@@ -90,9 +90,22 @@ Merkle 聚合（有限次签名）：
 - `MerklePublicKey(w, height, root)` — 冻结的长期公钥；`leaf_count` 给出叶子数 `2**height`
 - `MerkleSignature(index, wots_signature, auth_path)` — 冻结签名：叶索引、该叶的 W-OTS 签名、自叶层至根层的认证路径（每级一个 32 字节兄弟节点）
 - `MerkleSigner(*, height=4, w=4, token_bytes=secrets.token_bytes)` — 生成 `2**height` 把 W-OTS 密钥并建成 Merkle 树；`height` 为 1 至 8 的整数（非布尔），`w` 为 4 或 8。只读属性 `public_key`；`sign(message)` 线程安全地按 0 起递增分配叶子，仅成功后消耗叶子（非法消息抛 `TypeError` 且不消耗），叶子用尽抛 `KeyExhaustedError`，并发调用不会分配到重复索引
+- `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途
+- `MerkleSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；公钥与原签名器相同，下一次 `sign` 从保存的 `next_index` 继续，用尽状态恢复后仍抛 `KeyExhaustedError`。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、长度、`w`、树高、`next_index` 越界（允许 `0 <= next_index <= 2**height`）、元素数量、校验值非法，或由私钥重建的 Merkle 根不符，均抛 `ValueError` 且不返回实例
 - `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余畸形、越界或不匹配一律返回 `False`（包括绕过冻结构造器造成的字段缺失、类型/范围错误或元素、路径畸形）
 
-构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。状态只在进程内，不持久化。
+构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
+
+检查点 v1 二进制格式：8 字节魔数 `b"PQAMSCP\0"`；各 1 字节的版本（1）、`w`、`height`；2 字节大端 `next_index`；4 字节大端元素总数（必须等于 `2**height` 乘 `w` 对应的链数）；32 字节 Merkle 根；随后按叶、链顺序排列的全部 W-OTS 私钥元素（每个 32 字节）；最后为此前全部内容的 SHA-256。
+
+```python
+signer = MerkleSigner(height=4, w=4)
+blob = signer.checkpoint()                 # 含全部私钥，须当秘密保管
+restored = MerkleSigner.from_checkpoint(blob)
+assert restored.public_key == signer.public_key
+```
+
+**检查点安全须知**：检查点明文包含整棵树的全部 W-OTS 私钥，末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）。回滚到旧检查点会让 `next_index` 倒退、已消耗的叶子被再次分配，造成一次性密钥重用，签名即可被伪造。
 
 参数分析（纯函数，不生成密钥、不取随机数）：
 
@@ -114,7 +127,7 @@ signer = MerkleSigner(height=params.height, w=params.w)
 
 ## 限制
 
-Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用（Lamport 可用 `OneTimeSigner` 在进程内防护；W-OTS 没有等价包装器）。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子，`MerkleSigner` 只在进程内跟踪已用叶子、没有任何持久化状态——进程重启后叶子分配从零开始，因此长期防重用仍由调用方负责。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。
+Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用（Lamport 可用 `OneTimeSigner` 在进程内防护；W-OTS 没有等价包装器）。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子；`MerkleSigner` 只在进程内跟踪已用叶子，跨进程持久化须由调用方通过 `checkpoint()`/`from_checkpoint()` 完成——检查点明文包含全部私钥且校验值不提供认证，安全存储、每次签名后原子更新、绝不回滚旧检查点的责任都在调用方，回滚即造成叶子重用。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。
 
 ## 测试
 

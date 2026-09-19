@@ -1,18 +1,22 @@
 """pqattest - hash-based one-time signatures (Lamport construction).
 
-Public API: keygen / public_key_from / sign / verify / message_bits.
+Public API: keygen / public_key_from / sign / verify / message_bits,
+plus the managed OneTimeSigner / KeyExhaustedError wrappers.
 """
 
 from __future__ import annotations
 
 import hashlib
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 __all__ = [
     "BITS",
     "HASH_BYTES",
+    "KeyExhaustedError",
+    "OneTimeSigner",
     "PrivateKey",
     "PublicKey",
     "keygen",
@@ -116,3 +120,45 @@ def verify(message: Any, signature: Sequence[bytes], public_key: PublicKey) -> b
         if _secret_digest(materialised[index]) != public_key.digests[2 * index + bit]:
             return False
     return True
+
+
+class KeyExhaustedError(RuntimeError):
+    """Raised when a :class:`OneTimeSigner` is asked to sign more than once."""
+
+
+class OneTimeSigner:
+    """Concurrency-safe wrapper that signs at most one message per private key.
+
+    The first successful :meth:`sign` atomically exhausts the key; every
+    later call raises :class:`KeyExhaustedError`. The underlying stateless
+    :func:`sign` is unaffected.
+    """
+
+    def __init__(self, private_key: PrivateKey) -> None:
+        if not isinstance(private_key, PrivateKey):
+            raise TypeError("private_key must be a PrivateKey")
+        self._private_key = private_key
+        self._public_key = public_key_from(private_key)
+        self._lock = threading.Lock()
+        self._used = False
+
+    @property
+    def public_key(self) -> PublicKey:
+        """The public key matching the managed private key."""
+        return self._public_key
+
+    @property
+    def used(self) -> bool:
+        """Whether this signer has already produced a signature."""
+        return self._used
+
+    def sign(self, message: Any) -> tuple[bytes, ...]:
+        """Sign ``message`` once, then permanently exhaust the key."""
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time key has already been used to sign")
+            # A TypeError from an unsupported message type propagates here
+            # without consuming the key.
+            signature = sign(message, self._private_key)
+            self._used = True
+            return signature

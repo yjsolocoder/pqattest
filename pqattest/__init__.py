@@ -3,8 +3,9 @@
 Public API: keygen / public_key_from / sign / verify / message_bits /
 OneTimeSigner / KeyExhaustedError, the Winternitz construction:
 wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey,
-and Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
-MerkleSignature / merkle_verify.
+Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
+MerkleSignature / merkle_verify, and parameter analysis:
+Params / profile / recommend.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any, Callable, Sequence
 
 from ._errors import KeyExhaustedError
 from .merkle import MerklePublicKey, MerkleSignature, MerkleSigner, merkle_verify
+from .params import Params, profile, recommend
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -35,6 +37,7 @@ __all__ = [
     "MerkleSignature",
     "MerkleSigner",
     "OneTimeSigner",
+    "Params",
     "PrivateKey",
     "PublicKey",
     "WOTSPrivateKey",
@@ -43,7 +46,9 @@ __all__ = [
     "merkle_verify",
     "message_bits",
     "message_digest",
+    "profile",
     "public_key_from",
+    "recommend",
     "sign",
     "verify",
     "wots_keygen",

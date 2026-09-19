@@ -90,9 +90,34 @@ Merkle 聚合（有限次签名）：
 - `MerklePublicKey(w, height, root)` — 冻结的长期公钥；`leaf_count` 给出叶子数 `2**height`
 - `MerkleSignature(index, wots_signature, auth_path)` — 冻结签名：叶索引、该叶的 W-OTS 签名、自叶层至根层的认证路径（每级一个 32 字节兄弟节点）
 - `MerkleSigner(*, height=4, w=4, token_bytes=secrets.token_bytes)` — 生成 `2**height` 把 W-OTS 密钥并建成 Merkle 树；`height` 为 1 至 8 的整数（非布尔），`w` 为 4 或 8。只读属性 `public_key`；`sign(message)` 线程安全地按 0 起递增分配叶子，仅成功后消耗叶子（非法消息抛 `TypeError` 且不消耗），叶子用尽抛 `KeyExhaustedError`，并发调用不会分配到重复索引
-- `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余畸形、越界或不匹配一律返回 `False`
+- `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余一律返回 `False`——包括绕过构造器造成的字段缺失、类型或范围错误，以及元素或认证路径畸形
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。状态只在进程内，不持久化。
+
+参数分析（纯函数，不取随机数）：
+
+- `Params` — 冻结的参数/指标摘要，字段为 `scheme, w, height, capacity, elements, sig_bytes, path_bytes, steps`；`w`/`height` 在无此参数的scheme下为 `None`
+- `profile(scheme, w=None, height=None)` — 返回指定配置的 `Params`。`"lamport"` 不收 `w`/`height`；`"wots"` 只收 `w ∈ {4, 8}`；`"merkle"` 两者皆收，`height` 为 1 至 8 的整数（非布尔）。未知方案、参数缺失或多余一律抛 `ValueError`
+- `recommend(capacity, prefer="size")` — 返回能覆盖 `capacity` 条签名的 Merkle 配置：`capacity` 为 1 至 256 的整数（非布尔），取满足 `2**height >= capacity` 的最小 `height`（至少为 1）；`prefer="size"` 选 `w=8`（签名更短），`prefer="speed"` 选 `w=4`（链步更少）。非法输入抛 `ValueError`
+
+指标含义：
+
+- `capacity` — 一把密钥可签的消息数：一次性方案为 1，Merkle 为 `2**height`
+- `elements` — 单条签名中的 32 字节链元素数（`n = 256/w + l2`；Lamport 为 0，因为它直接揭示秘密而非链值）
+- `sig_bytes` — 签名总字节数，**不含** Merkle 叶索引与 Python 对象开销；Merkle 为 `32 * (n + height)`
+- `path_bytes` — 其中认证路径占的字节数 `32 * height`（已计入 `sig_bytes`，非 Merkle 方案为 0）
+- `steps` — 验证一条签名的哈希链步数上界 `n * (2**w - 1)`（Lamport 为 0，每个秘密只哈希一次）
+
+推荐策略：容量完全由 `height` 决定，而 `w` 只做尺寸/速度权衡——`w=8` 把签名从 67 个元素压到 34 个（约减半），代价是每条链最多走 255 步而非 15 步，验证慢一个数量级。因此默认 `prefer="size"`；只有在验证频繁且签名传输/存储便宜时才选 `prefer="speed"`。
+
+```python
+from pqattest import profile, recommend
+
+profile("lamport")                 # Params(scheme='lamport', ..., sig_bytes=8192, ...)
+profile("wots", w=8)               # 34 个元素，签名 1088 字节
+params = recommend(100)            # height=7（128 片叶子），w=8
+params = recommend(100, "speed")   # 同上但 w=4
+```
 
 ## 限制
 

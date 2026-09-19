@@ -182,34 +182,54 @@ def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> 
     The leaf hash is rebuilt from the recovered key, the authentication path
     is folded in according to the bits of ``signature.index`` (leaf level
     first), and the result is compared against ``public_key.root``. A wrong
-    public key *type* raises ``TypeError``; every other structural, range or
-    content mismatch returns ``False``.
+    public key *type* raises ``TypeError``; every other mismatch returns
+    ``False`` — including missing, wrongly typed or out-of-range fields on
+    keys or signatures that bypass the constructor validation, and malformed
+    elements or authentication paths.
     """
     if not isinstance(public_key, MerklePublicKey):
         raise TypeError("public_key must be a MerklePublicKey")
     if not isinstance(signature, MerkleSignature):
         return False
-    w = public_key.w
-    height = public_key.height
-    if len(signature.auth_path) != height:
+    try:
+        w = _validate_w(public_key.w)
+        height = _validate_height(public_key.height)
+    except (AttributeError, TypeError, ValueError):
         return False
-    if signature.index >= (1 << height):
+    root = getattr(public_key, "root", None)
+    if not isinstance(root, bytes) or len(root) != ELEMENT_BYTES:
+        return False
+    index = getattr(signature, "index", None)
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < (1 << height)
+    ):
+        return False
+    wots_signature = getattr(signature, "wots_signature", None)
+    auth_path = getattr(signature, "auth_path", None)
+    if not isinstance(wots_signature, tuple) or not isinstance(auth_path, tuple):
+        return False
+    if len(auth_path) != height:
         return False
     b, l1, l2 = _params(w)
-    if len(signature.wots_signature) != l1 + l2:
+    if len(wots_signature) != l1 + l2:
         return False
+    for node in wots_signature + auth_path:
+        if not isinstance(node, bytes) or len(node) != ELEMENT_BYTES:
+            return False
     try:
         digits = _signing_digits(message, w)
     except TypeError:
         return False
     recovered = tuple(
         _chain_walk(element, b - 1 - digit)
-        for element, digit in zip(signature.wots_signature, digits)
+        for element, digit in zip(wots_signature, digits)
     )
     node = _leaf_hash(w, recovered)
-    for level, sibling in enumerate(signature.auth_path):
-        if (signature.index >> level) & 1:
+    for level, sibling in enumerate(auth_path):
+        if (index >> level) & 1:
             node = _node_hash(sibling, node)
         else:
             node = _node_hash(node, sibling)
-    return node == public_key.root
+    return node == root

@@ -34,6 +34,7 @@ from .wots import (
 )
 
 __all__ = [
+    "MerkleProof",
     "MerklePublicKey",
     "MerkleSignature",
     "MerkleSigner",
@@ -57,6 +58,10 @@ _PUBLIC_KEY_BYTES = 8 + 1 + 1 + 1 + ELEMENT_BYTES
 _SIGNATURE_MAGIC = b"PQAMSIG\0"
 _SIGNATURE_VERSION = 1
 _SIGNATURE_HEADER_BYTES = 8 + 1 + 1 + 1 + 2 + 2 + 1
+
+_PROOF_MAGIC = b"PQAMPRF\0"
+_PROOF_VERSION = 1
+_PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
 
 
 def _validate_height(height: Any) -> int:
@@ -286,6 +291,108 @@ class MerkleSignature:
             for i in range(path_count)
         )
         return cls(index=index, wots_signature=wots_signature, auth_path=auth_path)
+
+
+@dataclass(frozen=True)
+class MerkleProof:
+    """Frozen self-contained proof: a Merkle public key paired with a signature.
+
+    Unlike :class:`MerkleSignature`, whose codec needs the matching key out of
+    band, a proof bundles the two so a verifier needs nothing but the blob.
+    The proof stores no message and is pure serialisation — it neither
+    authenticates nor encrypts anything.
+    """
+
+    MerklePublicKey: MerklePublicKey
+    MerkleSignature: MerkleSignature
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.MerklePublicKey, MerklePublicKey):
+            raise TypeError("MerklePublicKey must be a MerklePublicKey")
+        if not isinstance(self.MerkleSignature, MerkleSignature):
+            raise TypeError("MerkleSignature must be a MerkleSignature")
+        # The signature must be serialisable under exactly this key: the same
+        # parameter/count cross-checks as MerkleSignature.to_bytes.
+        self.MerkleSignature.to_bytes(self.MerklePublicKey)
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAMPRF\\0"``; one version byte
+        (1); the public-key and signature blob lengths as 4 big-endian bytes
+        each; then the existing v1 encryptions concatenated, key first. Both
+        inner blobs are produced by their own monolithic ``to_bytes`` rules,
+        so the signature is serialised under the bundled key. Encoding is
+        deterministic: equal proofs produce identical bytes. Fields corrupted
+        by bypassing the frozen constructor raise ``ValueError`` (or
+        ``TypeError`` for a wrong field type) instead of a malformed encoding.
+        """
+        if not isinstance(self, MerkleProof):
+            raise TypeError("to_bytes must be called on a MerkleProof")
+        if not isinstance(self.MerklePublicKey, MerklePublicKey):
+            raise TypeError("MerklePublicKey must be a MerklePublicKey")
+        if not isinstance(self.MerkleSignature, MerkleSignature):
+            raise TypeError("MerkleSignature must be a MerkleSignature")
+        key_blob = self.MerklePublicKey.to_bytes()
+        signature_blob = self.MerkleSignature.to_bytes(self.MerklePublicKey)
+        return (
+            _PROOF_MAGIC
+            + bytes((_PROOF_VERSION,))
+            + len(key_blob).to_bytes(4, "big")
+            + len(signature_blob).to_bytes(4, "big")
+            + key_blob
+            + signature_blob
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "MerkleProof":
+        """Parse ``to_bytes()`` output back into a :class:`MerkleProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The bundled public key is recovered first and then
+        constrains the signature parse. A bad magic, an unknown version, a
+        declared length that runs past the input or does not match the
+        content, truncation, trailing data, an invalid nested public key or
+        signature encoding, or parameter/count cross-inconsistency between
+        the two raises ``ValueError`` and no half-valid instance is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PROOF_HEADER_BYTES:
+            raise ValueError("proof encoding is truncated")
+        if data[:8] != _PROOF_MAGIC:
+            raise ValueError("bad proof magic")
+        if data[8] != _PROOF_VERSION:
+            raise ValueError(f"unsupported proof version: {data[8]}")
+        key_length = int.from_bytes(data[9:13], "big")
+        signature_length = int.from_bytes(data[13:17], "big")
+        expected_length = _PROOF_HEADER_BYTES + key_length + signature_length
+        if len(data) < expected_length:
+            raise ValueError("proof encoding is truncated")
+        if len(data) > expected_length:
+            raise ValueError("trailing data after the proof encoding")
+        key_blob = data[_PROOF_HEADER_BYTES : _PROOF_HEADER_BYTES + key_length]
+        signature_blob = data[_PROOF_HEADER_BYTES + key_length : expected_length]
+        # Recover the public key first; every nested defect (bad inner magic,
+        # version, length, field, or key/signature cross-inconsistency) is a
+        # ValueError and must surface as one.
+        public_key = MerklePublicKey.from_bytes(key_blob)
+        signature = MerkleSignature.from_bytes(signature_blob, public_key)
+        return cls(public_key, signature)
+
+    def verify(self, message: Any) -> bool:
+        """Verify ``message`` against the bundled signature and public key.
+
+        Accepts ``bytes``/``bytearray``/``str`` and returns exactly what
+        :func:`merkle_verify` returns for the bundled pair: ``True`` for a
+        valid proof, ``False`` for any changed message, key or signature
+        content. The proof carries no message and adds no authentication or
+        encryption of its own.
+        """
+        if not isinstance(self, MerkleProof):
+            raise TypeError("verify must be called on a MerkleProof")
+        return merkle_verify(message, self.MerkleSignature, self.MerklePublicKey)
 
 
 class MerkleSigner:

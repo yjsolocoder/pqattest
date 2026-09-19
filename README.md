@@ -91,6 +91,9 @@ Merkle 聚合（有限次签名）：
 - `MerklePublicKey.to_bytes()` / `MerklePublicKey.from_bytes(data)` — 版本化的公钥二进制编解码；编码确定一致，`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），魔数、版本、长度或字段非法抛 `ValueError`
 - `MerkleSignature(index, wots_signature, auth_path)` — 冻结签名：叶索引、该叶的 W-OTS 签名、自叶层至根层的认证路径（每级一个 32 字节兄弟节点）
 - `MerkleSignature.to_bytes(public_key)` / `MerkleSignature.from_bytes(data, public_key)` — 版本化的签名二进制编解码。签名对象自身不带参数，两个接口都以 `public_key` 约束：`w` 与树高须与之一致、索引小于 `2**height`、元素数等于 `w` 对应的链数、路径数等于树高；不满足抛 `ValueError`，`public_key` 类型错误抛 `TypeError`
+- `MerkleProof(MerklePublicKey, MerkleSignature)` — 冻结的自包含证明，把一把 Merkle 公钥和一条与之配套的签名打包，用于脱离带外信道独立传输。两个字段分别名为 `MerklePublicKey`、`MerkleSignature`；字段类型错误抛 `TypeError`，二者参数/计数不一致（`w`、树高、索引范围、元素数、路径数）抛 `ValueError`
+- `MerkleProof.to_bytes()` / `MerkleProof.from_bytes(data)` — 版本化的证明二进制编解码；编码确定一致、往返后对象相等。`from_bytes` 先恢复包内公钥，再由它约束签名解析。`data` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`）；错误魔数、未知版本、长度越界或与内容不符、截断、尾随数据、嵌套编码非法、公钥与签名交叉不一致均抛 `ValueError`，绝不返回半有效对象
+- `MerkleProof.verify(message)` — 接受 `bytes`/`bytearray`/`str`，返回值与 `merkle_verify(message, proof.MerkleSignature, proof.MerklePublicKey)` 完全一致：正确证明通过，消息、公钥或签名任一部分被改动即失败
 - `MerkleSigner(*, height=4, w=4, token_bytes=secrets.token_bytes)` — 生成 `2**height` 把 W-OTS 密钥并建成 Merkle 树；`height` 为 1 至 8 的整数（非布尔），`w` 为 4 或 8。只读属性 `public_key`；`sign(message)` 线程安全地按 0 起递增分配叶子，仅成功后消耗叶子（非法消息抛 `TypeError` 且不消耗），叶子用尽抛 `KeyExhaustedError`，并发调用不会分配到重复索引
 - `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途
 - `MerkleSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；公钥与原签名器相同，下一次 `sign` 从保存的 `next_index` 继续，用尽状态恢复后仍抛 `KeyExhaustedError`。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、长度、`w`、树高、`next_index` 越界（允许 `0 <= next_index <= 2**height`）、元素数量、校验值非法，或由私钥重建的 Merkle 根不符，均抛 `ValueError` 且不返回实例
@@ -104,6 +107,8 @@ Merkle 聚合（有限次签名）：
 
 签名 v1 线格式（`MerkleSignature.to_bytes(public_key)`）：8 字节魔数 `b"PQAMSIG\0"`；各 1 字节的版本（1）、`w`、`height`；2 字节大端叶索引；2 字节大端 W-OTS 元素数（等于 `w` 对应的链数）；1 字节路径数（等于树高）；随后依次是全部 W-OTS 签名元素和**自叶层向根层**排列的认证路径节点，每项 32 字节。总长度为 `16 + (元素数 + 树高) × 32` 字节。
 
+证明 v1 线格式（`MerkleProof.to_bytes`）：8 字节魔数 `b"PQAMPRF\0"`；1 字节版本（1）；各 4 字节大端的公钥编码长度与签名编码长度；随后直接拼接既有公钥 v1 编码与既有签名 v1 编码（公钥在前）。证明自身不重新定义任何内部字段：序列化调用两个成员各自的单体 `to_bytes` 规则（签名以包内公钥为参数），解析先按公钥规则恢复公钥，再把它传给签名规则约束解析。总长度为 `17 + 公钥编码长度 + 签名编码长度` 字节（默认参数下 43 + 2256 = 2316）。
+
 ```python
 signer = MerkleSigner(height=4, w=8)
 signature = signer.sign(b"position claim")
@@ -115,7 +120,22 @@ assert restored == signature
 assert merkle_verify(b"position claim", restored, key)
 ```
 
-**编解码须知**：两种编码都是纯序列化——只含结构校验（魔数、版本、计数、长度），**不提供认证或加密**，任何人都能改写字节；需要完整性或来源保证时须由调用方在传输/存储层自行解决（公钥与签名本身公开，通常只需防篡改）。未来格式变更会启用新的版本号，解析器对未知版本一律抛 `ValueError`，不会静默按 v1 解释。
+需要把公钥与签名作为一份独立材料交给验证方时，用自包含的 `MerkleProof`，验证方无需带外公钥：
+
+```python
+from pqattest import MerkleSigner, MerkleProof
+
+signer = MerkleSigner(height=4, w=8)
+signature = signer.sign(b"position claim")
+proof = MerkleProof(signer.public_key, signature)
+blob = proof.to_bytes()                    # 一份 blob 即可独立传输
+restored = MerkleProof.from_bytes(blob)    # 先恢复公钥，再约束签名
+assert restored == proof
+assert restored.verify(b"position claim")  # 等价于 merkle_verify
+assert not restored.verify(b"other claim")
+```
+
+**编解码须知**：公钥、签名、证明三种编码都是纯序列化——只含结构校验（魔数、版本、计数、长度），**不提供认证或加密**，任何人都能改写字节；需要完整性或来源保证时须由调用方在传输/存储层自行解决（公钥与签名本身公开，通常只需防篡改）。`MerkleProof` 只打包公钥与签名、**不存消息**，也不提供超出 `merkle_verify` 的任何保证：结构能解析不代表内容有效，篡改后的包仍可被 `from_bytes` 接受，但 `verify` 必定失败；验签必须针对期望的消息逐条进行。未来格式变更会启用新的版本号，解析器对任一层的未知版本一律抛 `ValueError`，不会静默按 v1 解释（证明版本与其嵌套成员版本各自独立，新证明版本或新嵌套版本都须显式支持）。
 
 ```python
 signer = MerkleSigner(height=4, w=4)

@@ -1,7 +1,8 @@
-"""pqattest - hash-based one-time signatures (Lamport construction).
+"""pqattest - hash-based one-time signatures (Lamport and Winternitz).
 
 Public API: keygen / public_key_from / sign / verify / message_bits /
-OneTimeSigner / KeyExhaustedError.
+OneTimeSigner / KeyExhaustedError, plus the Winternitz construction:
+wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey.
 """
 
 from __future__ import annotations
@@ -12,19 +13,34 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+from .wots import (
+    ELEMENT_BYTES,
+    WOTSPrivateKey,
+    WOTSPublicKey,
+    wots_keygen,
+    wots_sign,
+    wots_verify,
+)
+
 __all__ = [
     "BITS",
+    "ELEMENT_BYTES",
     "HASH_BYTES",
     "KeyExhaustedError",
     "OneTimeSigner",
     "PrivateKey",
     "PublicKey",
+    "WOTSPrivateKey",
+    "WOTSPublicKey",
     "keygen",
     "message_bits",
     "message_digest",
     "public_key_from",
     "sign",
     "verify",
+    "wots_keygen",
+    "wots_sign",
+    "wots_verify",
 ]
 
 BITS = 256

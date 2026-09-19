@@ -1,7 +1,13 @@
-"""pqattest - hash-based one-time signatures (Lamport construction).
+"""pqattest - hash-based one-time signatures.
 
-Public API: keygen / public_key_from / sign / verify / message_bits /
-OneTimeSigner / KeyExhaustedError.
+Lamport construction: keygen / public_key_from / sign / verify /
+message_bits / OneTimeSigner / KeyExhaustedError.
+
+Winternitz construction (W-OTS, w in {4, 8}): wots_keygen / wots_sign /
+wots_verify / WOTSPrivateKey / WOTSPublicKey.
+
+Both constructions are one-time signatures: there is no Merkle tree and no
+persistent state, so a key pair must sign at most one message.
 """
 
 from __future__ import annotations
@@ -19,12 +25,17 @@ __all__ = [
     "OneTimeSigner",
     "PrivateKey",
     "PublicKey",
+    "WOTSPrivateKey",
+    "WOTSPublicKey",
     "keygen",
     "message_bits",
     "message_digest",
     "public_key_from",
     "sign",
     "verify",
+    "wots_keygen",
+    "wots_sign",
+    "wots_verify",
 ]
 
 BITS = 256
@@ -170,3 +181,136 @@ class OneTimeSigner:
             signature = sign(message, self._private_key)
             self._used = True
             return signature
+
+
+# ---------------------------------------------------------------------------
+# Winternitz one-time signature (W-OTS)
+# ---------------------------------------------------------------------------
+
+_WOTS_DOMAIN = b"pqattest/wots/v1"
+_WOTS_WIDTHS = frozenset({4, 8})
+
+
+def _wots_chain_step(value: bytes) -> bytes:
+    """Single W-OTS chain step H(x) = SHA256(b"pqattest/wots/v1" + x)."""
+    return hashlib.sha256(_WOTS_DOMAIN + value).digest()
+
+
+def _wots_walk(start: bytes, steps: int) -> bytes:
+    value = start
+    for _ in range(steps):
+        value = _wots_chain_step(value)
+    return value
+
+
+def _wots_params(w: Any) -> tuple[int, int, int]:
+    """Return ``(l1, l2, base)`` for the given Winternitz width."""
+    if not isinstance(w, int) or isinstance(w, bool) or w not in _WOTS_WIDTHS:
+        raise ValueError("w must be 4 or 8")
+    base = 1 << w
+    l1 = BITS // w
+    l2 = 1
+    while base ** l2 <= l1 * (base - 1):
+        l2 += 1
+    return l1, l2, base
+
+
+def _wots_digits(message: Any, w: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Split the message digest into base-B digits plus its fixed-width checksum digits."""
+    l1, l2, base = _wots_params(w)
+    digest = message_digest(message)
+    integer = int.from_bytes(digest, "big")
+    message_digits = tuple(
+        (integer >> (w * (l1 - 1 - index))) & (base - 1) for index in range(l1)
+    )
+    checksum = sum(base - 1 - digit for digit in message_digits)
+    checksum_digits = tuple(
+        (checksum >> (w * (l2 - 1 - index))) & (base - 1) for index in range(l2)
+    )
+    return message_digits, checksum_digits
+
+
+@dataclass(frozen=True)
+class WOTSPrivateKey:
+    """W-OTS private key: Winternitz width ``w`` and one random chain start per digit."""
+
+    w: int
+    elements: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class WOTSPublicKey:
+    """W-OTS public key: Winternitz width ``w`` and the step-``B-1`` end of each chain."""
+
+    w: int
+    elements: tuple[bytes, ...]
+
+
+def wots_keygen(
+    *,
+    w: int = 4,
+    token_bytes: Callable[[int], bytes] = secrets.token_bytes,
+) -> tuple[WOTSPrivateKey, WOTSPublicKey]:
+    """Generate a fresh W-OTS key pair.
+
+    ``w`` must be 4 or 8; each chain element is exactly 32 random bytes.
+    """
+    l1, l2, base = _wots_params(w)
+    count = l1 + l2
+    starts = tuple(bytes(token_bytes(HASH_BYTES)) for _ in range(count))
+    for start in starts:
+        if len(start) != HASH_BYTES:
+            raise ValueError(f"token_bytes must return {HASH_BYTES} bytes")
+    private_key = WOTSPrivateKey(w, starts)
+    public_key = WOTSPublicKey(w, tuple(_wots_walk(start, base - 1) for start in starts))
+    return private_key, public_key
+
+
+def wots_sign(message: Any, private_key: WOTSPrivateKey) -> tuple[bytes, ...]:
+    """Produce a W-OTS signature: the step-``d`` value of every chain."""
+    if not isinstance(private_key, WOTSPrivateKey):
+        raise TypeError("private_key must be a WOTSPrivateKey")
+    w = private_key.w
+    l1, l2, _ = _wots_params(w)
+    if len(private_key.elements) != l1 + l2:
+        raise ValueError("private key does not match its Winternitz parameter w")
+    if any(len(element) != HASH_BYTES for element in private_key.elements):
+        raise ValueError(f"private key elements must be {HASH_BYTES} bytes")
+    message_digits, checksum_digits = _wots_digits(message, w)
+    digits = message_digits + checksum_digits
+    return tuple(
+        _wots_walk(private_key.elements[index], digit)
+        for index, digit in enumerate(digits)
+    )
+
+
+def wots_verify(message: Any, signature: Sequence[bytes], public_key: WOTSPublicKey) -> bool:
+    """Check a W-OTS signature by completing each chain to its public end.
+
+    Any structural, parameter or content mismatch returns ``False``; only a
+    wrong key type raises ``TypeError``.
+    """
+    if not isinstance(public_key, WOTSPublicKey):
+        raise TypeError("public_key must be a WOTSPublicKey")
+    w = public_key.w
+    if not isinstance(w, int) or isinstance(w, bool) or w not in _WOTS_WIDTHS:
+        return False
+    l1, l2, base = _wots_params(w)
+    if len(public_key.elements) != l1 + l2:
+        return False
+    if any(len(element) != HASH_BYTES for element in public_key.elements):
+        return False
+    try:
+        parts = tuple(bytes(part) for part in signature)
+    except (TypeError, ValueError):
+        return False
+    if len(parts) != l1 + l2:
+        return False
+    if any(len(part) != HASH_BYTES for part in parts):
+        return False
+    message_digits, checksum_digits = _wots_digits(message, w)
+    digits = message_digits + checksum_digits
+    for index, digit in enumerate(digits):
+        if _wots_walk(parts[index], base - 1 - digit) != public_key.elements[index]:
+            return False
+    return True

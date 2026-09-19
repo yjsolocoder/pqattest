@@ -39,6 +39,16 @@ sig1 = signer.sign(b"another claim")        # 叶子 1，依此类推
 assert merkle_verify(b"position claim", sig0, public_key)
 ```
 
+需要把一份签名连同公钥**独立**传给没有旁带公钥的接收方时，用 `MerkleProof` 打包：
+
+```python
+from pqattest import MerkleProof
+
+proof = MerkleProof(public_key=public_key, signature=sig0)
+blob = proof.to_bytes()                     # 单块字节即可传输
+assert MerkleProof.from_bytes(blob).verify(b"position claim")
+```
+
 消息统一接受 `bytes`、`bytearray`、`str`（str 按 UTF-8 编码）。
 
 ## 命令行演示
@@ -95,6 +105,9 @@ Merkle 聚合（有限次签名）：
 - `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途
 - `MerkleSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；公钥与原签名器相同，下一次 `sign` 从保存的 `next_index` 继续，用尽状态恢复后仍抛 `KeyExhaustedError`。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、长度、`w`、树高、`next_index` 越界（允许 `0 <= next_index <= 2**height`）、元素数量、校验值非法，或由私钥重建的 Merkle 根不符，均抛 `ValueError` 且不返回实例
 - `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余畸形、越界或不匹配一律返回 `False`（包括绕过冻结构造器造成的字段缺失、类型/范围错误或元素、路径畸形）
+- `MerkleProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `MerklePublicKey` 与 `MerkleSignature`（字段类型错误抛 `TypeError`，签名参数/计数与公钥不一致抛 `ValueError`）；把一把公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密
+- `MerkleProof.to_bytes()` / `MerkleProof.from_bytes(data)` — 证明包的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束签名；魔数、版本、长度越界或与内容不符、截断、尾随数据、嵌套编码非法或公钥与签名交叉不一致均抛 `ValueError`，不返回半有效对象
+- `MerkleProof.verify(message)` — 接受 `bytes`/`bytearray`/`str`，等价于 `merkle_verify(message, proof.signature, proof.public_key)`；只对被签署的消息返回 `True`，消息、公钥或签名被改动后返回 `False`（非法消息类型返回 `False`）
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 
@@ -103,6 +116,21 @@ Merkle 聚合（有限次签名）：
 公钥 v1 线格式（`MerklePublicKey.to_bytes`，固定 43 字节）：8 字节魔数 `b"PQAMPK\0\0"`；各 1 字节的版本（1）、`w`、`height`；32 字节 Merkle 根。
 
 签名 v1 线格式（`MerkleSignature.to_bytes(public_key)`）：8 字节魔数 `b"PQAMSIG\0"`；各 1 字节的版本（1）、`w`、`height`；2 字节大端叶索引；2 字节大端 W-OTS 元素数（等于 `w` 对应的链数）；1 字节路径数（等于树高）；随后依次是全部 W-OTS 签名元素和**自叶层向根层**排列的认证路径节点，每项 32 字节。总长度为 `16 + (元素数 + 树高) × 32` 字节。
+
+证明包 v1 线格式（`MerkleProof.to_bytes`）：8 字节魔数 `b"PQAMPRF\0"`；1 字节版本（1）；4 字节大端公钥长度；4 字节大端签名长度；随后先拼接完整的公钥 v1 编码，再拼接以该公钥约束的签名 v1 编码（即上面两种既有编码原样串联，证明包不另造单体编码）。长度字段必须与各自编码的实际内容一致；解析顺序固定为先公钥、后签名，签名始终由同包内刚恢复的公钥约束。总长度为 `17 + 公钥编码长度 + 签名编码长度` 字节。
+
+```python
+from pqattest import MerkleProof, MerklePublicKey, MerkleSignature, MerkleSigner
+
+signer = MerkleSigner(height=4, w=4)
+signature = signer.sign(b"position claim")
+proof = MerkleProof(public_key=signer.public_key, signature=signature)
+blob = proof.to_bytes()                       # 可独立传输的单块字节
+received = MerkleProof.from_bytes(blob)       # 接收方无需任何旁带参数
+assert received == proof
+assert received.verify(b"position claim")
+assert not received.verify(b"other claim")
+```
 
 ```python
 signer = MerkleSigner(height=4, w=8)
@@ -115,7 +143,7 @@ assert restored == signature
 assert merkle_verify(b"position claim", restored, key)
 ```
 
-**编解码须知**：两种编码都是纯序列化——只含结构校验（魔数、版本、计数、长度），**不提供认证或加密**，任何人都能改写字节；需要完整性或来源保证时须由调用方在传输/存储层自行解决（公钥与签名本身公开，通常只需防篡改）。未来格式变更会启用新的版本号，解析器对未知版本一律抛 `ValueError`，不会静默按 v1 解释。
+**编解码须知**：三种编码（公钥、签名、证明包）都是纯序列化——只含结构校验（魔数、版本、计数、长度），**不提供认证或加密**，任何人都能改写字节；需要完整性或来源保证时须由调用方在传输/存储层自行解决（公钥与签名本身公开，通常只需防篡改）。证明包只做参数与计数层面的交叉约束：参数一致的异源公钥/签名组合在结构上合法，必须靠 `verify(message)` 才能识别——证明包不存消息，无从自行判断签名是否出自该公钥。未来格式变更会启用新的版本号（证明包与内层两种编码各自独立版本化），解析器对未知版本一律抛 `ValueError`，不会静默按 v1 解释；新版本若改变内层编码，须在证明包新的版本号下整体规定其组合方式，v1 解析器永远只接受 v1 内层编码。
 
 ```python
 signer = MerkleSigner(height=4, w=4)

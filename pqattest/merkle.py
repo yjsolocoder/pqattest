@@ -6,8 +6,10 @@ long-term public key; each signature spends one leaf (one W-OTS key pair) and
 carries the authentication path from that leaf to the root. Only the standard
 library is used. Public keys and signatures have a versioned binary wire
 format via ``to_bytes`` / ``from_bytes`` (the signature codec is constrained
-by the corresponding :class:`MerklePublicKey`). Signer state can be persisted
-explicitly with :meth:`MerkleSigner.checkpoint` /
+by the corresponding :class:`MerklePublicKey`). A :class:`MerkleProof`
+bundles one public key and one signature for independent transport. Signer
+state can be persisted explicitly with
+:meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
 key and is protected only by a SHA-256 checksum against accidental
 corruption, so callers must store it securely.
@@ -34,6 +36,7 @@ from .wots import (
 )
 
 __all__ = [
+    "MerkleProof",
     "MerklePublicKey",
     "MerkleSignature",
     "MerkleSigner",
@@ -44,6 +47,10 @@ _LEAF_DOMAIN = b"pqattest/leaf"
 _NODE_DOMAIN = b"pqattest/node"
 _MIN_HEIGHT = 1
 _MAX_HEIGHT = 8
+
+_PROOF_MAGIC = b"PQAMPRF\0"
+_PROOF_VERSION = 1
+_PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
 
 _CHECKPOINT_MAGIC = b"PQAMSCP\0"
 _CHECKPOINT_VERSION = 1
@@ -286,6 +293,123 @@ class MerkleSignature:
             for i in range(path_count)
         )
         return cls(index=index, wots_signature=wots_signature, auth_path=auth_path)
+
+
+@dataclass(frozen=True)
+class MerkleProof:
+    """Frozen, self-contained bundle of one Merkle public key and one signature.
+
+    Unlike :class:`MerkleSignature` (whose wire format needs the
+    corresponding key separately), a proof carries the
+    :class:`MerklePublicKey` that constrains its :class:`MerkleSignature`, so
+    it can be transported on its own and verified with :meth:`verify`. The
+    proof stores no message and is a pure serialisation container: it offers
+    neither authentication nor encryption of the wrapper itself.
+    """
+
+    public_key: MerklePublicKey
+    signature: MerkleSignature
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        if not isinstance(self.signature, MerkleSignature):
+            raise TypeError("signature must be a MerkleSignature")
+        if not _signature_matches_key(self.signature, self.public_key):
+            raise ValueError("signature is not consistent with the public key")
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 proof wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAMPRF\\0"``; one version byte
+        (1); the public-key and signature lengths as 4 big-endian bytes each;
+        then the existing v1 encodings of the public key and of the signature
+        constrained by that key, in that order. Encoding is deterministic: the
+        same proof always produces the same bytes.
+        """
+        if not isinstance(self, MerkleProof):
+            raise TypeError("to_bytes must be called on a MerkleProof")
+        key_bytes = self.public_key.to_bytes()
+        signature_bytes = self.signature.to_bytes(self.public_key)
+        return (
+            _PROOF_MAGIC
+            + bytes((_PROOF_VERSION,))
+            + len(key_bytes).to_bytes(4, "big")
+            + len(signature_bytes).to_bytes(4, "big")
+            + key_bytes
+            + signature_bytes
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "MerkleProof":
+        """Parse ``to_bytes()`` output back into a :class:`MerkleProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The embedded public key is recovered first and then
+        constrains the signature. A bad magic, an unknown version, a length
+        field that is out of bounds or disagrees with the actual content,
+        truncation, trailing data, an invalid nested encoding, or a signature
+        inconsistent with the key (wrong parameters or counts) raises
+        ``ValueError`` and no half-valid object is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PROOF_HEADER_BYTES:
+            raise ValueError("proof encoding is truncated")
+        if data[:8] != _PROOF_MAGIC:
+            raise ValueError("bad proof magic")
+        if data[8] != _PROOF_VERSION:
+            raise ValueError(f"unsupported proof version: {data[8]}")
+        key_length = int.from_bytes(data[9:13], "big")
+        signature_length = int.from_bytes(data[13:17], "big")
+        key_end = _PROOF_HEADER_BYTES + key_length
+        signature_end = key_end + signature_length
+        if key_length == 0 or signature_length == 0:
+            raise ValueError("a length field must not be zero")
+        if key_end > len(data) or signature_end > len(data):
+            raise ValueError("proof encoding is truncated")
+        if signature_end < len(data):
+            raise ValueError("trailing data after the proof encoding")
+        public_key = MerklePublicKey.from_bytes(data[_PROOF_HEADER_BYTES:key_end])
+        signature = MerkleSignature.from_bytes(
+            data[key_end:signature_end], public_key
+        )
+        return cls(public_key=public_key, signature=signature)
+
+    def verify(self, message: Any) -> bool:
+        """Verify the embedded signature against the embedded public key.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like
+        :func:`merkle_verify`, to which this call delegates; it returns
+        ``True`` only for the message that was actually signed. The proof
+        itself carries no message and cannot authenticate its own origin.
+        """
+        return merkle_verify(message, self.signature, self.public_key)
+
+
+def _signature_matches_key(signature: MerkleSignature, public_key: MerklePublicKey) -> bool:
+    """Non-raising check mirroring the constraints enforced by ``to_bytes``."""
+    try:
+        w, height, chains = _signature_params(public_key)
+        index = signature.index
+        wots_signature = signature.wots_signature
+        auth_path = signature.auth_path
+    except (ValueError, AttributeError):
+        return False
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        return False
+    if index >= (1 << height):
+        return False
+    if not _nodes_well_formed(wots_signature):
+        return False
+    if not _nodes_well_formed(auth_path):
+        return False
+    if len(wots_signature) != chains:
+        return False
+    if len(auth_path) != height:
+        return False
+    return True
 
 
 class MerkleSigner:

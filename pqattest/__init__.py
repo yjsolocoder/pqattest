@@ -1,8 +1,10 @@
-"""pqattest - hash-based one-time signatures (Lamport and Winternitz).
+"""pqattest - hash-based one-time and few-times signatures.
 
 Public API: keygen / public_key_from / sign / verify / message_bits /
-OneTimeSigner / KeyExhaustedError, plus the Winternitz construction:
-wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey.
+OneTimeSigner / KeyExhaustedError, the Winternitz construction:
+wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey,
+and Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
+MerkleSignature / merkle_verify.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+from ._errors import KeyExhaustedError
+from .merkle import MerklePublicKey, MerkleSignature, MerkleSigner, merkle_verify
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -27,12 +31,16 @@ __all__ = [
     "ELEMENT_BYTES",
     "HASH_BYTES",
     "KeyExhaustedError",
+    "MerklePublicKey",
+    "MerkleSignature",
+    "MerkleSigner",
     "OneTimeSigner",
     "PrivateKey",
     "PublicKey",
     "WOTSPrivateKey",
     "WOTSPublicKey",
     "keygen",
+    "merkle_verify",
     "message_bits",
     "message_digest",
     "public_key_from",
@@ -136,10 +144,6 @@ def verify(message: Any, signature: Sequence[bytes], public_key: PublicKey) -> b
         if _secret_digest(materialised[index]) != public_key.digests[2 * index + bit]:
             return False
     return True
-
-
-class KeyExhaustedError(RuntimeError):
-    """A :class:`OneTimeSigner` was asked to sign after its key was already used."""
 
 
 class OneTimeSigner:

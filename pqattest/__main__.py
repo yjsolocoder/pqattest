@@ -6,7 +6,9 @@ from . import (
     BITS,
     ELEMENT_BYTES,
     HASH_BYTES,
+    MerkleSigner,
     keygen,
+    merkle_verify,
     message_bits,
     public_key_from,
     sign,
@@ -53,6 +55,19 @@ def main() -> int:
             f"signature {len(wots_signature) * ELEMENT_BYTES} B, "
             f"verify: {wots_verify(MESSAGE, wots_signature, wots_public)}"
         )
+
+    print()
+    print("Merkle-aggregated W-OTS (few-times signature)")
+    signer = MerkleSigner(height=4, w=4)
+    merkle_public = signer.public_key
+    print(f"  height={merkle_public.height}: {merkle_public.leaf_count} W-OTS leaves under one root")
+    print(f"  root: {merkle_public.root.hex()}")
+    first = signer.sign(MESSAGE)
+    second = signer.sign(MESSAGE + " (again)")
+    print(f"  first signature : leaf {first.index}, verify: {merkle_verify(MESSAGE, first, merkle_public)}")
+    print(f"  second signature: leaf {second.index}, verify: {merkle_verify(MESSAGE + ' (again)', second, merkle_public)}")
+    print(f"  swapped message verifies: {merkle_verify(MESSAGE, second, merkle_public)}")
+    print(f"  auth path: {len(first.auth_path)} nodes x {ELEMENT_BYTES} B")
     return 0
 
 

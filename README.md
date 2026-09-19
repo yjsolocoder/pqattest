@@ -33,10 +33,25 @@ python3 -m pqattest
 - `public_key_from(private_key)` — 由私钥重算公钥
 - `sign(message, private_key)` — 返回长度等于 `bits` 的签名（比特 `i` 揭示第 `i` 位对应的那个秘密）
 - `verify(message, signature, public_key)` — 逐位比对
+- `OneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `sign(message, private_key)` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
+- `KeyExhaustedError` — 已用签名器再次签名时抛出（继承 `RuntimeError`）
+
+```python
+from pqattest import keygen, OneTimeSigner, KeyExhaustedError
+
+private_key, public_key = keygen()
+signer = OneTimeSigner(private_key)
+signature = signer.sign(b"position claim")   # 成功
+assert signer.used and signer.public_key == public_key
+try:
+    signer.sign(b"another claim")            # KeyExhaustedError
+except KeyExhaustedError:
+    pass
+```
 
 ## 限制
 
-这是纯一次性签名：**同一密钥对签第二条消息就会同时泄露两个分支的秘密，签名即可被伪造**，库本身不阻止也不检测重复使用。没有任何状态记录，也没有密钥用尽管理。签名尺寸等于摘要位数乘以哈希长度（256 × 32 = 8 KB），签名本身比消息大得多，没有 Winternitz 链压缩。没有 Merkle 多一次性签名结构，因此一把长期公钥无法对应多次签名。参数固定为 256 位，没有可配置的安全裕度或尺寸权衡。
+这是纯一次性签名：**同一密钥对签第二条消息就会同时泄露两个分支的秘密，签名即可被伪造**。无状态的 `sign` 不阻止也不检测重复使用；需要防护时使用 `OneTimeSigner`（仅约束同一签名器实例，且为进程内管理）。签名尺寸等于摘要位数乘以哈希长度（256 × 32 = 8 KB），签名本身比消息大得多，没有 Winternitz 链压缩。没有 Merkle 多一次性签名结构，因此一把长期公钥无法对应多次签名。参数固定为 256 位，没有可配置的安全裕度或尺寸权衡。
 
 ## 测试
 

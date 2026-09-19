@@ -1,8 +1,11 @@
+import threading
 import unittest
 
 from pqattest import (
     BITS,
     HASH_BYTES,
+    KeyExhaustedError,
+    OneTimeSigner,
     PrivateKey,
     PublicKey,
     keygen,
@@ -135,6 +138,128 @@ class TypeTest(unittest.TestCase):
     def test_verify_requires_public_key(self):
         with self.assertRaises(TypeError):
             verify("m", (), PrivateKey(()))
+
+
+class OneTimeSignerTest(unittest.TestCase):
+    def setUp(self):
+        self.private_key, self.public_key = keygen(bits=32, token_bytes=counter_tokens())
+        self.message = b"position claim"
+
+    def test_constructor_requires_private_key(self):
+        with self.assertRaises(TypeError):
+            OneTimeSigner(PublicKey(()))
+        with self.assertRaises(TypeError):
+            OneTimeSigner("not a key")
+        with self.assertRaises(TypeError):
+            OneTimeSigner(None)
+
+    def test_public_key_matches(self):
+        signer = OneTimeSigner(self.private_key)
+        self.assertEqual(signer.public_key, self.public_key)
+        self.assertEqual(signer.public_key, public_key_from(self.private_key))
+
+    def test_initially_unused(self):
+        signer = OneTimeSigner(self.private_key)
+        self.assertFalse(signer.used)
+
+    def test_first_signature_matches_stateless_sign(self):
+        signer = OneTimeSigner(self.private_key)
+        signature = signer.sign(self.message)
+        self.assertEqual(signature, sign(self.message, self.private_key))
+        self.assertTrue(verify(self.message, signature, self.public_key))
+        self.assertTrue(signer.used)
+
+    def test_second_sign_raises_even_for_same_message(self):
+        signer = OneTimeSigner(self.private_key)
+        signer.sign(self.message)
+        with self.assertRaises(KeyExhaustedError):
+            signer.sign(self.message)
+        with self.assertRaises(KeyExhaustedError):
+            signer.sign(self.message + b"!")
+
+    def test_key_exhausted_error_is_runtime_error(self):
+        self.assertTrue(issubclass(KeyExhaustedError, RuntimeError))
+        signer = OneTimeSigner(self.private_key)
+        signer.sign(self.message)
+        with self.assertRaises(RuntimeError):
+            signer.sign(self.message)
+
+    def test_message_type_variants(self):
+        for message in (b"x", bytearray(b"x"), "x"):
+            private_key, public_key = keygen(bits=8, token_bytes=counter_tokens())
+            signer = OneTimeSigner(private_key)
+            signature = signer.sign(message)
+            self.assertEqual(signature, sign(message, private_key))
+            self.assertTrue(verify(message, signature, public_key))
+
+    def test_bad_message_type_does_not_consume_key(self):
+        signer = OneTimeSigner(self.private_key)
+        with self.assertRaises(TypeError):
+            signer.sign(123)
+        self.assertFalse(signer.used)
+        signature = signer.sign(self.message)
+        self.assertEqual(signature, sign(self.message, self.private_key))
+        self.assertTrue(signer.used)
+        with self.assertRaises(KeyExhaustedError):
+            signer.sign(self.message)
+
+    def test_properties_are_read_only(self):
+        signer = OneTimeSigner(self.private_key)
+        with self.assertRaises(AttributeError):
+            signer.used = True
+        with self.assertRaises(AttributeError):
+            signer.public_key = self.public_key
+
+    def test_no_public_reset_method(self):
+        signer = OneTimeSigner(self.private_key)
+        signer.sign(self.message)
+        public_names = [name for name in dir(signer) if not name.startswith("_")]
+        reset_like = [name for name in public_names if "reset" in name or "reuse" in name]
+        self.assertEqual(reset_like, [])
+        self.assertTrue(signer.used)
+
+    def test_instance_scope_does_not_affect_other_instance_or_stateless_sign(self):
+        signer = OneTimeSigner(self.private_key)
+        signer.sign(self.message)
+        with self.assertRaises(KeyExhaustedError):
+            signer.sign(self.message)
+        # same underlying key through a fresh instance still signs
+        other = OneTimeSigner(self.private_key)
+        self.assertFalse(other.used)
+        self.assertEqual(other.sign(self.message), sign(self.message, self.private_key))
+        # stateless API remains unrestricted
+        self.assertEqual(sign(self.message, self.private_key), sign(self.message, self.private_key))
+
+    def test_concurrent_signs_yield_one_success(self):
+        signer = OneTimeSigner(self.private_key)
+        thread_count = 32
+        barrier = threading.Barrier(thread_count)
+        results = {"ok": [], "exhausted": [], "other": []}
+
+        def worker(index: int) -> None:
+            barrier.wait()
+            try:
+                signature = signer.sign(self.message)
+            except KeyExhaustedError:
+                results["exhausted"].append(index)
+            except Exception as exc:  # pragma: no cover - failure record
+                results["other"].append((index, repr(exc)))
+            else:
+                results["ok"].append((index, signature))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(thread_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(results["other"], [])
+        self.assertEqual(len(results["ok"]), 1)
+        self.assertEqual(len(results["exhausted"]), thread_count - 1)
+        winner_index, winner_signature = results["ok"][0]
+        self.assertEqual(winner_signature, sign(self.message, self.private_key))
+        self.assertTrue(signer.used)
+        self.assertTrue(verify(self.message, winner_signature, self.public_key))
 
 
 if __name__ == "__main__":

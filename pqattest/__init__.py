@@ -1,18 +1,22 @@
 """pqattest - hash-based one-time signatures (Lamport construction).
 
-Public API: keygen / public_key_from / sign / verify / message_bits.
+Public API: keygen / public_key_from / sign / verify / message_bits /
+OneTimeSigner / KeyExhaustedError.
 """
 
 from __future__ import annotations
 
 import hashlib
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 __all__ = [
     "BITS",
     "HASH_BYTES",
+    "KeyExhaustedError",
+    "OneTimeSigner",
     "PrivateKey",
     "PublicKey",
     "keygen",
@@ -116,3 +120,53 @@ def verify(message: Any, signature: Sequence[bytes], public_key: PublicKey) -> b
         if _secret_digest(materialised[index]) != public_key.digests[2 * index + bit]:
             return False
     return True
+
+
+class KeyExhaustedError(RuntimeError):
+    """A :class:`OneTimeSigner` was asked to sign after its key was already used."""
+
+
+class OneTimeSigner:
+    """Thread-safe, single-use wrapper around a :class:`PrivateKey`.
+
+    The first :meth:`sign` call returns the ordinary Lamport signature and
+    marks the key as used; every later call raises :class:`KeyExhaustedError`.
+    The guard is per instance — calling the stateless :func:`sign` directly is
+    unaffected.
+    """
+
+    __slots__ = ("_lock", "_private_key", "_public_key", "_used")
+
+    def __init__(self, private_key: PrivateKey) -> None:
+        if not isinstance(private_key, PrivateKey):
+            raise TypeError("private_key must be a PrivateKey")
+        self._lock = threading.Lock()
+        self._private_key = private_key
+        self._public_key = public_key_from(private_key)
+        self._used = False
+
+    @property
+    def public_key(self) -> PublicKey:
+        """Public key derived from the wrapped private key (read-only)."""
+        return self._public_key
+
+    @property
+    def used(self) -> bool:
+        """``True`` once a signature has been produced (read-only)."""
+        return self._used
+
+    def sign(self, message: Any) -> tuple[bytes, ...]:
+        """Sign once.
+
+        Behaves exactly like :func:`sign` on the first call, accepting
+        ``bytes``/``bytearray``/``str``; an unsupported message type raises
+        ``TypeError`` without consuming the key. Any later call raises
+        :class:`KeyExhaustedError`. Concurrent calls are serialised so that at
+        most one of them can succeed.
+        """
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            signature = sign(message, self._private_key)
+            self._used = True
+            return signature

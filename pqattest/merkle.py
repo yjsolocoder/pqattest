@@ -59,6 +59,13 @@ def _validate_nodes(name: str, nodes: Any) -> None:
             raise ValueError(f"every {name} node must be exactly {ELEMENT_BYTES} bytes")
 
 
+def _nodes_well_formed(nodes: Any) -> bool:
+    """Non-raising counterpart of :func:`_validate_nodes` for verification."""
+    return isinstance(nodes, tuple) and all(
+        isinstance(node, bytes) and len(node) == ELEMENT_BYTES for node in nodes
+    )
+
+
 def _leaf_hash(w: int, elements: tuple[bytes, ...]) -> bytes:
     return hashlib.sha256(_LEAF_DOMAIN + bytes([w]) + b"".join(elements)).digest()
 
@@ -183,20 +190,39 @@ def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> 
     is folded in according to the bits of ``signature.index`` (leaf level
     first), and the result is compared against ``public_key.root``. A wrong
     public key *type* raises ``TypeError``; every other structural, range or
-    content mismatch returns ``False``.
+    content mismatch returns ``False`` — including keys or signatures whose
+    fields were corrupted by bypassing the frozen-dataclass constructors.
     """
     if not isinstance(public_key, MerklePublicKey):
         raise TypeError("public_key must be a MerklePublicKey")
     if not isinstance(signature, MerkleSignature):
         return False
-    w = public_key.w
-    height = public_key.height
-    if len(signature.auth_path) != height:
+    try:
+        w = public_key.w
+        height = public_key.height
+        root = public_key.root
+        index = signature.index
+        wots_signature = signature.wots_signature
+        auth_path = signature.auth_path
+    except AttributeError:
         return False
-    if signature.index >= (1 << height):
+    try:
+        _validate_w(w)
+        _validate_height(height)
+    except ValueError:
+        return False
+    if not isinstance(root, bytes) or len(root) != ELEMENT_BYTES:
+        return False
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        return False
+    if not _nodes_well_formed(wots_signature) or not _nodes_well_formed(auth_path):
+        return False
+    if len(auth_path) != height:
+        return False
+    if index >= (1 << height):
         return False
     b, l1, l2 = _params(w)
-    if len(signature.wots_signature) != l1 + l2:
+    if len(wots_signature) != l1 + l2:
         return False
     try:
         digits = _signing_digits(message, w)
@@ -204,12 +230,12 @@ def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> 
         return False
     recovered = tuple(
         _chain_walk(element, b - 1 - digit)
-        for element, digit in zip(signature.wots_signature, digits)
+        for element, digit in zip(wots_signature, digits)
     )
     node = _leaf_hash(w, recovered)
-    for level, sibling in enumerate(signature.auth_path):
-        if (signature.index >> level) & 1:
+    for level, sibling in enumerate(auth_path):
+        if (index >> level) & 1:
             node = _node_hash(sibling, node)
         else:
             node = _node_hash(node, sibling)
-    return node == public_key.root
+    return node == root

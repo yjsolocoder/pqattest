@@ -4,7 +4,8 @@ Public API: keygen / public_key_from / sign / verify / message_bits /
 OneTimeSigner / KeyExhaustedError, the Winternitz construction:
 wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey,
 Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
-MerkleSignature / merkle_verify, and static parameter analysis:
+MerkleSignature / merkle_verify (with checkpoint / from_checkpoint for
+caller-managed state persistence), and static parameter analysis:
 Params / profile / recommend.
 """
 

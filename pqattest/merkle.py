@@ -4,7 +4,10 @@ A :class:`MerkleSigner` generates ``2 ** height`` W-OTS key pairs up front and
 commits to every public key in a Merkle tree. The tree root is the single
 long-term public key; each signature spends one leaf (one W-OTS key pair) and
 carries the authentication path from that leaf to the root. Only the standard
-library is used and no state persists beyond the process.
+library is used. State is in-process by default; :meth:`MerkleSigner.checkpoint`
+optionally exports the full private state (including every W-OTS private key)
+so the caller can persist it, and :meth:`MerkleSigner.from_checkpoint` restores
+a signer that continues leaf allocation exactly where the snapshot was taken.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from typing import Any, Callable
 from ._errors import KeyExhaustedError
 from .wots import (
     ELEMENT_BYTES,
+    WOTSPrivateKey,
     _chain_walk,
     _params,
     _signing_digits,
@@ -37,6 +41,12 @@ _LEAF_DOMAIN = b"pqattest/leaf"
 _NODE_DOMAIN = b"pqattest/node"
 _MIN_HEIGHT = 1
 _MAX_HEIGHT = 8
+
+_CHECKPOINT_MAGIC = b"PQAMSCP\0"
+_CHECKPOINT_VERSION = 1
+# magic(8) + version(1) + w(1) + height(1) + next_index(2) + count(4) + root(32)
+_CHECKPOINT_HEADER_BYTES = 49
+_CHECKPOINT_CHECKSUM_BYTES = 32
 
 
 def _validate_height(height: Any) -> int:
@@ -72,6 +82,17 @@ def _leaf_hash(w: int, elements: tuple[bytes, ...]) -> bytes:
 
 def _node_hash(left: bytes, right: bytes) -> bytes:
     return hashlib.sha256(_NODE_DOMAIN + left + right).digest()
+
+
+def _tree_layers(leaves: list[bytes]) -> list[list[bytes]]:
+    """Stack Merkle layers above ``leaves`` up to and including the root."""
+    layers = [leaves]
+    while len(layers[-1]) > 1:
+        level = layers[-1]
+        layers.append(
+            [_node_hash(level[i], level[i + 1]) for i in range(0, len(level), 2)]
+        )
+    return layers
 
 
 @dataclass(frozen=True)
@@ -134,20 +155,17 @@ class MerkleSigner:
     ) -> None:
         w = _validate_w(w)
         height = _validate_height(height)
+        _, l1, l2 = _params(w)
         private_keys = []
         leaves = []
         for _ in range(1 << height):
             wots_private, wots_public = wots_keygen(w=w, token_bytes=token_bytes)
             private_keys.append(wots_private)
             leaves.append(_leaf_hash(w, wots_public.elements))
-        layers = [leaves]
-        while len(layers[-1]) > 1:
-            level = layers[-1]
-            layers.append(
-                [_node_hash(level[i], level[i + 1]) for i in range(0, len(level), 2)]
-            )
+        layers = _tree_layers(leaves)
         self._w = w
         self._height = height
+        self._chains = l1 + l2
         self._private_keys = tuple(private_keys)
         self._layers = tuple(tuple(layer) for layer in layers)
         self._next_index = 0
@@ -181,6 +199,127 @@ class MerkleSigner:
             return MerkleSignature(
                 index=index, wots_signature=wots_signature, auth_path=auth_path
             )
+
+    def checkpoint(self) -> bytes:
+        """Serialise the full private state into an opaque byte string.
+
+        The snapshot contains every W-OTS private key and the current leaf
+        cursor; :meth:`from_checkpoint` restores a signer with the identical
+        public key that continues allocating leaves at the saved
+        ``next_index``. The snapshot is taken under the same lock as
+        :meth:`sign`, so a concurrent checkpoint always falls either before
+        or after a complete signature — never in the middle of one.
+
+        The v1 binary layout is: the 8-byte magic ``b"PQAMSCP\\0"``, one byte
+        each of version (1), ``w`` and ``height``, a 2-byte big-endian
+        ``next_index``, a 4-byte big-endian element count (always
+        ``2 ** height`` times the chain count for ``w``), the 32-byte Merkle
+        root, then every 32-byte W-OTS private element in leaf-then-chain
+        order, and finally the SHA-256 of all preceding bytes.
+
+        .. warning::
+           The bytes are plaintext key material: the trailing SHA-256 only
+           detects accidental corruption, it neither authenticates nor
+           encrypts. Store checkpoints securely and persist them atomically
+           after every successful signature — restoring an older checkpoint
+           re-issues spent leaves and destroys unforgeability.
+        """
+        with self._lock:
+            parts = [
+                _CHECKPOINT_MAGIC,
+                bytes((_CHECKPOINT_VERSION, self._w, self._height)),
+                self._next_index.to_bytes(2, "big"),
+                (len(self._private_keys) * self._chains).to_bytes(4, "big"),
+                self._public_key.root,
+            ]
+            parts.extend(
+                element for key in self._private_keys for element in key.elements
+            )
+            body = b"".join(parts)
+            return body + hashlib.sha256(body).digest()
+
+    @classmethod
+    def from_checkpoint(cls, data: Any) -> "MerkleSigner":
+        """Restore a signer from :meth:`checkpoint` bytes; no randomness is drawn.
+
+        The restored signer has the identical public key and continues leaf
+        allocation at the saved ``next_index``; if the snapshot was taken with
+        every leaf spent, signing raises :class:`KeyExhaustedError` as before.
+        Only ``bytes``/``bytearray`` are accepted — anything else raises
+        ``TypeError``. A bad magic, version, length, ``w``, height,
+        ``next_index`` outside ``0 .. 2 ** height``, element count, checksum,
+        or a Merkle root that does not match the tree rebuilt from the
+        private keys raises ``ValueError`` and no instance is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("checkpoint data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _CHECKPOINT_HEADER_BYTES + _CHECKPOINT_CHECKSUM_BYTES:
+            raise ValueError("checkpoint is too short")
+        if data[:8] != _CHECKPOINT_MAGIC:
+            raise ValueError("bad checkpoint magic")
+        if data[8] != _CHECKPOINT_VERSION:
+            raise ValueError(f"unsupported checkpoint version: {data[8]}")
+        w = _validate_w(data[9])
+        height = _validate_height(data[10])
+        next_index = int.from_bytes(data[11:13], "big")
+        element_count = int.from_bytes(data[13:17], "big")
+        root = data[17:_CHECKPOINT_HEADER_BYTES]
+        leaf_count = 1 << height
+        if next_index > leaf_count:
+            raise ValueError(
+                f"next_index must satisfy 0 <= next_index <= {leaf_count}"
+            )
+        _, l1, l2 = _params(w)
+        chains = l1 + l2
+        if element_count != leaf_count * chains:
+            raise ValueError(
+                "element count must equal 2 ** height times the chain count"
+            )
+        expected = (
+            _CHECKPOINT_HEADER_BYTES
+            + element_count * ELEMENT_BYTES
+            + _CHECKPOINT_CHECKSUM_BYTES
+        )
+        if len(data) != expected:
+            raise ValueError("checkpoint length mismatch")
+        body = data[:-_CHECKPOINT_CHECKSUM_BYTES]
+        if hashlib.sha256(body).digest() != data[-_CHECKPOINT_CHECKSUM_BYTES:]:
+            raise ValueError("checkpoint checksum mismatch")
+        elements = data[_CHECKPOINT_HEADER_BYTES:-_CHECKPOINT_CHECKSUM_BYTES]
+        key_bytes = chains * ELEMENT_BYTES
+        private_keys = tuple(
+            WOTSPrivateKey(
+                w=w,
+                elements=tuple(
+                    elements[offset : offset + ELEMENT_BYTES]
+                    for offset in range(
+                        leaf * key_bytes, (leaf + 1) * key_bytes, ELEMENT_BYTES
+                    )
+                ),
+            )
+            for leaf in range(leaf_count)
+        )
+        b = 1 << w
+        leaves = [
+            _leaf_hash(
+                w, tuple(_chain_walk(element, b - 1) for element in key.elements)
+            )
+            for key in private_keys
+        ]
+        layers = _tree_layers(leaves)
+        if layers[-1][0] != root:
+            raise ValueError("checkpoint root does not match the private keys")
+        signer = cls.__new__(cls)
+        signer._w = w
+        signer._height = height
+        signer._chains = chains
+        signer._private_keys = private_keys
+        signer._layers = tuple(tuple(layer) for layer in layers)
+        signer._next_index = next_index
+        signer._lock = threading.Lock()
+        signer._public_key = MerklePublicKey(w=w, height=height, root=root)
+        return signer
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

@@ -6,7 +6,9 @@ from . import (
     BITS,
     ELEMENT_BYTES,
     HASH_BYTES,
+    MerkleSigner,
     keygen,
+    merkle_verify,
     message_bits,
     public_key_from,
     sign,
@@ -53,6 +55,20 @@ def main() -> int:
             f"signature {len(wots_signature) * ELEMENT_BYTES} B, "
             f"verify: {wots_verify(MESSAGE, wots_signature, wots_public)}"
         )
+
+    print()
+    print("Merkle aggregation over W-OTS")
+    merkle_signer = MerkleSigner(height=4, w=4)
+    merkle_key = merkle_signer.public_key
+    print(f"  height={merkle_key.height} ({merkle_signer.remaining} leaves), root: {merkle_key.root.hex()[:32]}...")
+    merkle_signature = merkle_signer.sign(MESSAGE)
+    print(
+        f"  leaf {merkle_signature.index}: signature "
+        f"{len(merkle_signature.wots_signature)} elements + "
+        f"{len(merkle_signature.auth_path)} path nodes, "
+        f"verify: {merkle_verify(MESSAGE, merkle_signature, merkle_key)}"
+    )
+    print(f"  different message -> {merkle_verify(MESSAGE + '!', merkle_signature, merkle_key)}")
     return 0
 
 

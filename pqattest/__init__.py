@@ -2,7 +2,9 @@
 
 Public API: keygen / public_key_from / sign / verify / message_bits /
 OneTimeSigner / KeyExhaustedError, plus the Winternitz construction:
-wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey.
+wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey,
+and Merkle aggregation over W-OTS: MerkleSigner / MerklePublicKey /
+MerkleSignature / merkle_verify.
 """
 
 from __future__ import annotations
@@ -27,12 +29,16 @@ __all__ = [
     "ELEMENT_BYTES",
     "HASH_BYTES",
     "KeyExhaustedError",
+    "MerklePublicKey",
+    "MerkleSignature",
+    "MerkleSigner",
     "OneTimeSigner",
     "PrivateKey",
     "PublicKey",
     "WOTSPrivateKey",
     "WOTSPublicKey",
     "keygen",
+    "merkle_verify",
     "message_bits",
     "message_digest",
     "public_key_from",
@@ -186,3 +192,11 @@ class OneTimeSigner:
             signature = sign(message, self._private_key)
             self._used = True
             return signature
+
+
+from .merkle import (  # noqa: E402  (after KeyExhaustedError, which merkle imports)
+    MerklePublicKey,
+    MerkleSignature,
+    MerkleSigner,
+    merkle_verify,
+)

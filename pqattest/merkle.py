@@ -4,10 +4,13 @@ A :class:`MerkleSigner` generates ``2 ** height`` W-OTS key pairs up front and
 commits to every public key in a Merkle tree. The tree root is the single
 long-term public key; each signature spends one leaf (one W-OTS key pair) and
 carries the authentication path from that leaf to the root. Only the standard
-library is used. State can be persisted explicitly with
-:meth:`MerkleSigner.checkpoint` / :meth:`MerkleSigner.from_checkpoint`; the
-checkpoint contains every private key and is protected only by a SHA-256
-checksum against accidental corruption, so callers must store it securely.
+library is used. Public keys and signatures have a versioned binary wire
+format via ``to_bytes`` / ``from_bytes`` (the signature codec is constrained
+by the corresponding :class:`MerklePublicKey`). Signer state can be persisted
+explicitly with :meth:`MerkleSigner.checkpoint` /
+:meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
+key and is protected only by a SHA-256 checksum against accidental
+corruption, so callers must store it securely.
 """
 
 from __future__ import annotations
@@ -47,6 +50,14 @@ _CHECKPOINT_VERSION = 1
 _CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 1 + 2 + 4 + ELEMENT_BYTES
 _CHECKPOINT_CHECKSUM_BYTES = 32
 
+_PUBLIC_KEY_MAGIC = b"PQAMPK\0\0"
+_PUBLIC_KEY_VERSION = 1
+_PUBLIC_KEY_BYTES = 8 + 1 + 1 + 1 + ELEMENT_BYTES
+
+_SIGNATURE_MAGIC = b"PQAMSIG\0"
+_SIGNATURE_VERSION = 1
+_SIGNATURE_HEADER_BYTES = 8 + 1 + 1 + 1 + 2 + 2 + 1
+
 
 def _validate_height(height: Any) -> int:
     if (
@@ -79,6 +90,15 @@ def _leaf_hash(w: int, elements: tuple[bytes, ...]) -> bytes:
     return hashlib.sha256(_LEAF_DOMAIN + bytes([w]) + b"".join(elements)).digest()
 
 
+def _signature_params(public_key: MerklePublicKey) -> tuple[int, int, int]:
+    """Return ``(w, height, chains)`` constraining a signature encoding."""
+    w = _validate_w(public_key.w)
+    height = _validate_height(public_key.height)
+    _, l1, l2 = _params(w)
+    return w, height, l1 + l2
+
+
+
 def _node_hash(left: bytes, right: bytes) -> bytes:
     return hashlib.sha256(_NODE_DOMAIN + left + right).digest()
 
@@ -102,6 +122,49 @@ class MerklePublicKey:
         """Number of W-OTS leaves (signatures) this key commits to."""
         return 1 << self.height
 
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAMPK\\0\\0"``, one byte each for
+        the version (1), ``w`` and ``height``, and the 32-byte root — 43 bytes
+        in total. Encoding is deterministic: the same key always produces the
+        same bytes. Fields corrupted by bypassing the frozen constructor
+        raise ``ValueError`` instead of producing a malformed encoding.
+        """
+        if not isinstance(self, MerklePublicKey):
+            raise TypeError("to_bytes must be called on a MerklePublicKey")
+        _validate_w(self.w)
+        _validate_height(self.height)
+        if not isinstance(self.root, bytes) or len(self.root) != ELEMENT_BYTES:
+            raise ValueError(f"root must be exactly {ELEMENT_BYTES} bytes")
+        return (
+            _PUBLIC_KEY_MAGIC
+            + bytes((_PUBLIC_KEY_VERSION, self.w, self.height))
+            + self.root
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "MerklePublicKey":
+        """Parse ``to_bytes()`` output back into a :class:`MerklePublicKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, a truncated or
+        over-long encoding, or invalid ``w``/``height``/root fields raises
+        ``ValueError`` and no instance is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("public key data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PUBLIC_KEY_BYTES:
+            raise ValueError("public key encoding is truncated")
+        if len(data) > _PUBLIC_KEY_BYTES:
+            raise ValueError("trailing data after the public key encoding")
+        if data[:8] != _PUBLIC_KEY_MAGIC:
+            raise ValueError("bad public key magic")
+        if data[8] != _PUBLIC_KEY_VERSION:
+            raise ValueError(f"unsupported public key version: {data[8]}")
+        return cls(w=data[9], height=data[10], root=data[11:_PUBLIC_KEY_BYTES])
+
 
 @dataclass(frozen=True)
 class MerkleSignature:
@@ -124,6 +187,105 @@ class MerkleSignature:
             raise ValueError("index must be a non-negative integer")
         _validate_nodes("wots_signature", self.wots_signature)
         _validate_nodes("auth_path", self.auth_path)
+
+    def to_bytes(self, public_key: MerklePublicKey) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The signature carries no parameters of its own, so ``public_key``
+        supplies — and constrains — them: the encoding stores the key's ``w``
+        and ``height``, and the signature must match them (index below
+        ``2 ** height``, as many W-OTS elements as ``w`` has chains, and an
+        authentication path exactly ``height`` nodes long). The layout is the
+        8-byte magic ``b"PQAMSIG\\0"``; one byte each for the version (1),
+        ``w`` and ``height``; the index and the W-OTS element count as 2
+        big-endian bytes each; the path count as 1 byte; then every signature
+        element followed by the authentication path from the leaf level
+        upwards, 32 bytes each. Encoding is deterministic. A wrong
+        ``public_key`` type raises ``TypeError``; a signature inconsistent
+        with the key (or corrupted by bypassing the frozen constructor)
+        raises ``ValueError``.
+        """
+        if not isinstance(self, MerkleSignature):
+            raise TypeError("to_bytes must be called on a MerkleSignature")
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        w, height, chains = _signature_params(public_key)
+        index = self.index
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError("index must be a non-negative integer")
+        if index >= (1 << height):
+            raise ValueError("index is out of range for the public key's tree height")
+        _validate_nodes("wots_signature", self.wots_signature)
+        _validate_nodes("auth_path", self.auth_path)
+        if len(self.wots_signature) != chains:
+            raise ValueError("wots_signature length does not match the chain count")
+        if len(self.auth_path) != height:
+            raise ValueError("auth_path length does not match the tree height")
+        return (
+            _SIGNATURE_MAGIC
+            + bytes((_SIGNATURE_VERSION, w, height))
+            + index.to_bytes(2, "big")
+            + chains.to_bytes(2, "big")
+            + bytes((height,))
+            + b"".join(self.wots_signature)
+            + b"".join(self.auth_path)
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any, public_key: MerklePublicKey) -> "MerkleSignature":
+        """Parse ``to_bytes()`` output back into a :class:`MerkleSignature`.
+
+        ``public_key`` constrains the expected parameters: the encoded ``w``
+        and ``height`` must equal the key's, the index must be below
+        ``2 ** height``, the element count must equal the chain count for
+        ``w`` and the path count must equal ``height``. ``data`` must be
+        ``bytes`` or ``bytearray`` and ``public_key`` a
+        :class:`MerklePublicKey`; other types raise ``TypeError``. A bad
+        magic, an unknown version, a parameter mismatch, a wrong count, an
+        out-of-range index, truncation or trailing data raises ``ValueError``
+        and no instance is returned.
+        """
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("signature data must be bytes or bytearray")
+        data = bytes(data)
+        w, height, chains = _signature_params(public_key)
+        if len(data) < _SIGNATURE_HEADER_BYTES:
+            raise ValueError("signature encoding is truncated")
+        if data[:8] != _SIGNATURE_MAGIC:
+            raise ValueError("bad signature magic")
+        if data[8] != _SIGNATURE_VERSION:
+            raise ValueError(f"unsupported signature version: {data[8]}")
+        if data[9] != w:
+            raise ValueError("encoded w does not match the public key")
+        if data[10] != height:
+            raise ValueError("encoded height does not match the public key")
+        index = int.from_bytes(data[11:13], "big")
+        element_count = int.from_bytes(data[13:15], "big")
+        path_count = data[15]
+        if index >= (1 << height):
+            raise ValueError("index is out of range for the public key's tree height")
+        if element_count != chains:
+            raise ValueError("element count does not match the chain count")
+        if path_count != height:
+            raise ValueError("path count does not match the tree height")
+        expected = _SIGNATURE_HEADER_BYTES + (element_count + path_count) * ELEMENT_BYTES
+        if len(data) < expected:
+            raise ValueError("signature encoding is truncated")
+        if len(data) > expected:
+            raise ValueError("trailing data after the signature encoding")
+        offset = _SIGNATURE_HEADER_BYTES
+        wots_signature = tuple(
+            data[offset + i * ELEMENT_BYTES : offset + (i + 1) * ELEMENT_BYTES]
+            for i in range(element_count)
+        )
+        offset += element_count * ELEMENT_BYTES
+        auth_path = tuple(
+            data[offset + i * ELEMENT_BYTES : offset + (i + 1) * ELEMENT_BYTES]
+            for i in range(path_count)
+        )
+        return cls(index=index, wots_signature=wots_signature, auth_path=auth_path)
 
 
 class MerkleSigner:

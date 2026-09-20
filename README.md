@@ -172,9 +172,24 @@ signer = MerkleSigner(height=params.height, w=params.w)
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。
 
+教学用格基玩具 KEM（**未经审计，仅用于教学演示，严禁用于生产**）：
+
+- `ToyLatticePublicKey(t)` / `ToyLatticePrivateKey(s)` / `ToyLatticeCiphertext(u, tag)` — 冻结的值对象（记作 P/S/C），可位置构造、按值相等；字段均为 `bytes`，其中 `t`/`s`/`u` 必须是 `E` 的编码值：8 个 `0..256` 系数各按 2 字节大端拼接成的 16 字节串（点积用解码后的向量计算）；`tag` 为 32 字节。字段类型错误抛 `TypeError`，长度或系数越界抛 `ValueError`
+- `toy_lattice_keygen(*, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`；取 `x = token_bytes(8)`，令 `s = t = E(x)`
+- `toy_lattice_encapsulate(public_key, *, token_bytes=secrets.token_bytes)` — 返回 `(ciphertext, K)`；取 `r = token_bytes(8)`、`u = E(r)`，共享值 `v = t·r mod 257`，`K = SHA256(b"K" + v 的 2 字节大端)`，`tag = K`
+- `toy_lattice_decapsulate(ciphertext, private_key)` — 重算 `v = s·u mod 257` 与 `K`，常量时间校验 `tag` 后返回 `K`；`tag` 不匹配抛 `ValueError`；`ciphertext`/`private_key` 类型错误抛 `TypeError`
+
+```python
+from pqattest import toy_lattice_keygen, toy_lattice_encapsulate, toy_lattice_decapsulate
+
+private_key, public_key = toy_lattice_keygen()
+ciphertext, key = toy_lattice_encapsulate(public_key)
+assert toy_lattice_decapsulate(ciphertext, private_key) == key
+```
+
 ## 限制
 
-Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用（Lamport 可用 `OneTimeSigner` 在进程内防护；W-OTS 没有等价包装器）。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子；`MerkleSigner` 只在进程内跟踪已用叶子，跨进程持久化须由调用方通过 `checkpoint()`/`from_checkpoint()` 完成——检查点明文包含全部私钥且校验值不提供认证，安全存储、每次签名后原子更新、绝不回滚旧检查点的责任都在调用方，回滚即造成叶子重用。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。
+Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用（Lamport 可用 `OneTimeSigner` 在进程内防护；W-OTS 没有等价包装器）。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子；`MerkleSigner` 只在进程内跟踪已用叶子，跨进程持久化须由调用方通过 `checkpoint()`/`from_checkpoint()` 完成——检查点明文包含全部私钥且校验值不提供认证，安全存储、每次签名后原子更新、绝不回滚旧检查点的责任都在调用方，回滚即造成叶子重用。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。玩具 KEM 私钥与公钥相同（`s == t`）、共享值空间只有 257 个取值且 `tag` 直接等于会话密钥，**没有任何机密性或完整性保证**，只用于演示 KEM 接口形状，不得用于任何真实场景。
 
 ## 测试
 

@@ -4,7 +4,13 @@ Like the Lamport construction this is a **one-time** signature: a key pair
 must sign at most one message. Each signing key is a set of hash chains; a
 signature for a base-``B`` digit ``d`` reveals the value at chain step ``d``
 and the public key holds the step ``B - 1`` endpoint. Only the standard
-library is used. :class:`WOTSOneTimeSigner` state can be persisted with a
+library is used. Keys and signatures have a deterministic, versioned v1
+binary codec: :meth:`WOTSPrivateKey.to_bytes` /
+:meth:`WOTSPrivateKey.from_bytes`, :meth:`WOTSPublicKey.to_bytes` /
+:meth:`WOTSPublicKey.from_bytes`, and the stateless
+:func:`wots_signature_to_bytes` / :func:`wots_signature_from_bytes`. The
+private-key encoding contains the secret in the clear, so callers must store
+it securely. :class:`WOTSOneTimeSigner` state can be persisted with a
 versioned binary checkpoint (``checkpoint`` / ``from_checkpoint``); the blob
 holds the private key in the clear and is integrity-protected only by a
 SHA-256 checksum, so callers must store it securely.
@@ -27,6 +33,8 @@ __all__ = [
     "WOTSPublicKey",
     "wots_keygen",
     "wots_sign",
+    "wots_signature_from_bytes",
+    "wots_signature_to_bytes",
     "wots_verify",
 ]
 
@@ -38,6 +46,12 @@ _CHECKPOINT_MAGIC = b"PQAWCP\0\0"
 _CHECKPOINT_VERSION = 1
 _CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 1 + 2
 _CHECKPOINT_CHECKSUM_BYTES = 32
+
+_PRIVATE_KEY_MAGIC = b"PQAWPRV\0"
+_PUBLIC_KEY_MAGIC = b"PQAWPUB\0"
+_SIGNATURE_MAGIC = b"PQAWSIG\0"
+_CODEC_VERSION = 1
+_CODEC_HEADER_BYTES = 8 + 1 + 1 + 2
 
 
 def _as_bytes(message: Any) -> bytes:
@@ -78,6 +92,60 @@ def _validate_elements(w: int, elements: Any) -> None:
             raise ValueError(f"every element must be exactly {ELEMENT_BYTES} bytes")
 
 
+def _chain_count(w: int) -> int:
+    _, l1, l2 = _params(w)
+    return l1 + l2
+
+
+def _encode_v1(magic: bytes, w: int, elements: tuple[bytes, ...]) -> bytes:
+    """Shared v1 layout: magic, version, ``w``, element count, elements."""
+    return (
+        magic
+        + bytes((_CODEC_VERSION, w))
+        + len(elements).to_bytes(2, "big")
+        + b"".join(elements)
+    )
+
+
+def _decode_v1(data: Any, magic: bytes, name: str) -> tuple[int, tuple[bytes, ...]]:
+    """Parse a v1 blob into ``(w, elements)``; ``name`` labels error messages."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"{name} data must be bytes or bytearray")
+    data = bytes(data)
+    if len(data) < _CODEC_HEADER_BYTES:
+        raise ValueError(f"{name} encoding is truncated")
+    if data[:8] != magic:
+        raise ValueError(f"bad {name} magic")
+    if data[8] != _CODEC_VERSION:
+        raise ValueError(f"unsupported {name} version: {data[8]}")
+    w = _validate_w(data[9])
+    element_count = int.from_bytes(data[10:12], "big")
+    chains = _chain_count(w)
+    if element_count != chains:
+        raise ValueError("element count does not match the chain count for w")
+    expected = _CODEC_HEADER_BYTES + element_count * ELEMENT_BYTES
+    if len(data) < expected:
+        raise ValueError(f"{name} encoding is truncated")
+    if len(data) > expected:
+        raise ValueError(f"trailing data after the {name} encoding")
+    elements = tuple(
+        data[_CODEC_HEADER_BYTES + i * ELEMENT_BYTES : _CODEC_HEADER_BYTES + (i + 1) * ELEMENT_BYTES]
+        for i in range(element_count)
+    )
+    return w, elements
+
+
+def _key_to_bytes(key: Any, key_type: type, magic: bytes, name: str) -> bytes:
+    if not isinstance(key, key_type):
+        raise TypeError(f"to_bytes must be called on a {key_type.__name__}")
+    try:
+        w = _validate_w(key.w)
+        _validate_elements(w, key.elements)
+    except TypeError as exc:
+        raise ValueError(f"corrupted {name}: {exc}") from exc
+    return _encode_v1(magic, w, key.elements)
+
+
 @dataclass(frozen=True)
 class WOTSPrivateKey:
     """Frozen W-OTS private key.
@@ -98,6 +166,33 @@ class WOTSPrivateKey:
         """Number of chains (and signature elements): ``l1 + l2``."""
         return len(self.elements)
 
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAWPRV\\0"``; one byte each for
+        the version (1) and ``w``; the element count as 2 big-endian bytes
+        (67 for ``w=4``, 34 for ``w=8``); then every private element in chain
+        order, 32 bytes each. Encoding is deterministic: the same key always
+        produces the same bytes. Fields corrupted by bypassing the frozen
+        constructor raise ``ValueError`` instead of producing a malformed
+        encoding. The blob contains the private key in the clear — store it
+        as a secret.
+        """
+        return _key_to_bytes(self, WOTSPrivateKey, _PRIVATE_KEY_MAGIC, "private key")
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "WOTSPrivateKey":
+        """Parse ``to_bytes()`` output back into a :class:`WOTSPrivateKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, an invalid ``w``, an
+        element count that does not match the chain count for ``w``,
+        truncation or trailing data raises ``ValueError`` and no instance is
+        returned. The restored key is equal by value to the original.
+        """
+        w, elements = _decode_v1(data, _PRIVATE_KEY_MAGIC, "private key")
+        return cls(w=w, elements=elements)
+
 
 @dataclass(frozen=True)
 class WOTSPublicKey:
@@ -114,6 +209,32 @@ class WOTSPublicKey:
     def length(self) -> int:
         """Number of chains (and signature elements): ``l1 + l2``."""
         return len(self.elements)
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAWPUB\\0"``; one byte each for
+        the version (1) and ``w``; the element count as 2 big-endian bytes
+        (67 for ``w=4``, 34 for ``w=8``); then every public element in chain
+        order, 32 bytes each. Encoding is deterministic: the same key always
+        produces the same bytes. Fields corrupted by bypassing the frozen
+        constructor raise ``ValueError`` instead of producing a malformed
+        encoding.
+        """
+        return _key_to_bytes(self, WOTSPublicKey, _PUBLIC_KEY_MAGIC, "public key")
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "WOTSPublicKey":
+        """Parse ``to_bytes()`` output back into a :class:`WOTSPublicKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, an invalid ``w``, an
+        element count that does not match the chain count for ``w``,
+        truncation or trailing data raises ``ValueError`` and no instance is
+        returned. The restored key is equal by value to the original.
+        """
+        w, elements = _decode_v1(data, _PUBLIC_KEY_MAGIC, "public key")
+        return cls(w=w, elements=elements)
 
 
 def _chain_step(value: bytes) -> bytes:
@@ -359,3 +480,46 @@ def wots_verify(
         if endpoint != public_key.elements[i]:
             return False
     return True
+
+
+def wots_signature_to_bytes(signature: Any, *, w: int) -> bytes:
+    """Serialise a stateless W-OTS signature to the versioned v1 wire format.
+
+    ``signature`` must be a ``tuple`` whose members are all ``bytes`` — the
+    shape :func:`wots_sign` returns; anything else raises ``TypeError``.
+    ``w`` is keyword-only and must be 4 or 8 (``ValueError`` otherwise); the
+    signature must contain exactly the chain count for ``w`` (67 or 34
+    elements) and every element must be exactly 32 bytes, else ``ValueError``.
+
+    The layout is the 8-byte magic ``b"PQAWSIG\\0"``; one byte each for the
+    version (1) and ``w``; the element count as 2 big-endian bytes; then every
+    signature element in chain order, 32 bytes each. Encoding is
+    deterministic: the same signature and ``w`` always produce the same
+    bytes.
+    """
+    if not isinstance(signature, tuple):
+        raise TypeError("signature must be a tuple of 32-byte values")
+    for element in signature:
+        if not isinstance(element, bytes):
+            raise TypeError("every signature element must be bytes")
+    w = _validate_w(w)
+    chains = _chain_count(w)
+    if len(signature) != chains:
+        raise ValueError(f"signature must contain exactly {chains} elements for w={w}")
+    for element in signature:
+        if len(element) != ELEMENT_BYTES:
+            raise ValueError(f"every signature element must be exactly {ELEMENT_BYTES} bytes")
+    return _encode_v1(_SIGNATURE_MAGIC, w, signature)
+
+
+def wots_signature_from_bytes(data: Any) -> tuple[int, tuple[bytes, ...]]:
+    """Parse ``wots_signature_to_bytes()`` output back into ``(w, elements)``.
+
+    ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+    ``TypeError``. A bad magic, an unknown version, an invalid ``w``, an
+    element count that does not match the chain count for ``w``, truncation
+    or trailing data raises ``ValueError``. The returned ``elements`` are an
+    immutable ``tuple`` of 32-byte ``bytes`` in the original chain order,
+    ready for :func:`wots_verify`.
+    """
+    return _decode_v1(data, _SIGNATURE_MAGIC, "signature")

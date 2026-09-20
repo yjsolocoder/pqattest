@@ -3,7 +3,8 @@
 Public API: keygen / public_key_from / sign / verify / message_bits /
 OneTimeSigner / KeyExhaustedError, the Winternitz construction:
 wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey /
-WOTSOneTimeSigner, Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
+WOTSOneTimeSigner / wots_signature_to_bytes / wots_signature_from_bytes,
+Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
 MerkleSignature / MerkleProof / merkle_verify, static parameter analysis:
 Params / profile / recommend, and the teaching-only toy lattice KEM:
 toy_lattice_keygen / toy_lattice_encapsulate / toy_lattice_decapsulate /
@@ -42,6 +43,8 @@ from .wots import (
     WOTSPublicKey,
     wots_keygen,
     wots_sign,
+    wots_signature_from_bytes,
+    wots_signature_to_bytes,
     wots_verify,
 )
 
@@ -78,6 +81,8 @@ __all__ = [
     "verify",
     "wots_keygen",
     "wots_sign",
+    "wots_signature_from_bytes",
+    "wots_signature_to_bytes",
     "wots_verify",
 ]
 

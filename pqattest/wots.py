@@ -4,7 +4,10 @@ Like the Lamport construction this is a **one-time** signature: a key pair
 must sign at most one message. Each signing key is a set of hash chains; a
 signature for a base-``B`` digit ``d`` reveals the value at chain step ``d``
 and the public key holds the step ``B - 1`` endpoint. Only the standard
-library is used.
+library is used. :class:`WOTSOneTimeSigner` state can be persisted with a
+versioned binary checkpoint (``checkpoint`` / ``from_checkpoint``); the blob
+holds the private key in the clear and is integrity-protected only by a
+SHA-256 checksum, so callers must store it securely.
 """
 
 from __future__ import annotations
@@ -30,6 +33,11 @@ __all__ = [
 ELEMENT_BYTES = 32
 _DOMAIN = b"pqattest/wots/v1"
 _ALLOWED_W = (4, 8)
+
+_CHECKPOINT_MAGIC = b"PQAWCP\0\0"
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 1 + 2
+_CHECKPOINT_CHECKSUM_BYTES = 32
 
 
 def _as_bytes(message: Any) -> bytes:
@@ -147,7 +155,10 @@ class WOTSOneTimeSigner:
     :class:`~pqattest.KeyExhaustedError`. The guard is per instance and per
     process — copying the private key, calling the stateless :func:`wots_sign`
     directly or reusing the key in another process is the caller's
-    responsibility.
+    responsibility. State can be persisted with :meth:`checkpoint` and
+    restored in another process with :meth:`from_checkpoint`; the checkpoint
+    contains the private key in the clear and is protected only by a SHA-256
+    checksum against accidental corruption, so callers must store it securely.
     """
 
     __slots__ = ("_lock", "_private_key", "_public_key", "_used")
@@ -155,16 +166,28 @@ class WOTSOneTimeSigner:
     def __init__(self, private_key: WOTSPrivateKey) -> None:
         if not isinstance(private_key, WOTSPrivateKey):
             raise TypeError("private_key must be a WOTSPrivateKey")
-        self._lock = threading.Lock()
-        self._private_key = private_key
+        self._restore_state(private_key, self._public_key_from(private_key), False)
+
+    @staticmethod
+    def _public_key_from(private_key: WOTSPrivateKey) -> WOTSPublicKey:
         b = 1 << private_key.w
-        self._public_key = WOTSPublicKey(
+        return WOTSPublicKey(
             w=private_key.w,
             elements=tuple(
                 _chain_walk(start, b - 1) for start in private_key.elements
             ),
         )
-        self._used = False
+
+    def _restore_state(
+        self,
+        private_key: WOTSPrivateKey,
+        public_key: WOTSPublicKey,
+        used: bool,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._private_key = private_key
+        self._public_key = public_key
+        self._used = used
 
     @property
     def public_key(self) -> WOTSPublicKey:
@@ -193,6 +216,79 @@ class WOTSOneTimeSigner:
             signature = wots_sign(message, self._private_key)
             self._used = True
             return signature
+
+    def checkpoint(self) -> bytes:
+        """Serialise the signer state (private key plus ``used``) to ``bytes``.
+
+        The v1 layout is: the 8-byte magic ``b"PQAWCP\\0\\0"``; one byte each
+        for the version (1), ``w`` and ``used`` (0 or 1); the element count as
+        2 big-endian bytes (67 for ``w=4``, 34 for ``w=8``); every private key
+        element in chain order (32 bytes each); and finally the SHA-256 of all
+        preceding content. Encoding is deterministic: the same state always
+        produces the same bytes.
+
+        The checkpoint shares the signing lock, so a concurrent snapshot
+        reflects the state either immediately before or immediately after an
+        in-flight :meth:`sign`, never part-way through one. The blob contains
+        the private key in the clear and the trailing hash only detects
+        accidental corruption — store it as a secret.
+        """
+        with self._lock:
+            body = (
+                _CHECKPOINT_MAGIC
+                + bytes((_CHECKPOINT_VERSION, self._private_key.w, int(self._used)))
+                + len(self._private_key.elements).to_bytes(2, "big")
+                + b"".join(self._private_key.elements)
+            )
+            return body + hashlib.sha256(body).digest()
+
+    @classmethod
+    def from_checkpoint(cls, data: Any) -> "WOTSOneTimeSigner":
+        """Restore a signer from ``checkpoint()`` output without randomness.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, version, ``w``, ``used`` flag, element
+        count, length, truncation, trailing data or checksum mismatch raises
+        ``ValueError`` and no instance is returned. The private key and the
+        public key rebuilt from it are identical to the original's, so a
+        restored unused signer still allows exactly one signature and a
+        checkpoint taken after signing restores a signer whose every call
+        raises :class:`~pqattest.KeyExhaustedError`.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("checkpoint data must be bytes or bytearray")
+        data = bytes(data)
+        header = _CHECKPOINT_HEADER_BYTES
+        if len(data) < header + _CHECKPOINT_CHECKSUM_BYTES:
+            raise ValueError("checkpoint is too short")
+        body, checksum = data[:-_CHECKPOINT_CHECKSUM_BYTES], data[-_CHECKPOINT_CHECKSUM_BYTES:]
+        if body[:8] != _CHECKPOINT_MAGIC:
+            raise ValueError("bad checkpoint magic")
+        if body[8] != _CHECKPOINT_VERSION:
+            raise ValueError(f"unsupported checkpoint version: {body[8]}")
+        w = _validate_w(body[9])
+        used_byte = body[10]
+        if used_byte not in (0, 1):
+            raise ValueError("used flag must be 0 or 1")
+        element_count = int.from_bytes(body[11:13], "big")
+        _, l1, l2 = _params(w)
+        chains = l1 + l2
+        if element_count != chains:
+            raise ValueError("element count does not match the chain count for w")
+        if len(body) != header + element_count * ELEMENT_BYTES:
+            raise ValueError("checkpoint length does not match the element count")
+        if hashlib.sha256(body).digest() != checksum:
+            raise ValueError("checkpoint checksum mismatch")
+        elements = tuple(
+            body[header + i * ELEMENT_BYTES : header + (i + 1) * ELEMENT_BYTES]
+            for i in range(element_count)
+        )
+        private_key = WOTSPrivateKey(w=w, elements=elements)
+        signer = cls.__new__(cls)
+        signer._restore_state(
+            private_key, cls._public_key_from(private_key), bool(used_byte)
+        )
+        return signer
 
 
 def wots_keygen(

@@ -580,8 +580,9 @@ class MerkleSigner:
     """Thread-safe, in-process few-times signer over a Merkle tree of W-OTS keys.
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
-    only by a successful :meth:`sign` or :meth:`sign_batch`. Once every leaf
-    is spent, further calls raise :class:`KeyExhaustedError`.
+    only by a successful :meth:`sign`, :meth:`sign_batch` or
+    :meth:`sign_with_checkpoint`. Once every leaf is spent, further calls
+    raise :class:`KeyExhaustedError`.
 
     Leaves can also be proactively voided with :meth:`advance_to`: after a
     crash or whenever state is uncertain, a caller skips leaves that may
@@ -655,6 +656,24 @@ class MerkleSigner:
         with self._lock:
             return len(self._private_keys) - self._next_index
 
+    def _checkpoint_bytes(self) -> bytes:
+        """Serialise the full signer state; the caller holds the lock."""
+        body = (
+            _CHECKPOINT_MAGIC
+            + bytes((_CHECKPOINT_VERSION, self._w, self._height))
+            + self._next_index.to_bytes(2, "big")
+            + (len(self._private_keys) * self._private_keys[0].length).to_bytes(
+                4, "big"
+            )
+            + self._public_key.root
+            + b"".join(
+                element
+                for private_key in self._private_keys
+                for element in private_key.elements
+            )
+        )
+        return body + hashlib.sha256(body).digest()
+
     def checkpoint(self) -> bytes:
         """Serialise the full signer state (all private keys) to ``bytes``.
 
@@ -672,21 +691,7 @@ class MerkleSigner:
         accidental corruption — store it as a secret.
         """
         with self._lock:
-            body = (
-                _CHECKPOINT_MAGIC
-                + bytes((_CHECKPOINT_VERSION, self._w, self._height))
-                + self._next_index.to_bytes(2, "big")
-                + (len(self._private_keys) * self._private_keys[0].length).to_bytes(
-                    4, "big"
-                )
-                + self._public_key.root
-                + b"".join(
-                    element
-                    for private_key in self._private_keys
-                    for element in private_key.elements
-                )
-            )
-            return body + hashlib.sha256(body).digest()
+            return self._checkpoint_bytes()
 
     @classmethod
     def from_checkpoint(cls, data: Any) -> "MerkleSigner":
@@ -848,6 +853,37 @@ class MerkleSigner:
                 signatures.append(self._signature_at(index, message))
             self._next_index = base + len(signatures)
             return tuple(signatures)
+
+    def sign_with_checkpoint(self, message: Any) -> tuple[MerkleSignature, bytes]:
+        """Sign ``message`` and snapshot the advanced state in one atomic step.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like :meth:`sign`.
+        Returns ``(signature, checkpoint)``: the
+        :class:`MerkleSignature` produced by the existing signing path —
+        value-for-value identical to calling :meth:`sign` on the same message
+        from the same starting state, drawing no extra randomness — and the
+        ``bytes`` that :meth:`checkpoint` returns for the advanced state,
+        byte-for-byte the same v1 encoding holding the new ``next_index`` and
+        every private key. Both halves are produced under the same lock as
+        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the index
+        properties and :meth:`checkpoint`, so a concurrent observer sees the
+        state either before the whole call or after both the signature and
+        the snapshot are complete — never part-way through.
+
+        A rejected message type raises ``TypeError`` without spending a leaf,
+        and an exhausted signer raises :class:`KeyExhaustedError`; a failed
+        call returns no partial result. The returned checkpoint still carries
+        every private key in the clear and offers no authentication,
+        encryption or atomic persistence — confidentiality, durable storage
+        and rollback protection remain the caller's responsibility.
+        """
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            index = self._next_index
+            signature = self._signature_at(index, message)
+            self._next_index += 1
+            return signature, self._checkpoint_bytes()
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

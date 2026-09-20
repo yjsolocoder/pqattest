@@ -76,12 +76,14 @@ Lamport：
 
 - `BITS` / `HASH_BYTES` — 默认 256 位摘要与 32 字节哈希
 - `PrivateKey(secrets)` / `PublicKey(digests)` — 不可变密钥；各含 `2 * bits` 个 32 字节元素
+- `PrivateKey.to_bytes()` / `PrivateKey.from_bytes(data)`、`PublicKey.to_bytes()` / `PublicKey.from_bytes(data)` — 密钥的确定性 v1 二进制编解码；编码方法不接参数，`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），魔数、版本、`bits`（1..256 非布尔整数）、元素计数（须为 `2 * bits`）、截断或尾随数据非法抛 `ValueError`；往返后密钥仍可位置构造、冻结、按值相等，且可照常签名/验证。**私钥编码含明文秘密**，须按私钥保护
 - `message_digest(message)` — 对 `bytes`/`bytearray`/`str` 取 SHA-256
 - `message_bits(message, *, bits=BITS)` — 摘要展开为比特序列
 - `keygen(*, bits=BITS, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`
 - `public_key_from(private_key)` — 由私钥重算公钥
 - `sign(message, private_key)` — 返回长度等于 `bits` 的签名（比特 `i` 揭示第 `i` 位对应的那个秘密）
 - `verify(message, signature, public_key)` — 逐位比对
+- `lamport_signature_to_bytes(signature, *, bits)` / `lamport_signature_from_bytes(data)` — 无状态签名的确定性 v1 二进制编解码；前者要求 `signature` 为成员全为 `bytes` 的元组（容器或成员类型错抛 `TypeError`）并返回 `bytes`，`bits` 仅限关键字且须为 1..256 的非布尔整数、等于元素数（否则抛 `ValueError`）；后者返回 `(bits, elements)`，`bits` 为 `int`，`elements` 为保持原序的不可变 `bytes` 元组、每项 32 字节，可直接交给 `verify`。计数或成员长度不符、坏魔数、未知版本、截断或尾随数据均抛 `ValueError`；解码入口只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`）
 - `OneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `sign(message, private_key)` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `KeyExhaustedError` — 已用签名器再次签名时抛出（继承 `RuntimeError`）
 
@@ -96,6 +98,18 @@ try:
     signer.sign(b"another claim")            # KeyExhaustedError
 except KeyExhaustedError:
     pass
+```
+
+```python
+from pqattest import lamport_signature_to_bytes, lamport_signature_from_bytes
+
+blob = private_key.to_bytes()                 # 含明文秘密，须按私钥保护
+restored_private = PrivateKey.from_bytes(blob)
+assert restored_private == private_key
+
+sig_blob = lamport_signature_to_bytes(signature, bits=private_key.bits)
+bits, elements = lamport_signature_from_bytes(sig_blob)
+assert verify(b"position claim", elements, public_key)
 ```
 
 Winternitz（W-OTS）：
@@ -132,6 +146,8 @@ Merkle 聚合（有限次签名）：
 检查点 v1 二进制格式：8 字节魔数 `b"PQAMSCP\0"`；各 1 字节的版本（1）、`w`、`height`；2 字节大端 `next_index`；4 字节大端元素总数（必须等于 `2**height` 乘 `w` 对应的链数）；32 字节 Merkle 根；随后按叶、链顺序排列的全部 W-OTS 私钥元素（每个 32 字节）；最后为此前全部内容的 SHA-256。
 
 W-OTS 一次性签名器检查点 v1 二进制格式（`WOTSOneTimeSigner.checkpoint`）：8 字节魔数 `b"PQAWCP\0\0"`；各 1 字节的版本（1）、`w`、`used`（仅 0 或 1）；2 字节大端私钥元素数（由 `w` 严格限定：`w=4` 为 67、`w=8` 为 34）；随后按原链序排列的全部 32 字节私钥元素；最后为此前全部内容的 SHA-256。总长度为 `13 + 元素数 × 32 + 32` 字节（w=4 时 2189 字节，w=8 时 1133 字节）。
+
+Lamport 密钥与签名 v1 线格式（`PrivateKey.to_bytes` / `PublicKey.to_bytes` / `lamport_signature_to_bytes`）：三种格式结构相同——8 字节魔数（私钥 `b"PQALPRV\0"`、公钥 `b"PQALPUB\0"`、签名 `b"PQALSIG\0"`）；1 字节版本（1）；两个 2 字节大端无符号整数依次为 `bits`（1..256）与元素计数（密钥严格等于 `2 * bits`，签名严格等于 `bits`）；随后按原序拼接全部 32 字节元素。总长度为 `13 + 元素计数 × 32` 字节（默认 bits=256 时：密钥 16397 字节，签名 8205 字节）。编码确定、同值同字节；私钥编码含明文秘密。
 
 W-OTS 密钥与签名 v1 线格式（`WOTSPrivateKey.to_bytes` / `WOTSPublicKey.to_bytes` / `wots_signature_to_bytes`）：三种格式结构相同——8 字节魔数（私钥 `b"PQAWPRV\0"`、公钥 `b"PQAWPUB\0"`、签名 `b"PQAWSIG\0"`）；各 1 字节的版本（1）与 `w`；2 字节大端元素数（由 `w` 严格限定：`w=4` 为 67、`w=8` 为 34）；随后按原序拼接全部 32 字节元素。总长度为 `12 + 元素数 × 32` 字节（w=4 时 2156 字节，w=8 时 1100 字节）。编码确定、同值同字节；私钥编码含明文秘密。
 

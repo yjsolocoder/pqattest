@@ -156,6 +156,8 @@ Merkle 聚合（有限次签名）：
 - `MerkleBatchProof(public_key, signatures)` — 冻结的批次证明值对象：`public_key` 须为 `MerklePublicKey`，`signatures` 须为**非空**的 `MerkleSignature` 元组，索引严格递增（故唯一）且每份签名都与该公钥参数/计数一致（字段类型错误抛 `TypeError`，结构约束违反抛 `ValueError`）；把同一公钥的多份签名打包成一份可**独立传输**的批次证明。批次包不存消息，本身不提供认证或加密
 - `MerkleBatchProof.to_bytes()` / `MerkleBatchProof.from_bytes(data)` — 批次证明的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束每份签名；魔数、版本、长度/计数越界或为零、截断、尾随数据、嵌套编码非法、签名与公钥交叉不一致或索引非严格递增均抛 `ValueError`，不返回半有效对象
 - `MerkleBatchProof.verify(messages)` — `messages` 须为与签名等长的元组，成员接受 `bytes`/`bytearray`/`str`；逐项等价于 `merkle_verify(message, signature, public_key)`，全部成功才返回 `True`；非元组、数量不符、非法消息成员或任一验签失败均返回 `False`
+- `multiproof_encode(public_key, signatures)` — 顶层函数，把同一 `MerklePublicKey` 的多份 `MerkleSignature` 压成一份去重认证路径的确定性证明 `bytes`；不引入新对象、不改动任何旧接口与格式。`public_key` 须为 `MerklePublicKey`，`signatures` 须为非空的 `MerkleSignature` 元组（类型错抛 `TypeError`）；空集合、索引非严格递增、签名不被公钥约束（`w`/树高/索引越界/W-OTS 元素数或路径数不符、元素畸形）或同一坐标节点冲突抛 `ValueError`
+- `multiproof_verify(messages, data)` — 顶层验证；`data` 只接受 `bytes`/`bytearray`，`messages` 须为与叶数等长的元组，成员沿用现有消息规则（`bytes`/`bytearray`/`str`）。按各消息恢复 W-OTS 公钥，沿用现有叶哈希与内部节点字节规则逐层合并，必须得到包内公钥根、且每个证明节点恰好使用一次；消息不符，或 `data`/`messages` 类型或数量错、魔数/版本/长度/计数错、截断、尾随、叶块乱序或重复、节点缺失/多余/重复/乱序/坐标非规范，一律返回 `False`
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 
@@ -176,6 +178,8 @@ W-OTS 密钥与签名 v1 线格式（`WOTSPrivateKey.to_bytes` / `WOTSPublicKey.
 证明包 v1 线格式（`MerkleProof.to_bytes`）：8 字节魔数 `b"PQAMPRF\0"`；1 字节版本（1）；4 字节大端公钥长度；4 字节大端签名长度；随后先拼接完整的公钥 v1 编码，再拼接以该公钥约束的签名 v1 编码（即上面两种既有编码原样串联，证明包不另造单体编码）。长度字段必须与各自编码的实际内容一致；解析顺序固定为先公钥、后签名，签名始终由同包内刚恢复的公钥约束。总长度为 `17 + 公钥编码长度 + 签名编码长度` 字节。
 
 批次证明 v1 线格式（`MerkleBatchProof.to_bytes`）：8 字节魔数 `b"PQAMBAT\0"`；1 字节版本（1）；4 字节大端公钥长度；2 字节大端签名数（至少 1）；完整的公钥 v1 编码；随后按元组顺序，每份签名先写 4 字节大端长度、再写以该公钥约束的既有签名 v1 编码。总长度为 `15 + 公钥编码长度 + Σ(4 + 各签名编码长度)` 字节。
+
+多签名证明 v1 线格式（`multiproof_encode`）：8 字节魔数 `b"PQAMMUL\0"`；1 字节版本（1）；4 字节大端公钥长度；各 2 字节大端的叶数与（去重后）兄弟节点数；完整的公钥 v1 编码；随后每叶按索引升序依次写 2 字节大端叶索引、2 字节大端 W-OTS 元素数（等于该公钥 `w` 对应的链数）与保持原序的 32 字节元素（不含旧签名里的认证路径）；最后是规范兄弟节点，各编码为 1 字节层号、2 字节大端层内索引与 32 字节哈希。规范节点集的构造从第 0 层的叶索引集合开始：每层收录当前集合中「兄弟不在当前集合」的索引之兄弟坐标 `(level, index^1)`，再把全部索引右移一位并去重进入下一层；节点按层、层内索引递增排列。总长度为 `17 + 公钥编码长度 + 叶数 × (4 + 元素数 × 32) + 节点数 × 35` 字节。与批次证明相比，被多片叶子共享的兄弟节点只出现一次。
 
 ```python
 from pqattest import MerkleProof, MerklePublicKey, MerkleSignature, MerkleSigner
@@ -199,6 +203,17 @@ key = MerklePublicKey.from_bytes(key_blob)
 restored = MerkleSignature.from_bytes(sig_blob, key)
 assert restored == signature
 assert merkle_verify(b"position claim", restored, key)
+```
+
+```python
+from pqattest import multiproof_encode, multiproof_verify
+
+signer = MerkleSigner(height=4, w=4)
+messages = (b"claim 0", b"claim 1", b"claim 2")
+signatures = tuple(signer.sign(message) for message in messages)
+blob = multiproof_encode(signer.public_key, signatures)   # 共享兄弟节点只存一次
+assert multiproof_verify(messages, blob)
+assert not multiproof_verify((b"claim 0", b"claim 1", b"other"), blob)
 ```
 
 **编解码须知**：三种编码（公钥、签名、证明包）都是纯序列化——只含结构校验（魔数、版本、计数、长度），**不提供认证或加密**，任何人都能改写字节；需要完整性或来源保证时须由调用方在传输/存储层自行解决（公钥与签名本身公开，通常只需防篡改）。证明包只做参数与计数层面的交叉约束：参数一致的异源公钥/签名组合在结构上合法，必须靠 `verify(message)` 才能识别——证明包不存消息，无从自行判断签名是否出自该公钥。未来格式变更会启用新的版本号（证明包与内层两种编码各自独立版本化），解析器对未知版本一律抛 `ValueError`，不会静默按 v1 解释；新版本若改变内层编码，须在证明包新的版本号下整体规定其组合方式，v1 解析器永远只接受 v1 内层编码。

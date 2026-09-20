@@ -221,6 +221,29 @@ restored.sign(b"position claim")           # 成功；此后任何 sign 都抛 K
 
 **检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
 
+### 带密钥的认证封装 `auth_wrap` / `auth_unwrap`
+
+三类现有明文检查点（Lamport、W-OTS、Merkle）可再套一层**带密钥的认证封装**，用来发现没有共享密钥者的篡改：
+
+- `auth_wrap(checkpoint, *, scheme, key)` — 关键字参数 `scheme` 仅取 `"lamport"`/`"wots"`/`"merkle"`（依次编码为 1/2/3），`checkpoint` 与 `key` 只接受非空的 `bytes`/`bytearray`（`key` 不得为空字节串）；返回确定编码的 `bytes`。封装前按既有检查点魔数核对方案（Lamport `b"PQALCP\0\0"`、W-OTS `b"PQAWCP\0\0"`、Merkle `b"PQAMSCP\0"`），不符抛 `ValueError`
+- `auth_unwrap(data, *, key, expect=None)` — 验证封装并返回 `(scheme, payload)`：方案名字符串与传入 `auth_wrap` 的原检查点字节（`bytes`，可直接交给对应的 `from_checkpoint`）。`expect` 给出时必须与封装中的方案一致，否则抛 `ValueError`
+- 参数类型错误抛 `TypeError`；空 `key`、未知或与 `expect` 不符的方案、坏封装魔数/版本/方案标识/长度字段、截断、尾随数据、载荷魔数与标识不符或 HMAC 标签错误，一律抛 `ValueError`。标签用 `hmac.compare_digest` 常量时间比较，**先验标签、后核对载荷魔数**，任何字段都不会在标签验证通过前被信任
+
+v1 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（1）；1 字节方案标识（lamport=1、wots=2、merkle=3）；4 字节大端载荷长度；原样嵌入的检查点载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `14 + 载荷长度 + 32` 字节。编码确定、同输入同字节。
+
+```python
+from pqattest import MerkleSigner, auth_wrap, auth_unwrap
+
+signer = MerkleSigner(height=4, w=4)
+blob = auth_wrap(signer.checkpoint(), scheme="merkle", key=b"shared-secret")
+scheme, checkpoint = auth_unwrap(blob, key=b"shared-secret", expect="merkle")
+assert scheme == "merkle"
+restored = MerkleSigner.from_checkpoint(checkpoint)
+```
+
+**封装安全边界**：HMAC 只提供**来源/完整性认证**，**不加密**——载荷依旧是明文，任何拿到封装的人都能读到检查点内容；它也**不防复制、重放或回滚**：旧的合法封装随时可以重新提交，`auth_unwrap` 无法判断新旧。需要防回滚/重放时，调用方仍须自行加入单调序号或受信存储，并把封装连同明文检查点一起当秘密保管。旧的明文 `checkpoint()`/`from_checkpoint()` 接口保持不变，封装是可选的外层。
+
+
 玩具格基 KEM（教学用，**未审计，禁止生产**）：
 
 - `ToyLatticePrivateKey(s)` / `ToyLatticePublicKey(t)` / `ToyLatticeCiphertext(u, tag)` — 三个冻结值对象，可位置构造、按值相等（含可哈希）。字段均为 `bytes`：`s`/`t`/`u` 必须是编码 `E` 值（恰好 16 字节、8 个 2 字节大端系数、每项在 `0..256`），`tag` 为任意 `bytes`。字段类型错误抛 `TypeError`，长度或系数越界抛 `ValueError`

@@ -15,7 +15,10 @@ MerklePublicKey / MerkleSignature / MerkleProof / merkle_verify, static
 parameter analysis: Params / profile / recommend, and the teaching-only toy
 lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
-ToyLatticeCiphertext.
+ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
+in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; the envelope
+authenticates but does not encrypt and gives no replay or rollback
+protection.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from ._errors import KeyExhaustedError
+from .auth import auth_unwrap, auth_wrap
 from .merkle import (
     MerkleProof,
     MerklePublicKey,
@@ -74,6 +78,8 @@ __all__ = [
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
     "WOTSPublicKey",
+    "auth_unwrap",
+    "auth_wrap",
     "keygen",
     "lamport_signature_from_bytes",
     "lamport_signature_to_bytes",

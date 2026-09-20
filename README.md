@@ -243,6 +243,35 @@ restored = MerkleSigner.from_checkpoint(checkpoint)
 
 **封装安全边界**：HMAC 只提供**来源/完整性认证**，**不加密**——载荷依旧是明文，任何拿到封装的人都能读到检查点内容；它也**不防复制、重放或回滚**：旧的合法封装随时可以重新提交，`auth_unwrap` 无法判断新旧。需要防回滚/重放时，调用方仍须自行加入单调序号或受信存储，并把封装连同明文检查点一起当秘密保管。旧的明文 `checkpoint()`/`from_checkpoint()` 接口保持不变，封装是可选的外层。
 
+### 带代次的认证封装 `auth_state_wrap` / `auth_state_unwrap`
+
+v1 封装没有任何新旧概念；v2 封装在共享同一魔数、同一套 v1 参数约束与认证方式之外，额外绑定一个 64 位无符号**代次（generation）**，解封时可按调用方提供的下限拒绝旧封装：
+
+- `auth_state_wrap(checkpoint, *, scheme, key, generation)` — 参数与 `auth_wrap` 完全一致（`checkpoint`/`key` 为非空 `bytes`/`bytearray`，`scheme` 仅取 `"lamport"`/`"wots"`/`"merkle"`，封装前按检查点魔数核对方案），额外的关键字参数 `generation` 必须是 `0..2**64-1` 的**非布尔整数**；类型错抛 `TypeError`，越界抛 `ValueError`。返回确定编码的 `bytes`
+- `auth_state_unwrap(data, *, key, expect=None, min_generation=None)` — 验证 v2 封装并返回 `(scheme, generation, payload)`：`generation` 为封装中的非负 `int`，`payload` 为传入 `auth_state_wrap` 的原检查点字节（`bytes`，可直接交给对应的 `from_checkpoint`）。`expect` 语义与 `auth_unwrap` 相同；`min_generation` 为 `None`（缺省，不检查）或 `0..2**64-1` 的非布尔整数，低于下限的代次一律拒绝
+- 参数类型错误抛 `TypeError`（非字节的 `data`/`key`、非字符串 `expect`、非整数或布尔的 `generation`/`min_generation`）；空 `key`、未知 `expect`、代次参数超出 uint64、坏封装魔数、版本不为 2（v1 封装也算版本不符）、未知方案标识、长度字段不符、截断、尾随数据、载荷魔数与标识不符、与 `expect` 不符、HMAC 标签错误或代次低于 `min_generation`，一律抛 `ValueError`
+
+v2 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（2）；1 字节方案标识（lamport=1、wots=2、merkle=3）；**8 字节大端 `generation`**；4 字节大端载荷长度；原样嵌入的检查点载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `22 + 载荷长度 + 32` 字节。编码确定、同输入同字节。解封**先用 `hmac.compare_digest` 验证标签**，此后才信任任何字段；标签通过后再核对载荷魔数与方案（含 `expect`），**最后**应用代次下限。v1 与 v2 仅以版本字节区分：`auth_unwrap` 只接受版本 1、`auth_state_unwrap` 只接受版本 2，互不解析对方的封装；旧的 v1 封装与三类检查点的字节格式保持逐字节不变。
+
+```python
+from pqattest import MerkleSigner, auth_state_wrap, auth_state_unwrap
+
+signer = MerkleSigner(height=4, w=4)
+blob = auth_state_wrap(
+    signer.checkpoint(), scheme="merkle", key=b"shared-secret", generation=7
+)
+scheme, generation, checkpoint = auth_state_unwrap(
+    blob, key=b"shared-secret", expect="merkle", min_generation=7
+)
+assert scheme == "merkle" and generation == 7
+restored = MerkleSigner.from_checkpoint(checkpoint)
+
+auth_state_unwrap(blob, key=b"shared-secret", min_generation=8)  # ValueError：回滚
+```
+
+**代次安全边界**：下限 `min_generation` **不由封装携带**，必须保存在调用方的外部可信存储中（随每次接受的新一代次原子推进），并与封装/检查点分开保管。代次只对「检查点回滚、但可信下限没有一并回退」的情形有效：攻击者若能把检查点和可信下限**一起**回滚，或者在**同一代次内**重放一份合法封装，HMAC 依然有效、无从检测。与 v1 相同，v2 封装**不加密**，载荷是明文，也不防复制；须把封装连同明文检查点一起当秘密保管。
+
+
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：
 

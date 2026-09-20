@@ -1,4 +1,4 @@
-"""Keyed authenticated wrapper for the plaintext v1 signer checkpoints.
+"""Keyed authenticated wrappers for the plaintext v1 signer checkpoints.
 
 The Lamport (:meth:`pqattest.OneTimeSigner.checkpoint`), W-OTS
 (:meth:`pqattest.WOTSOneTimeSigner.checkpoint`) and Merkle
@@ -9,11 +9,16 @@ HMAC-SHA-256 envelope so a party holding the shared key can tell whether a
 checkpoint was altered by someone without the key; :func:`auth_unwrap`
 verifies the tag and hands the original checkpoint bytes back.
 
-The envelope authenticates but does **not** encrypt (the payload stays
-readable), and it is stateless: it neither stops the same blob from being
-copied or replayed nor detects a rollback to an older checkpoint — those
-guards remain the caller's responsibility (atomic storage, monotonic
-metadata, etc.).
+:func:`auth_state_wrap` / :func:`auth_state_unwrap` are the version 2
+envelope: the same magic, authentication and v1 parameter rules, plus an
+8-byte unsigned *generation*. :func:`auth_state_unwrap` can refuse a blob
+whose generation is below a caller-supplied floor, which lets a trusted
+monotonic counter detect rollback across unwraps (the floor itself is not
+stored in the envelope and must live in trusted storage).
+
+Both envelopes authenticate but do **not** encrypt (the payload stays
+readable), and a same-generation replay, or a rollback that also rewinds
+the trusted floor, remains undetectable.
 """
 
 from __future__ import annotations
@@ -22,12 +27,25 @@ import hashlib
 import hmac
 from typing import Any
 
-__all__ = ["auth_wrap", "auth_unwrap"]
+__all__ = [
+    "auth_wrap",
+    "auth_unwrap",
+    "auth_state_wrap",
+    "auth_state_unwrap",
+]
 
 _AUTH_MAGIC = b"PQAAUTH\0"
-_AUTH_VERSION = 1
-_AUTH_HEADER_BYTES = 8 + 1 + 1 + 4
 _AUTH_TAG_BYTES = 32  # HMAC-SHA-256 output length
+_UINT64_MAX = 2**64 - 1
+
+# v1 envelope: magic, version, scheme identifier, 4-byte payload length.
+_AUTH_V1_VERSION = 1
+_AUTH_V1_HEADER_BYTES = 8 + 1 + 1 + 4
+
+# v2 envelope: magic, version, scheme identifier, 8-byte generation, 4-byte
+# payload length.
+_AUTH_V2_VERSION = 2
+_AUTH_V2_HEADER_BYTES = 8 + 1 + 1 + 8 + 4
 
 # Scheme name -> (envelope identifier, magic prefix of the wrapped checkpoint).
 # The magic bytes match the v1 checkpoint codecs in the lamport, wots and
@@ -58,6 +76,29 @@ def _validate_key(key: Any) -> bytes:
     return key_bytes
 
 
+def _validate_generation(value: Any, label: str) -> int:
+    """Coerce a keyword argument that must be a non-boolean uint64."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} must be a non-boolean integer between 0 and 2**64-1")
+    if not 0 <= value <= _UINT64_MAX:
+        raise ValueError(f"{label} must be between 0 and 2**64-1")
+    return value
+
+
+def _validate_expect(expect: Any) -> None:
+    if expect is None:
+        return
+    if not isinstance(expect, str):
+        raise TypeError("expect must be a scheme name string or None")
+    if expect not in _SCHEMES:
+        raise ValueError(f"unknown expected scheme: {expect!r}")
+
+
+def _check_payload_magic(payload: bytes, payload_magic: bytes, scheme: str) -> None:
+    if len(payload) < len(payload_magic) or payload[: len(payload_magic)] != payload_magic:
+        raise ValueError("payload magic does not match the envelope scheme")
+
+
 def auth_wrap(checkpoint: Any, *, scheme: Any, key: Any) -> bytes:
     """Wrap a plaintext v1 signer checkpoint in a keyed authenticated envelope.
 
@@ -86,13 +127,10 @@ def auth_wrap(checkpoint: Any, *, scheme: Any, key: Any) -> bytes:
         identifier, payload_magic = _SCHEMES[scheme]
     except KeyError:
         raise ValueError(f"unknown scheme: {scheme!r}") from None
-    if len(payload) < len(payload_magic):
-        raise ValueError("checkpoint is too short to contain a scheme magic")
-    if payload[: len(payload_magic)] != payload_magic:
-        raise ValueError(f"checkpoint magic does not match scheme {scheme!r}")
+    _check_payload_magic(payload, payload_magic, scheme)
     body = (
         _AUTH_MAGIC
-        + bytes((_AUTH_VERSION, identifier))
+        + bytes((_AUTH_V1_VERSION, identifier))
         + len(payload).to_bytes(4, "big")
         + payload
     )
@@ -100,7 +138,7 @@ def auth_wrap(checkpoint: Any, *, scheme: Any, key: Any) -> bytes:
 
 
 def auth_unwrap(data: Any, *, key: Any, expect: Any = None) -> tuple[str, bytes]:
-    """Verify an authenticated envelope and return ``(scheme, checkpoint)``.
+    """Verify a v1 authenticated envelope and return ``(scheme, checkpoint)``.
 
     ``data`` must be ``bytes`` or ``bytearray`` produced by
     :func:`auth_wrap` and ``key`` a non-empty ``bytes``/``bytearray`` shared
@@ -111,7 +149,8 @@ def auth_unwrap(data: Any, *, key: Any, expect: Any = None) -> tuple[str, bytes]
     scheme identifier, a length field that does not match the content,
     truncation, trailing data, a payload magic that does not match its
     scheme identifier, an identifier different from ``expect`` or a bad
-    HMAC tag raises ``ValueError`` and nothing is returned.
+    HMAC tag raises ``ValueError`` and nothing is returned. A v2 envelope
+    (from :func:`auth_state_wrap`) is rejected as an unsupported version.
 
     The tag is checked with :func:`hmac.compare_digest` before any payload
     byte is trusted; only afterwards is the payload magic checked against
@@ -122,18 +161,14 @@ def auth_unwrap(data: Any, *, key: Any, expect: Any = None) -> tuple[str, bytes]
     """
     blob = _coerce_bytes(data, "data")
     key_bytes = _validate_key(key)
-    if expect is not None:
-        if not isinstance(expect, str):
-            raise TypeError("expect must be a scheme name string or None")
-        if expect not in _SCHEMES:
-            raise ValueError(f"unknown expected scheme: {expect!r}")
+    _validate_expect(expect)
 
-    minimum_length = _AUTH_HEADER_BYTES + _AUTH_TAG_BYTES
+    minimum_length = _AUTH_V1_HEADER_BYTES + _AUTH_TAG_BYTES
     if len(blob) < minimum_length:
         raise ValueError("authenticated checkpoint is truncated")
     if blob[:8] != _AUTH_MAGIC:
         raise ValueError("bad authenticated checkpoint magic")
-    if blob[8] != _AUTH_VERSION:
+    if blob[8] != _AUTH_V1_VERSION:
         raise ValueError(f"unsupported authenticated checkpoint version: {blob[8]}")
     identifier = blob[9]
     try:
@@ -141,7 +176,7 @@ def auth_unwrap(data: Any, *, key: Any, expect: Any = None) -> tuple[str, bytes]
     except KeyError:
         raise ValueError(f"unknown scheme identifier: {identifier}") from None
     payload_length = int.from_bytes(blob[10:14], "big")
-    expected_length = _AUTH_HEADER_BYTES + payload_length + _AUTH_TAG_BYTES
+    expected_length = _AUTH_V1_HEADER_BYTES + payload_length + _AUTH_TAG_BYTES
     if len(blob) < expected_length:
         raise ValueError("authenticated checkpoint is truncated")
     if len(blob) > expected_length:
@@ -152,9 +187,124 @@ def auth_unwrap(data: Any, *, key: Any, expect: Any = None) -> tuple[str, bytes]
     if not hmac.compare_digest(expected_tag, tag):
         raise ValueError("authenticated checkpoint tag mismatch")
 
-    payload = blob[_AUTH_HEADER_BYTES : _AUTH_HEADER_BYTES + payload_length]
-    if payload_length < len(payload_magic) or payload[: len(payload_magic)] != payload_magic:
-        raise ValueError("payload magic does not match the envelope scheme")
+    payload = blob[_AUTH_V1_HEADER_BYTES : _AUTH_V1_HEADER_BYTES + payload_length]
+    _check_payload_magic(payload, payload_magic, scheme)
     if expect is not None and scheme != expect:
         raise ValueError(f"envelope scheme {scheme!r} does not match expected {expect!r}")
     return scheme, bytes(payload)
+
+
+def auth_state_wrap(
+    checkpoint: Any, *, scheme: Any, key: Any, generation: Any
+) -> bytes:
+    """Wrap a checkpoint in the version 2 authenticated, generation-tagged envelope.
+
+    Behaves exactly like :func:`auth_wrap` — same ``checkpoint``, ``scheme``
+    and ``key`` constraints and the same checkpoint-magic check — but
+    additionally binds a keyword-only ``generation``: a non-boolean integer
+    from ``0`` to ``2**64 - 1`` (a wrong type raises ``TypeError``, an
+    out-of-range value ``ValueError``).
+
+    The v2 envelope layout is: the 8-byte magic ``b"PQAAUTH\\0"``; one byte
+    each for the version (2) and the scheme identifier (lamport=1, wots=2,
+    merkle=3); the generation as 8 big-endian bytes; the payload length as
+    4 big-endian bytes; the original checkpoint payload unchanged; and
+    finally the 32-byte ``HMAC-SHA-256(key, all preceding bytes)`` tag.
+    Encoding is deterministic: identical inputs produce identical bytes.
+    The payload is not encrypted, and the generation only helps a caller
+    that tracks a trusted high-water mark — it proves nothing on its own.
+    """
+    payload = _coerce_bytes(checkpoint, "checkpoint")
+    key_bytes = _validate_key(key)
+    generation_value = _validate_generation(generation, "generation")
+    if not isinstance(scheme, str):
+        raise TypeError("scheme must be a string")
+    try:
+        identifier, payload_magic = _SCHEMES[scheme]
+    except KeyError:
+        raise ValueError(f"unknown scheme: {scheme!r}") from None
+    _check_payload_magic(payload, payload_magic, scheme)
+    body = (
+        _AUTH_MAGIC
+        + bytes((_AUTH_V2_VERSION, identifier))
+        + generation_value.to_bytes(8, "big")
+        + len(payload).to_bytes(4, "big")
+        + payload
+    )
+    return body + hmac.new(key_bytes, body, hashlib.sha256).digest()
+
+
+def auth_state_unwrap(
+    data: Any, *, key: Any, expect: Any = None, min_generation: Any = None
+) -> tuple[str, int, bytes]:
+    """Verify a v2 envelope and return ``(scheme, generation, checkpoint)``.
+
+    ``data`` must be ``bytes`` or ``bytearray`` produced by
+    :func:`auth_state_wrap` and ``key`` a non-empty ``bytes``/``bytearray``
+    shared secret. ``expect`` may name a scheme the envelope must match.
+    ``min_generation`` is ``None`` (the default: no floor) or a non-boolean
+    integer from ``0`` to ``2**64 - 1``; when given, an envelope whose
+    generation is below the floor is rejected. The floor is *not* carried in
+    the envelope — persist it in trusted storage, or an attacker who can
+    roll the checkpoint back and rewind the floor defeats the check.
+
+    Wrong parameter types raise ``TypeError`` (a non-bytes ``data``/``key``,
+    a non-string ``expect``, a non-integer or boolean ``min_generation``);
+    an empty key, an unknown ``expect``/floor value out of the uint64 range,
+    a bad envelope magic, a version other than 2 (including a v1 envelope),
+    an unknown scheme identifier, a mismatched length field, truncation,
+    trailing data, a bad HMAC tag, a payload magic that does not match its
+    scheme identifier, an identifier different from ``expect`` or a
+    generation below ``min_generation`` raises ``ValueError``.
+
+    The tag is verified with :func:`hmac.compare_digest` first, before any
+    field is trusted; only afterwards are the payload magic and the scheme
+    (including ``expect``) checked, and the generation floor is applied
+    last. The returned checkpoint is the exact payload passed to
+    :func:`auth_state_wrap` (as ``bytes``), ready for the matching
+    ``from_checkpoint``. The envelope authenticates but does not encrypt; a
+    same-generation replay or a rollback accompanied by a floor rewind
+    remains undetectable.
+    """
+    blob = _coerce_bytes(data, "data")
+    key_bytes = _validate_key(key)
+    _validate_expect(expect)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+
+    minimum_length = _AUTH_V2_HEADER_BYTES + _AUTH_TAG_BYTES
+    if len(blob) < minimum_length:
+        raise ValueError("authenticated checkpoint is truncated")
+    if blob[:8] != _AUTH_MAGIC:
+        raise ValueError("bad authenticated checkpoint magic")
+    if blob[8] != _AUTH_V2_VERSION:
+        raise ValueError(f"unsupported authenticated checkpoint version: {blob[8]}")
+    identifier = blob[9]
+    try:
+        scheme, payload_magic = _SCHEME_IDS[identifier]
+    except KeyError:
+        raise ValueError(f"unknown scheme identifier: {identifier}") from None
+    generation = int.from_bytes(blob[10:18], "big")
+    payload_length = int.from_bytes(blob[18:22], "big")
+    expected_length = _AUTH_V2_HEADER_BYTES + payload_length + _AUTH_TAG_BYTES
+    if len(blob) < expected_length:
+        raise ValueError("authenticated checkpoint is truncated")
+    if len(blob) > expected_length:
+        raise ValueError("trailing data after the authenticated checkpoint")
+
+    # Authenticate first: no field above (including the generation) is
+    # trusted until this tag checks out.
+    body, tag = blob[:-_AUTH_TAG_BYTES], blob[-_AUTH_TAG_BYTES:]
+    expected_tag = hmac.new(key_bytes, body, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_tag, tag):
+        raise ValueError("authenticated checkpoint tag mismatch")
+
+    payload = blob[_AUTH_V2_HEADER_BYTES : _AUTH_V2_HEADER_BYTES + payload_length]
+    _check_payload_magic(payload, payload_magic, scheme)
+    if expect is not None and scheme != expect:
+        raise ValueError(f"envelope scheme {scheme!r} does not match expected {expect!r}")
+    if min_generation is not None and generation < min_generation:
+        raise ValueError(
+            f"checkpoint generation {generation} is below the minimum {min_generation}"
+        )
+    return scheme, generation, bytes(payload)

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ._errors import KeyExhaustedError
+from .auth import _validate_generation, _validate_key, auth_state_wrap
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -580,9 +581,9 @@ class MerkleSigner:
     """Thread-safe, in-process few-times signer over a Merkle tree of W-OTS keys.
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
-    only by a successful :meth:`sign`, :meth:`sign_batch` or
-    :meth:`sign_with_checkpoint`. Once every leaf is spent, further calls
-    raise :class:`KeyExhaustedError`.
+    only by a successful :meth:`sign`, :meth:`sign_batch`,
+    :meth:`sign_with_checkpoint` or :meth:`sign_with_auth_state`. Once every
+    leaf is spent, further calls raise :class:`KeyExhaustedError`.
 
     Leaves can also be proactively voided with :meth:`advance_to`: after a
     crash or whenever state is uncertain, a caller skips leaves that may
@@ -884,6 +885,55 @@ class MerkleSigner:
             signature = self._signature_at(index, message)
             self._next_index += 1
             return signature, self._checkpoint_bytes()
+
+    def sign_with_auth_state(
+        self, message: Any, *, key: Any, generation: Any
+    ) -> tuple[MerkleSignature, bytes]:
+        """Sign ``message`` and return the advanced state as a v2 auth envelope.
+
+        Behaves like :meth:`sign_with_checkpoint` — the same leaf allocation,
+        the same :class:`MerkleSignature` and the same post-advance v1
+        :meth:`checkpoint` bytes, all under the signing lock — but instead of
+        the plaintext checkpoint the second half of the returned
+        ``(signature, envelope)`` tuple is the
+        :func:`auth_state_wrap` v2 envelope over that checkpoint with
+        ``scheme="merkle"`` and the given ``key`` and ``generation``. Pairing
+        the two halves in one call keeps the signature and the state it
+        advanced to together, so a caller can never match a signature against
+        a checkpoint taken at the wrong point under concurrency.
+
+        ``message`` accepts ``bytes``/``bytearray``/``str`` exactly like
+        :meth:`sign`; ``key`` is keyword-only and must be a non-empty
+        ``bytes``/``bytearray`` shared secret; ``generation`` is keyword-only
+        and must be a non-boolean integer in ``0 .. 2**64 - 1``. A rejected
+        message or key type raises ``TypeError``, an empty key or an
+        out-of-range generation raises ``ValueError``, and an exhausted
+        signer raises :class:`KeyExhaustedError`; every failure happens
+        without spending a leaf and returns no partial result. The whole call
+        — signature, leaf advance, snapshot and wrapping — linearises with
+        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the index
+        properties and :meth:`checkpoint` under the same lock, so a concurrent
+        observer sees the state either before the call or after all four
+        steps are complete. The envelope is plaintext and authenticated only;
+        it provides neither encryption nor protection against replay or
+        rollback on its own.
+        """
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            index = self._next_index
+            signature = self._signature_at(index, message)
+            self._next_index += 1
+            checkpoint = self._checkpoint_bytes()
+            envelope = auth_state_wrap(
+                checkpoint,
+                scheme="merkle",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            return signature, envelope
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

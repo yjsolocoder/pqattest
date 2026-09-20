@@ -1,7 +1,11 @@
 """pqattest - hash-based one-time and few-times signatures, plus a toy KEM.
 
 Public API: keygen / public_key_from / sign / verify / message_bits /
-OneTimeSigner / KeyExhaustedError, the Winternitz construction:
+OneTimeSigner / KeyExhaustedError, deterministic v1 serialisation for the
+Lamport keys and stateless signatures: PrivateKey.to_bytes /
+PrivateKey.from_bytes / PublicKey.to_bytes / PublicKey.from_bytes /
+lamport_signature_to_bytes / lamport_signature_from_bytes, the Winternitz
+construction:
 wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey /
 WOTSOneTimeSigner / wots_signature_to_bytes / wots_signature_from_bytes,
 Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
@@ -68,6 +72,8 @@ __all__ = [
     "WOTSPrivateKey",
     "WOTSPublicKey",
     "keygen",
+    "lamport_signature_from_bytes",
+    "lamport_signature_to_bytes",
     "merkle_verify",
     "message_bits",
     "message_digest",
@@ -89,6 +95,12 @@ __all__ = [
 BITS = 256
 HASH_BYTES = 32
 _DOMAIN = b"pqattest/lamport/v1"
+
+_PRIVATE_KEY_MAGIC = b"PQALPRV\0"
+_PUBLIC_KEY_MAGIC = b"PQALPUB\0"
+_SIGNATURE_MAGIC = b"PQALSIG\0"
+_CODEC_VERSION = 1
+_CODEC_HEADER_BYTES = 8 + 1 + 2 + 2
 
 
 def _as_bytes(message: Any) -> bytes:
@@ -118,6 +130,71 @@ def _secret_digest(secret: bytes) -> bytes:
     return hashlib.sha256(_DOMAIN + secret).digest()
 
 
+def _validate_bits(bits: Any) -> int:
+    if isinstance(bits, bool) or not isinstance(bits, int) or not 1 <= bits <= BITS:
+        raise ValueError(f"bits must be an integer between 1 and {BITS}")
+    return bits
+
+
+def _validate_elements(elements: Any, name: str) -> tuple[bytes, ...]:
+    if not isinstance(elements, tuple):
+        raise TypeError(f"{name} must be a tuple of {HASH_BYTES}-byte bytes")
+    for element in elements:
+        if not isinstance(element, bytes):
+            raise TypeError(f"every {name} element must be bytes")
+        if len(element) != HASH_BYTES:
+            raise ValueError(f"every {name} element must be exactly {HASH_BYTES} bytes")
+    return elements
+
+
+def _encode_v1(magic: bytes, bits: int, elements: tuple[bytes, ...]) -> bytes:
+    """Shared v1 layout: magic, version, ``bits``, element count, elements."""
+    return (
+        magic
+        + bytes((_CODEC_VERSION,))
+        + bits.to_bytes(2, "big")
+        + len(elements).to_bytes(2, "big")
+        + b"".join(elements)
+    )
+
+
+def _decode_v1(data: Any, magic: bytes, name: str, elements_per_bit: int) -> tuple[int, tuple[bytes, ...]]:
+    """Parse a v1 blob into ``(bits, elements)``; ``name`` labels error messages."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"{name} data must be bytes or bytearray")
+    data = bytes(data)
+    if len(data) < _CODEC_HEADER_BYTES:
+        raise ValueError(f"{name} encoding is truncated")
+    if data[:8] != magic:
+        raise ValueError(f"bad {name} magic")
+    if data[8] != _CODEC_VERSION:
+        raise ValueError(f"unsupported {name} version: {data[8]}")
+    bits = _validate_bits(int.from_bytes(data[9:11], "big"))
+    element_count = int.from_bytes(data[11:13], "big")
+    if element_count != elements_per_bit * bits:
+        raise ValueError(f"element count does not match {elements_per_bit} * bits")
+    expected = _CODEC_HEADER_BYTES + element_count * HASH_BYTES
+    if len(data) < expected:
+        raise ValueError(f"{name} encoding is truncated")
+    if len(data) > expected:
+        raise ValueError(f"trailing data after the {name} encoding")
+    elements = tuple(
+        data[_CODEC_HEADER_BYTES + i * HASH_BYTES : _CODEC_HEADER_BYTES + (i + 1) * HASH_BYTES]
+        for i in range(element_count)
+    )
+    return bits, elements
+
+
+def _key_to_bytes(key: Any, key_type: type, field: str, magic: bytes, name: str) -> bytes:
+    if not isinstance(key, key_type):
+        raise TypeError(f"to_bytes must be called on a {key_type.__name__}")
+    elements = getattr(key, field)
+    _validate_elements(elements, name)
+    if len(elements) % 2 != 0:
+        raise ValueError(f"{name} must contain an even number of elements")
+    return _encode_v1(magic, _validate_bits(len(elements) // 2), elements)
+
+
 @dataclass(frozen=True)
 class PrivateKey:
     """``2 * bits`` secret values: index ``2 * i + b`` belongs to bit ``i``, branch ``b``."""
@@ -127,6 +204,34 @@ class PrivateKey:
     @property
     def bits(self) -> int:
         return len(self.secrets) // 2
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALPRV\\0"``; one byte for the
+        version (1); ``bits`` and the element count (``2 * bits``) as 2
+        big-endian bytes each; then every secret in the original order, 32
+        bytes each. Encoding is deterministic: the same key always produces
+        the same bytes. Fields corrupted by bypassing the frozen constructor
+        raise ``TypeError`` (wrong container or member type) or ``ValueError``
+        (bad count or element length) instead of producing a malformed
+        encoding. The blob contains the private key in the clear — store it
+        as a secret.
+        """
+        return _key_to_bytes(self, PrivateKey, "secrets", _PRIVATE_KEY_MAGIC, "private key")
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "PrivateKey":
+        """Parse ``to_bytes()`` output back into a :class:`PrivateKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, an out-of-range
+        ``bits``, an element count that is not ``2 * bits``, truncation or
+        trailing data raises ``ValueError`` and no instance is returned. The
+        restored key is equal by value to the original.
+        """
+        _, elements = _decode_v1(data, _PRIVATE_KEY_MAGIC, "private key", 2)
+        return cls(elements)
 
 
 @dataclass(frozen=True)
@@ -138,6 +243,33 @@ class PublicKey:
     @property
     def bits(self) -> int:
         return len(self.digests) // 2
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALPUB\\0"``; one byte for the
+        version (1); ``bits`` and the element count (``2 * bits``) as 2
+        big-endian bytes each; then every digest in the original order, 32
+        bytes each. Encoding is deterministic: the same key always produces
+        the same bytes. Fields corrupted by bypassing the frozen constructor
+        raise ``TypeError`` (wrong container or member type) or ``ValueError``
+        (bad count or element length) instead of producing a malformed
+        encoding.
+        """
+        return _key_to_bytes(self, PublicKey, "digests", _PUBLIC_KEY_MAGIC, "public key")
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "PublicKey":
+        """Parse ``to_bytes()`` output back into a :class:`PublicKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, an out-of-range
+        ``bits``, an element count that is not ``2 * bits``, truncation or
+        trailing data raises ``ValueError`` and no instance is returned. The
+        restored key is equal by value to the original.
+        """
+        _, elements = _decode_v1(data, _PUBLIC_KEY_MAGIC, "public key", 2)
+        return cls(elements)
 
 
 def keygen(*, bits: int = BITS, token_bytes: Callable[[int], bytes] = secrets.token_bytes) -> tuple[PrivateKey, PublicKey]:
@@ -179,6 +311,42 @@ def verify(message: Any, signature: Sequence[bytes], public_key: PublicKey) -> b
         if _secret_digest(materialised[index]) != public_key.digests[2 * index + bit]:
             return False
     return True
+
+
+def lamport_signature_to_bytes(signature: Any, *, bits: int) -> bytes:
+    """Serialise a stateless Lamport signature to the versioned v1 wire format.
+
+    ``signature`` must be a ``tuple`` whose members are all ``bytes`` — the
+    shape :func:`sign` returns; anything else raises ``TypeError``. ``bits``
+    is keyword-only and must be a non-``bool`` integer between 1 and
+    :data:`BITS` (``ValueError`` otherwise); the signature must contain
+    exactly ``bits`` elements of 32 bytes each (``ValueError`` otherwise).
+
+    The layout is the 8-byte magic ``b"PQALSIG\\0"``; one byte for the
+    version (1); ``bits`` and the element count (``bits``) as 2 big-endian
+    bytes each; then every element in the original order, 32 bytes each.
+    Encoding is deterministic: the same signature always produces the same
+    bytes. The blob reveals one secret per digest bit — handle it like
+    private key material.
+    """
+    _validate_bits(bits)
+    _validate_elements(signature, "signature")
+    if len(signature) != bits:
+        raise ValueError(f"signature must contain exactly {bits} elements")
+    return _encode_v1(_SIGNATURE_MAGIC, bits, signature)
+
+
+def lamport_signature_from_bytes(data: Any) -> tuple[int, tuple[bytes, ...]]:
+    """Parse ``lamport_signature_to_bytes()`` output back into ``(bits, elements)``.
+
+    ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+    ``TypeError``. A bad magic, an unknown version, an out-of-range ``bits``,
+    an element count that does not equal ``bits``, truncation or trailing
+    data raises ``ValueError``. The returned ``elements`` are an immutable
+    ``tuple`` of 32-byte ``bytes`` in the original order, ready for
+    :func:`verify`.
+    """
+    return _decode_v1(data, _SIGNATURE_MAGIC, "signature", 1)
 
 
 class OneTimeSigner:

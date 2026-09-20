@@ -1,4 +1,5 @@
 import hashlib
+import struct
 import unittest
 from dataclasses import FrozenInstanceError
 
@@ -10,7 +11,13 @@ from pqattest import (
     toy_lattice_encapsulate,
     toy_lattice_keygen,
 )
-from pqattest.toy_lattice import _decode_e, _encode_e
+from pqattest.toy_lattice import (
+    _CIPHERTEXT_MAGIC,
+    _PRIVATE_KEY_MAGIC,
+    _PUBLIC_KEY_MAGIC,
+    _decode_e,
+    _encode_e,
+)
 
 
 def fixed_tokens(value: bytes):
@@ -202,6 +209,273 @@ class DecapsulateTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
                     toy_lattice_decapsulate(ciphertext, bad)
+
+
+class KeySerializationTest(unittest.TestCase):
+    def setUp(self):
+        self.private_key, self.public_key = toy_lattice_keygen(
+            token_bytes=fixed_tokens(b"abcdefgh")
+        )
+
+    def test_public_key_layout(self):
+        blob = self.public_key.to_bytes()
+        self.assertIsInstance(blob, bytes)
+        self.assertEqual(len(blob), 25)
+        self.assertEqual(blob[:8], _PUBLIC_KEY_MAGIC)
+        self.assertEqual(blob[8], 1)  # version
+        self.assertEqual(blob[9:], self.public_key.t)
+
+    def test_private_key_layout(self):
+        blob = self.private_key.to_bytes()
+        self.assertIsInstance(blob, bytes)
+        self.assertEqual(len(blob), 25)
+        self.assertEqual(blob[:8], _PRIVATE_KEY_MAGIC)
+        self.assertEqual(blob[8], 1)  # version
+        self.assertEqual(blob[9:], self.private_key.s)
+
+    def test_encoding_is_deterministic(self):
+        self.assertEqual(
+            self.public_key.to_bytes(), self.public_key.to_bytes()
+        )
+        self.assertEqual(
+            self.private_key.to_bytes(), self.private_key.to_bytes()
+        )
+
+    def test_round_trip(self):
+        for key, cls in (
+            (self.public_key, ToyLatticePublicKey),
+            (self.private_key, ToyLatticePrivateKey),
+        ):
+            with self.subTest(cls=cls.__name__):
+                blob = key.to_bytes()
+                restored = cls.from_bytes(blob)
+                self.assertIs(type(restored), cls)
+                self.assertEqual(restored, key)
+                self.assertEqual(restored.to_bytes(), blob)
+
+    def test_accepts_bytearray(self):
+        self.assertEqual(
+            ToyLatticePublicKey.from_bytes(bytearray(self.public_key.to_bytes())),
+            self.public_key,
+        )
+        self.assertEqual(
+            ToyLatticePrivateKey.from_bytes(bytearray(self.private_key.to_bytes())),
+            self.private_key,
+        )
+
+    def test_coefficient_256_round_trips_losslessly(self):
+        encoded = b"\x01\x00" + b"\x00" * 14
+        self.assertEqual(ToyLatticePublicKey.from_bytes(
+            ToyLatticePublicKey(encoded).to_bytes()).t, encoded)
+        self.assertEqual(ToyLatticePrivateKey.from_bytes(
+            ToyLatticePrivateKey(encoded).to_bytes()).s, encoded)
+
+    def test_non_bytes_types_raise_type_error(self):
+        blob = self.public_key.to_bytes()
+        for bad in (None, 42, 4.5, "key", [blob], (blob,), object(), memoryview(blob)):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    ToyLatticePublicKey.from_bytes(bad)
+                with self.assertRaises(TypeError):
+                    ToyLatticePrivateKey.from_bytes(bad)
+
+    def test_to_bytes_on_foreign_object_raises_type_error(self):
+        for bad in (None, 42, "key", object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    ToyLatticePublicKey.to_bytes(bad)
+                with self.assertRaises(TypeError):
+                    ToyLatticePrivateKey.to_bytes(bad)
+
+    def test_truncated_and_empty_rejected(self):
+        for cls, blob in (
+            (ToyLatticePublicKey, self.public_key.to_bytes()),
+            (ToyLatticePrivateKey, self.private_key.to_bytes()),
+        ):
+            for cut in (0, 7, 8, 20, 24):
+                with self.subTest(cls=cls.__name__, cut=cut):
+                    with self.assertRaises(ValueError):
+                        cls.from_bytes(blob[:cut])
+
+    def test_trailing_data_rejected(self):
+        with self.assertRaises(ValueError):
+            ToyLatticePublicKey.from_bytes(self.public_key.to_bytes() + b"\x00")
+        with self.assertRaises(ValueError):
+            ToyLatticePrivateKey.from_bytes(self.private_key.to_bytes() + b"\x00")
+
+    def test_bad_magic_rejected(self):
+        for cls, blob in (
+            (ToyLatticePublicKey, self.public_key.to_bytes()),
+            (ToyLatticePrivateKey, self.private_key.to_bytes()),
+        ):
+            bad = bytearray(blob)
+            bad[0] ^= 0x01
+            with self.subTest(cls=cls.__name__):
+                with self.assertRaises(ValueError):
+                    cls.from_bytes(bytes(bad))
+
+    def test_cross_magic_rejected(self):
+        with self.assertRaises(ValueError):
+            ToyLatticePublicKey.from_bytes(self.private_key.to_bytes())
+        with self.assertRaises(ValueError):
+            ToyLatticePrivateKey.from_bytes(self.public_key.to_bytes())
+
+    def test_bad_version_rejected(self):
+        for cls, blob in (
+            (ToyLatticePublicKey, self.public_key.to_bytes()),
+            (ToyLatticePrivateKey, self.private_key.to_bytes()),
+        ):
+            for version in (0, 2, 255):
+                with self.subTest(cls=cls.__name__, version=version):
+                    bad = bytearray(blob)
+                    bad[8] = version
+                    with self.assertRaises(ValueError):
+                        cls.from_bytes(bytes(bad))
+
+    def test_illegal_coefficient_rejected(self):
+        for cls in (ToyLatticePublicKey, ToyLatticePrivateKey):
+            bad = bytearray(cls(b"\x00" * 16).to_bytes())
+            bad[9:11] = b"\x01\x01"  # coefficient 257 > 256
+            with self.subTest(cls=cls.__name__):
+                with self.assertRaises(ValueError):
+                    cls.from_bytes(bytes(bad))
+
+
+class CiphertextSerializationTest(unittest.TestCase):
+    def setUp(self):
+        _, self.public_key = toy_lattice_keygen(
+            token_bytes=fixed_tokens(b"abcdefgh")
+        )
+        self.ciphertext, self.shared_key = toy_lattice_encapsulate(
+            self.public_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        self.blob = self.ciphertext.to_bytes()
+
+    def test_layout(self):
+        blob = self.blob
+        self.assertIsInstance(blob, bytes)
+        self.assertEqual(blob[:8], _CIPHERTEXT_MAGIC)
+        self.assertEqual(blob[8], 1)  # version
+        self.assertEqual(blob[9:25], self.ciphertext.u)
+        self.assertEqual(
+            struct.unpack(">I", blob[25:29])[0], len(self.ciphertext.tag)
+        )
+        self.assertEqual(blob[29:], self.ciphertext.tag)
+
+    def test_encoding_is_deterministic(self):
+        self.assertEqual(self.blob, self.ciphertext.to_bytes())
+
+    def test_round_trip(self):
+        restored = ToyLatticeCiphertext.from_bytes(self.blob)
+        self.assertIs(type(restored), ToyLatticeCiphertext)
+        self.assertEqual(restored, self.ciphertext)
+        self.assertEqual(restored.to_bytes(), self.blob)
+
+    def test_round_trip_still_decapsulates(self):
+        private_key, _ = toy_lattice_keygen(token_bytes=fixed_tokens(b"abcdefgh"))
+        restored = ToyLatticeCiphertext.from_bytes(self.blob)
+        self.assertEqual(
+            toy_lattice_decapsulate(restored, private_key), self.shared_key
+        )
+
+    def test_accepts_bytearray(self):
+        self.assertEqual(
+            ToyLatticeCiphertext.from_bytes(bytearray(self.blob)),
+            self.ciphertext,
+        )
+
+    def test_empty_tag_round_trips(self):
+        ciphertext = ToyLatticeCiphertext(_encode_e(b"12345678"), b"")
+        blob = ciphertext.to_bytes()
+        self.assertEqual(len(blob), 29)
+        self.assertEqual(blob[29:], b"")
+        self.assertEqual(ToyLatticeCiphertext.from_bytes(blob), ciphertext)
+
+    def test_arbitrary_tag_round_trips(self):
+        for tag in (b"\x00", bytes(range(256)), b"x" * 1000):
+            with self.subTest(length=len(tag)):
+                ciphertext = ToyLatticeCiphertext(_encode_e(b"12345678"), tag)
+                blob = ciphertext.to_bytes()
+                restored = ToyLatticeCiphertext.from_bytes(blob)
+                self.assertEqual(restored, ciphertext)
+                self.assertEqual(restored.tag, tag)
+                self.assertEqual(restored.to_bytes(), blob)
+
+    def test_coefficient_256_round_trips_losslessly(self):
+        encoded = b"\x01\x00" + b"\x00" * 14
+        ciphertext = ToyLatticeCiphertext(encoded, b"tag")
+        self.assertEqual(
+            ToyLatticeCiphertext.from_bytes(ciphertext.to_bytes()).u, encoded
+        )
+
+    def test_decoded_value_remains_frozen(self):
+        restored = ToyLatticeCiphertext.from_bytes(self.blob)
+        with self.assertRaises(FrozenInstanceError):
+            restored.u = b"\x00" * 16
+        with self.assertRaises(FrozenInstanceError):
+            restored.tag = b""
+
+    def test_non_bytes_types_raise_type_error(self):
+        for bad in (None, 42, 4.5, "ct", [self.blob], (self.blob,), object(),
+                    memoryview(self.blob)):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    ToyLatticeCiphertext.from_bytes(bad)
+
+    def test_to_bytes_on_foreign_object_raises_type_error(self):
+        for bad in (None, 42, "ct", object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    ToyLatticeCiphertext.to_bytes(bad)
+
+    def test_truncated_and_empty_rejected(self):
+        for cut in range(0, len(self.blob)):
+            with self.subTest(cut=cut):
+                with self.assertRaises(ValueError):
+                    ToyLatticeCiphertext.from_bytes(self.blob[:cut])
+
+    def test_trailing_data_rejected(self):
+        with self.assertRaises(ValueError):
+            ToyLatticeCiphertext.from_bytes(self.blob + b"\x00")
+
+    def test_bad_magic_rejected(self):
+        bad = bytearray(self.blob)
+        bad[0] ^= 0x01
+        with self.assertRaises(ValueError):
+            ToyLatticeCiphertext.from_bytes(bytes(bad))
+
+    def test_foreign_magic_rejected(self):
+        with self.assertRaises(ValueError):
+            ToyLatticeCiphertext.from_bytes(self.public_key.to_bytes())
+
+    def test_bad_version_rejected(self):
+        for version in (0, 2, 255):
+            with self.subTest(version=version):
+                bad = bytearray(self.blob)
+                bad[8] = version
+                with self.assertRaises(ValueError):
+                    ToyLatticeCiphertext.from_bytes(bytes(bad))
+
+    def test_illegal_coefficient_rejected(self):
+        bad = bytearray(self.blob)
+        bad[9:11] = b"\x01\x01"  # coefficient 257 > 256
+        with self.assertRaises(ValueError):
+            ToyLatticeCiphertext.from_bytes(bytes(bad))
+
+    def test_tag_length_mismatch_rejected(self):
+        real_length = len(self.ciphertext.tag)
+        # Declared lengths that disagree with the actual tag body.
+        for declared in (0, real_length - 1, real_length + 1):
+            with self.subTest(declared=declared):
+                bad = bytearray(self.blob)
+                bad[25:29] = declared.to_bytes(4, "big")
+                with self.assertRaises(ValueError):
+                    ToyLatticeCiphertext.from_bytes(bytes(bad))
+        # A huge declared length runs straight past the end of the blob.
+        bad = bytearray(self.blob[:29])
+        bad[25:29] = (2 ** 32 - 1).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            ToyLatticeCiphertext.from_bytes(bytes(bad))
 
 
 if __name__ == "__main__":

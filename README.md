@@ -221,6 +221,28 @@ restored.sign(b"position claim")           # 成功；此后任何 sign 都抛 K
 
 **检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
 
+### 可选的认证封装 `auth_wrap` / `auth_unwrap`
+
+明文检查点只有无密钥的 SHA-256 校验值，需要防**无钥篡改**（但不必自己设计外层格式）时，可在三类检查点外统一加一层 HMAC 信封；旧接口完全不变，不加封装的检查点行为与以前一致。
+
+- `auth_wrap(checkpoint, *, scheme, key)` — 关键字参数 `scheme` 仅取 `"lamport"` / `"wots"` / `"merkle"`，依次编码为标识字节 1/2/3；`checkpoint` 为对应 `checkpoint()` 的 `bytes`/`bytearray` 输出，封装前按既有检查点魔数核对方案（Lamport `b"PQALCP\0\0"`、W-OTS `b"PQAWCP\0\0"`、Merkle `b"PQAMSCP\0"`），不符抛 `ValueError`；`key` 为非空 `bytes`/`bytearray`。返回逐字节确定的 `bytes`：8 字节魔数 `b"PQAAUTH\0"`、1 字节版本（1）、1 字节方案标识、4 字节大端载荷长度、原样载荷，末尾追加 `HMAC-SHA-256(key, 此前全部字节)` 的 32 字节标签
+- `auth_unwrap(data, *, key, expect=None)` — `data`/`key` 类型要求与封装相同；先按长度切出标签并用 `hmac.compare_digest` 常量时比较，标签通过后才核对载荷魔数与声明方案是否一致。成功返回 `(scheme, checkpoint)`：方案名字符串与传给 `auth_wrap` 的原始检查点字节（可直接交给对应的 `from_checkpoint`）。`expect` 给出时必须是方案名字符串且与信封方案一致，否则抛 `ValueError`
+
+错误约定：参数类型错误（`checkpoint`/`data`/`key` 非 `bytes`/`bytearray`、`scheme`/`expect` 非 `str`）抛 `TypeError`；空 key、未知或不符方案、坏魔数/版本/标识/长度、截断、尾随数据、载荷魔数不符或标签错误（含用错 key）均抛 `ValueError`，不返回任何载荷。
+
+```python
+from pqattest import MerkleSigner, auth_wrap, auth_unwrap
+
+signer = MerkleSigner(height=4, w=4)
+sealed = auth_wrap(signer.checkpoint(), scheme="merkle", key=b"hmac-secret")
+scheme, checkpoint = auth_unwrap(sealed, key=b"hmac-secret", expect="merkle")
+restored = MerkleSigner.from_checkpoint(checkpoint)
+```
+
+封装 v1 二进制格式：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（1）；1 字节方案标识（lamport=1、wots=2、merkle=3）；4 字节大端无符号载荷长度；原样嵌入的既有检查点；最后为覆盖此前全部字节（含载荷）的 32 字节 `HMAC-SHA-256` 标签。总长度为 `14 + 载荷长度 + 32` 字节。
+
+**安全边界**：认证只防无钥篡改，**不加密**——载荷中的私钥仍为明文，封装后的字节仍须按私钥保管；信封不含序号或时间戳，**不防复制、重放或回滚**：把一份旧的合法封存检查点换回存储即可通过认证，原子更新与绝不回滚旧状态的责任仍在调用方。
+
 玩具格基 KEM（教学用，**未审计，禁止生产**）：
 
 - `ToyLatticePrivateKey(s)` / `ToyLatticePublicKey(t)` / `ToyLatticeCiphertext(u, tag)` — 三个冻结值对象，可位置构造、按值相等（含可哈希）。字段均为 `bytes`：`s`/`t`/`u` 必须是编码 `E` 值（恰好 16 字节、8 个 2 字节大端系数、每项在 `0..256`），`tag` 为任意 `bytes`。字段类型错误抛 `TypeError`，长度或系数越界抛 `ValueError`

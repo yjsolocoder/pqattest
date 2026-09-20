@@ -7,7 +7,9 @@ PrivateKey.to_bytes / PrivateKey.from_bytes,
 PublicKey.to_bytes / PublicKey.from_bytes,
 lamport_signature_to_bytes / lamport_signature_from_bytes, and a versioned
 state checkpoint for the signer: OneTimeSigner.checkpoint /
-OneTimeSigner.from_checkpoint; the Winternitz
+OneTimeSigner.from_checkpoint; an optional keyed authenticated envelope that
+uniformly protects the three plaintext signer checkpoints:
+auth_wrap / auth_unwrap; the Winternitz
 construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
@@ -27,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from ._errors import KeyExhaustedError
+from .auth import auth_unwrap, auth_wrap
 from .merkle import (
     MerkleProof,
     MerklePublicKey,
@@ -74,6 +77,8 @@ __all__ = [
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
     "WOTSPublicKey",
+    "auth_unwrap",
+    "auth_wrap",
     "keygen",
     "lamport_signature_from_bytes",
     "lamport_signature_to_bytes",

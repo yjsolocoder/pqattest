@@ -416,8 +416,8 @@ class MerkleSigner:
     """Thread-safe, in-process few-times signer over a Merkle tree of W-OTS keys.
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
-    only by a successful :meth:`sign`. Once every leaf is spent, further calls
-    raise :class:`KeyExhaustedError`.
+    only by a successful :meth:`sign` or :meth:`sign_batch`. Once every leaf
+    is spent, further calls raise :class:`KeyExhaustedError`.
     """
 
     def __init__(
@@ -554,6 +554,21 @@ class MerkleSigner:
             raise ValueError("Merkle root rebuilt from the private keys does not match")
         return signer
 
+    def _signature_at(self, index: int, message: Any) -> MerkleSignature:
+        """Build the signature for ``message`` at leaf ``index``.
+
+        Does not touch signer state: the caller holds the lock and decides
+        whether and when to advance ``_next_index``.
+        """
+        wots_signature = wots_sign(message, self._private_keys[index])
+        auth_path = tuple(
+            self._layers[level][(index >> level) ^ 1]
+            for level in range(self._height)
+        )
+        return MerkleSignature(
+            index=index, wots_signature=wots_signature, auth_path=auth_path
+        )
+
     def sign(self, message: Any) -> MerkleSignature:
         """Sign ``message`` with the next unused leaf.
 
@@ -567,15 +582,46 @@ class MerkleSigner:
             if self._next_index >= len(self._private_keys):
                 raise KeyExhaustedError("all Merkle leaves have been used")
             index = self._next_index
-            wots_signature = wots_sign(message, self._private_keys[index])
+            signature = self._signature_at(index, message)
             self._next_index += 1
-            auth_path = tuple(
-                self._layers[level][(index >> level) ^ 1]
-                for level in range(self._height)
-            )
-            return MerkleSignature(
-                index=index, wots_signature=wots_signature, auth_path=auth_path
-            )
+            return signature
+
+    def sign_batch(self, messages: Any) -> tuple[MerkleSignature, ...]:
+        """Sign every message in ``messages`` atomically, one leaf each, in order.
+
+        ``messages`` must be a ``tuple`` whose members each follow the usual
+        message rules (``bytes``/``bytearray``/``str``); a non-tuple argument
+        or an illegal member raises ``TypeError``. The whole batch runs under
+        the same lock as :meth:`sign` and :meth:`checkpoint`: leaves are
+        allocated consecutively from the current ``next_index`` and the state
+        advances exactly once, after every signature has been generated, so a
+        concurrent caller never observes a half-consumed batch. The returned
+        tuple carries one :class:`MerkleSignature` per message, in the same
+        order, with strictly increasing indices — value-for-value identical
+        to calling :meth:`sign` on each message in sequence from the same
+        state, and encoded by the existing ``to_bytes`` codec unchanged.
+
+        The call is all-or-nothing: a batch larger than the number of
+        remaining leaves raises :class:`KeyExhaustedError`, and any
+        ``TypeError`` from an illegal message leaves the signer untouched —
+        no leaf is consumed and no partial result is returned either way.
+        An empty tuple returns an empty tuple and does not change the state.
+        """
+        with self._lock:
+            if not isinstance(messages, tuple):
+                raise TypeError("messages must be a tuple of messages")
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            signatures = []
+            for offset, message in enumerate(messages):
+                index = base + offset
+                if index >= leaf_count:
+                    raise KeyExhaustedError(
+                        "not enough Merkle leaves remain for the batch"
+                    )
+                signatures.append(self._signature_at(index, message))
+            self._next_index = base + len(signatures)
+            return tuple(signatures)
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

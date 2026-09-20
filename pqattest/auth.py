@@ -257,14 +257,16 @@ def auth_state_unwrap(
     scheme identifier, an identifier different from ``expect`` or a
     generation below ``min_generation`` raises ``ValueError``.
 
-    The tag is verified with :func:`hmac.compare_digest` first, before any
-    field is trusted; only afterwards are the payload magic and the scheme
-    (including ``expect``) checked, and the generation floor is applied
-    last. The returned checkpoint is the exact payload passed to
-    :func:`auth_state_wrap` (as ``bytes``), ready for the matching
-    ``from_checkpoint``. The envelope authenticates but does not encrypt; a
-    same-generation replay or a rollback accompanied by a floor rewind
-    remains undetectable.
+    Once at least the 32 tag bytes are present, the last 32 bytes are taken
+    as the tag and everything before them as the authenticated body; the tag
+    is verified with :func:`hmac.compare_digest` before any field is
+    trusted. Only afterwards are the v2 fields and the payload parsed, the
+    payload magic and the scheme (including ``expect``) checked, and the
+    generation floor applied last. The returned checkpoint is the exact
+    payload passed to :func:`auth_state_wrap` (as ``bytes``), ready for the
+    matching ``from_checkpoint``. The envelope authenticates but does not
+    encrypt; a same-generation replay or a rollback accompanied by a floor
+    rewind remains undetectable.
     """
     blob = _coerce_bytes(data, "data")
     key_bytes = _validate_key(key)
@@ -272,34 +274,36 @@ def auth_state_unwrap(
     if min_generation is not None:
         _validate_generation(min_generation, "min_generation")
 
-    minimum_length = _AUTH_V2_HEADER_BYTES + _AUTH_TAG_BYTES
-    if len(blob) < minimum_length:
+    if len(blob) < _AUTH_TAG_BYTES:
         raise ValueError("authenticated checkpoint is truncated")
-    if blob[:8] != _AUTH_MAGIC:
-        raise ValueError("bad authenticated checkpoint magic")
-    if blob[8] != _AUTH_V2_VERSION:
-        raise ValueError(f"unsupported authenticated checkpoint version: {blob[8]}")
-    identifier = blob[9]
-    try:
-        scheme, payload_magic = _SCHEME_IDS[identifier]
-    except KeyError:
-        raise ValueError(f"unknown scheme identifier: {identifier}") from None
-    generation = int.from_bytes(blob[10:18], "big")
-    payload_length = int.from_bytes(blob[18:22], "big")
-    expected_length = _AUTH_V2_HEADER_BYTES + payload_length + _AUTH_TAG_BYTES
-    if len(blob) < expected_length:
-        raise ValueError("authenticated checkpoint is truncated")
-    if len(blob) > expected_length:
-        raise ValueError("trailing data after the authenticated checkpoint")
 
-    # Authenticate first: no field above (including the generation) is
-    # trusted until this tag checks out.
+    # Authenticate first: no field (including the generation) is trusted
+    # until this tag over the whole body checks out.
     body, tag = blob[:-_AUTH_TAG_BYTES], blob[-_AUTH_TAG_BYTES:]
     expected_tag = hmac.new(key_bytes, body, hashlib.sha256).digest()
     if not hmac.compare_digest(expected_tag, tag):
         raise ValueError("authenticated checkpoint tag mismatch")
 
-    payload = blob[_AUTH_V2_HEADER_BYTES : _AUTH_V2_HEADER_BYTES + payload_length]
+    if len(body) < _AUTH_V2_HEADER_BYTES:
+        raise ValueError("authenticated checkpoint is truncated")
+    if body[:8] != _AUTH_MAGIC:
+        raise ValueError("bad authenticated checkpoint magic")
+    if body[8] != _AUTH_V2_VERSION:
+        raise ValueError(f"unsupported authenticated checkpoint version: {body[8]}")
+    identifier = body[9]
+    try:
+        scheme, payload_magic = _SCHEME_IDS[identifier]
+    except KeyError:
+        raise ValueError(f"unknown scheme identifier: {identifier}") from None
+    generation = int.from_bytes(body[10:18], "big")
+    payload_length = int.from_bytes(body[18:22], "big")
+    expected_length = _AUTH_V2_HEADER_BYTES + payload_length
+    if len(body) < expected_length:
+        raise ValueError("authenticated checkpoint is truncated")
+    if len(body) > expected_length:
+        raise ValueError("trailing data after the authenticated checkpoint")
+
+    payload = body[_AUTH_V2_HEADER_BYTES:expected_length]
     _check_payload_magic(payload, payload_magic, scheme)
     if expect is not None and scheme != expect:
         raise ValueError(f"envelope scheme {scheme!r} does not match expected {expect!r}")

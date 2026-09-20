@@ -12,7 +12,7 @@ construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
-merkle_verify, static
+merkle_verify, multiproof_encode / multiproof_verify, static
 parameter analysis: Params / profile / recommend, and the teaching-only toy
 lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -46,6 +46,8 @@ from .merkle import (
     MerkleSignature,
     MerkleSigner,
     merkle_verify,
+    multiproof_encode,
+    multiproof_verify,
 )
 from .params import Params, profile, recommend
 from .toy_lattice import (
@@ -98,6 +100,8 @@ __all__ = [
     "merkle_verify",
     "message_bits",
     "message_digest",
+    "multiproof_encode",
+    "multiproof_verify",
     "profile",
     "public_key_from",
     "recommend",

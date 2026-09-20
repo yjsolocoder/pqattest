@@ -44,6 +44,8 @@ __all__ = [
     "MerkleSignature",
     "MerkleSigner",
     "merkle_verify",
+    "multiproof_encode",
+    "multiproof_verify",
 ]
 
 _LEAF_DOMAIN = b"pqattest/leaf"
@@ -59,6 +61,14 @@ _BATCH_PROOF_MAGIC = b"PQAMBAT\0"
 _BATCH_PROOF_VERSION = 1
 _BATCH_PROOF_HEADER_BYTES = 8 + 1 + 4 + 2
 _MAX_BATCH_SIGNATURES = 0xFFFF
+
+_MULTIPROOF_MAGIC = b"PQAMMUL\0"
+_MULTIPROOF_VERSION = 1
+_MULTIPROOF_HEADER_BYTES = 8 + 1 + 4 + 2 + 2
+_MAX_MULTIPROOF_LEAVES = 0xFFFF
+_MAX_MULTIPROOF_NODES = 0xFFFF
+_NODE_RECORD_BYTES = 1 + 2 + ELEMENT_BYTES
+_LEAF_RECORD_BYTES = 2 + 2
 
 _CHECKPOINT_MAGIC = b"PQAMSCP\0"
 _CHECKPOINT_VERSION = 1
@@ -831,3 +841,275 @@ def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> 
         else:
             node = _node_hash(node, sibling)
     return node == root
+
+
+def _canonical_proof_nodes(
+    height: int, indices: tuple[int, ...]
+) -> tuple[tuple[int, int], ...]:
+    """Coordinates ``(level, index)`` of the deduplicated authentication nodes.
+
+    Starting from the signed leaf indices on level 0, each level keeps every
+    sibling that is not itself part of the current index set and then folds the
+    set in half (index right shift). The result is sorted by level and then by
+    index, so the encoding is canonical and deterministic.
+    """
+    current = set(indices)
+    nodes: list[tuple[int, int]] = []
+    for level in range(height):
+        siblings = {
+            (level, index ^ 1) for index in current if (index ^ 1) not in current
+        }
+        nodes.extend(sorted(siblings))
+        current = {index >> 1 for index in current}
+    return tuple(nodes)
+
+
+def multiproof_encode(public_key: Any, signatures: Any) -> bytes:
+    """Pack several signatures of one Merkle key into a deduplicated multiproof.
+
+    Unlike :class:`MerkleBatchProof` (which embeds each signature's full
+    authentication path), the multiproof keeps only the W-OTS signature of
+    every signed leaf plus the *canonical* set of Merkle nodes shared by their
+    authentication paths: each node appears exactly once.
+
+    The v1 layout is the 8-byte magic ``b"PQAMMUL\\0"``; the version byte (1);
+    the public-key length as 4 big-endian bytes; the leaf count and the node
+    count as 2 big-endian bytes each; the complete v1 encoding of
+    ``public_key``; one record per leaf in strictly increasing index order —
+    the index and the W-OTS element count as 2 big-endian bytes each followed
+    by that many 32-byte elements in chain order; and one record per canonical
+    node in ``(level, index)`` order — one level byte, the node index as 2
+    big-endian bytes and the 32-byte node hash. Encoding is deterministic: the
+    same inputs always produce the same bytes.
+
+    A wrong argument type (a non-:class:`MerklePublicKey` key, a non-tuple
+    container or a non-:class:`MerkleSignature` member) raises ``TypeError``.
+    An empty set, non-strictly-increasing or out-of-range leaf indices, a
+    signature inconsistent with the key, or an encoding whose node set exceeds
+    the 2-byte count field raises ``ValueError``.
+    """
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    if not isinstance(signatures, tuple):
+        raise TypeError("signatures must be a tuple of MerkleSignature")
+    for signature in signatures:
+        if not isinstance(signature, MerkleSignature):
+            raise TypeError("every signature must be a MerkleSignature")
+    if not signatures:
+        raise ValueError("signatures must not be empty")
+    for signature in signatures:
+        if not _signature_matches_key(signature, public_key):
+            raise ValueError("signature is not consistent with the public key")
+    indices = tuple(signature.index for signature in signatures)
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("signature indices must be strictly increasing and unique")
+    if len(indices) > _MAX_MULTIPROOF_LEAVES:
+        raise ValueError("the leaf count does not fit in 2 bytes")
+
+    w, height, chains = _signature_params(public_key)
+    nodes = _canonical_proof_nodes(height, indices)
+    if len(nodes) > _MAX_MULTIPROOF_NODES:
+        raise ValueError("the node count does not fit in 2 bytes")
+
+    # Every embedded signature carries the complete authentication path, so
+    # every canonical node is available without the signer's tree; paths
+    # belonging to different signatures must agree wherever they overlap.
+    node_values: dict[tuple[int, int], bytes] = {}
+    for signature in signatures:
+        for level, node in enumerate(signature.auth_path):
+            coordinate = (level, (signature.index >> level) ^ 1)
+            previous = node_values.get(coordinate)
+            if previous is not None and previous != node:
+                raise ValueError("conflicting proof nodes across signatures")
+            node_values[coordinate] = node
+
+    key_bytes = public_key.to_bytes()
+    parts = [
+        _MULTIPROOF_MAGIC,
+        bytes((_MULTIPROOF_VERSION,)),
+        len(key_bytes).to_bytes(4, "big"),
+        len(indices).to_bytes(2, "big"),
+        len(nodes).to_bytes(2, "big"),
+        key_bytes,
+    ]
+    for signature in signatures:
+        parts.append(signature.index.to_bytes(2, "big"))
+        parts.append(chains.to_bytes(2, "big"))
+        parts.append(b"".join(signature.wots_signature))
+    for level, node_index in nodes:
+        parts.append(bytes((level,)))
+        parts.append(node_index.to_bytes(2, "big"))
+        parts.append(node_values[(level, node_index)])
+    return b"".join(parts)
+
+
+def multiproof_verify(messages: Any, data: Any) -> bool:
+    """Verify a deterministic multiproof produced by :func:`multiproof_encode`.
+
+    ``messages`` must be a tuple with one entry per embedded leaf; each member
+    follows the usual message rules (``bytes``/``bytearray``/``str``). The
+    leaves are verified by index: the W-OTS public key recovered from each
+    leaf's signature is leaf-hashed, the canonical nodes are folded in level by
+    level using the existing leaf and internal-node byte rules, and the result
+    must equal the root committed by the embedded public key. Every proof node
+    must be used exactly once.
+
+    ``data`` must be ``bytes`` or ``bytearray``; any other type, a bad magic or
+    version, mismatched lengths or counts, truncation, trailing bytes, a
+    non-canonical (missing, extra, duplicated or out-of-order) node set, a
+    wrong number or type of messages, or any signature that does not recover to
+    the committed root makes the function return ``False``.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if not isinstance(messages, tuple):
+        return False
+    data = bytes(data)
+
+    parsed = _multiproof_parse(data)
+    if parsed is None:
+        return False
+    public_key, leaves, nodes = parsed
+    if len(messages) != len(leaves):
+        return False
+
+    w = public_key.w
+    height = public_key.height
+    b, _, _ = _params(w)
+
+    # Recover one W-OTS public key (hence one leaf hash) per signed message.
+    current: dict[int, bytes] = {}
+    for message, (index, wots_signature) in zip(messages, leaves):
+        try:
+            digits = _signing_digits(message, w)
+        except TypeError:
+            return False
+        recovered = tuple(
+            _chain_walk(element, b - 1 - digit)
+            for element, digit in zip(wots_signature, digits)
+        )
+        current[index] = _leaf_hash(w, recovered)
+
+    node_map: dict[tuple[int, int], bytes] = {}
+    for level, node_index, node_value in nodes:
+        coordinate = (level, node_index)
+        if coordinate in node_map:
+            return False
+        node_map[coordinate] = node_value
+
+    used: set[tuple[int, int]] = set()
+    for level in range(height):
+        parents: dict[int, bytes] = {}
+        for position in sorted(current):
+            parent = position >> 1
+            if parent in parents:
+                continue
+            sibling = position ^ 1
+            if sibling in current:
+                left, right = current[position], current[sibling]
+                if position & 1:
+                    left, right = right, left
+            else:
+                coordinate = (level, sibling)
+                if coordinate in used or coordinate not in node_map:
+                    return False
+                used.add(coordinate)
+                sibling_value = node_map[coordinate]
+                if position & 1:
+                    left, right = sibling_value, current[position]
+                else:
+                    left, right = current[position], sibling_value
+            parents[parent] = _node_hash(left, right)
+        current = parents
+
+    if used != set(node_map):
+        return False
+    return current.get(0) == public_key.root
+
+
+def _multiproof_parse(
+    data: bytes,
+) -> Any:
+    """Strict parser for the multiproof v1 wire format.
+
+    Returns ``(public_key, leaves, nodes)`` with
+    ``leaves = ((index, wots_elements), ...)`` and
+    ``nodes = ((level, index, value), ...)`` in wire order, or ``None`` for any
+    malformed, truncated, trailing or non-canonical encoding.
+    """
+    if len(data) < _MULTIPROOF_HEADER_BYTES:
+        return None
+    if data[:8] != _MULTIPROOF_MAGIC:
+        return None
+    if data[8] != _MULTIPROOF_VERSION:
+        return None
+    key_length = int.from_bytes(data[9:13], "big")
+    leaf_count = int.from_bytes(data[13:15], "big")
+    node_count = int.from_bytes(data[15:17], "big")
+    if key_length == 0 or leaf_count == 0:
+        return None
+    offset = _MULTIPROOF_HEADER_BYTES
+    key_end = offset + key_length
+    if key_end > len(data):
+        return None
+    try:
+        public_key = MerklePublicKey.from_bytes(data[offset:key_end])
+    except (TypeError, ValueError):
+        return None
+    w, height, chains = _signature_params(public_key)
+    leaf_limit = 1 << height
+
+    offset = key_end
+    leaves = []
+    last_index = -1
+    for _ in range(leaf_count):
+        if offset + _LEAF_RECORD_BYTES > len(data):
+            return None
+        index = int.from_bytes(data[offset : offset + 2], "big")
+        element_count = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        offset += _LEAF_RECORD_BYTES
+        if index >= leaf_limit or index <= last_index:
+            return None
+        last_index = index
+        if element_count != chains:
+            return None
+        elements_end = offset + element_count * ELEMENT_BYTES
+        if elements_end > len(data):
+            return None
+        elements = tuple(
+            data[offset + i * ELEMENT_BYTES : offset + (i + 1) * ELEMENT_BYTES]
+            for i in range(element_count)
+        )
+        offset = elements_end
+        leaves.append((index, elements))
+
+    nodes = []
+    last_coordinate = (-1, -1)
+    for _ in range(node_count):
+        record_end = offset + _NODE_RECORD_BYTES
+        if record_end > len(data):
+            return None
+        level = data[offset]
+        node_index = int.from_bytes(data[offset + 1 : offset + 3], "big")
+        node_value = data[offset + 3 : record_end]
+        offset = record_end
+        if not 0 <= level < height:
+            return None
+        if node_index >= (1 << (height - level)):
+            return None
+        coordinate = (level, node_index)
+        if coordinate <= last_coordinate:
+            return None
+        last_coordinate = coordinate
+        nodes.append((level, node_index, node_value))
+
+    if offset != len(data):
+        return None
+
+    # The node set must be exactly the canonical set implied by the leaves:
+    # nothing missing, nothing extra, nothing reordered.
+    indices = tuple(index for index, _ in leaves)
+    canonical = _canonical_proof_nodes(height, indices)
+    if tuple((level, node_index) for level, node_index, _ in nodes) != canonical:
+        return None
+    return public_key, tuple(leaves), tuple(nodes)

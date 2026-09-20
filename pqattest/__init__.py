@@ -1,11 +1,13 @@
-"""pqattest - hash-based one-time and few-times signatures.
+"""pqattest - hash-based one-time and few-times signatures, plus a toy KEM.
 
 Public API: keygen / public_key_from / sign / verify / message_bits /
 OneTimeSigner / KeyExhaustedError, the Winternitz construction:
 wots_keygen / wots_sign / wots_verify / WOTSPrivateKey / WOTSPublicKey,
 Merkle-aggregated W-OTS: MerkleSigner / MerklePublicKey /
-MerkleSignature / MerkleProof / merkle_verify, and static parameter analysis:
-Params / profile / recommend.
+MerkleSignature / MerkleProof / merkle_verify, static parameter analysis:
+Params / profile / recommend, and the teaching-only toy lattice KEM:
+toy_lattice_keygen / toy_lattice_encapsulate / toy_lattice_decapsulate /
+ToyLatticePublicKey / ToyLatticePrivateKey / ToyLatticeCiphertext.
 """
 
 from __future__ import annotations
@@ -25,6 +27,14 @@ from .merkle import (
     merkle_verify,
 )
 from .params import Params, profile, recommend
+from .toy_lattice import (
+    ToyLatticeCiphertext,
+    ToyLatticePrivateKey,
+    ToyLatticePublicKey,
+    toy_lattice_decapsulate,
+    toy_lattice_encapsulate,
+    toy_lattice_keygen,
+)
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -47,6 +57,9 @@ __all__ = [
     "Params",
     "PrivateKey",
     "PublicKey",
+    "ToyLatticeCiphertext",
+    "ToyLatticePrivateKey",
+    "ToyLatticePublicKey",
     "WOTSPrivateKey",
     "WOTSPublicKey",
     "keygen",
@@ -57,6 +70,9 @@ __all__ = [
     "public_key_from",
     "recommend",
     "sign",
+    "toy_lattice_decapsulate",
+    "toy_lattice_encapsulate",
+    "toy_lattice_keygen",
     "verify",
     "wots_keygen",
     "wots_sign",

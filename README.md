@@ -51,6 +51,19 @@ assert MerkleProof.from_bytes(blob).verify(b"position claim")
 
 消息统一接受 `bytes`、`bytearray`、`str`（str 按 UTF-8 编码）。
 
+教学用格基玩具 KEM（仅演示封装/解封装流程）：
+
+```python
+from pqattest import toy_lattice_keygen, toy_lattice_encapsulate, toy_lattice_decapsulate
+
+private_key, public_key = toy_lattice_keygen()
+ciphertext, enc_key = toy_lattice_encapsulate(public_key)
+dec_key = toy_lattice_decapsulate(ciphertext, private_key)
+assert enc_key == dec_key == ciphertext.tag
+```
+
+**未审计、不具安全性，仅供教学，严禁生产使用。**
+
 ## 命令行演示
 
 ```bash
@@ -154,6 +167,27 @@ assert restored.public_key == signer.public_key
 
 **检查点安全须知**：检查点明文包含整棵树的全部 W-OTS 私钥，末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）。回滚到旧检查点会让 `next_index` 倒退、已消耗的叶子被再次分配，造成一次性密钥重用，签名即可被伪造。
 
+玩具格基 KEM（教学用，**未审计，禁止生产**）：
+
+- `ToyLatticePrivateKey(s)` / `ToyLatticePublicKey(t)` / `ToyLatticeCiphertext(u, tag)` — 三个冻结值对象，可位置构造、按值相等（含可哈希）。字段均为 `bytes`：`s`/`t`/`u` 必须是编码 `E` 值（恰好 16 字节、8 个 2 字节大端系数、每项在 `0..256`），`tag` 为任意 `bytes`。字段类型错误抛 `TypeError`，长度或系数越界抛 `ValueError`
+- `toy_lattice_keygen(*, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`；取 `x = token_bytes(8)`，令 `s = t = E(x)`（即私钥与公钥是同一个向量，毫无难度可求逆——这正是它只能教学的原因之一）。令牌源未返回恰好 8 字节抛 `ValueError`
+- `toy_lattice_encapsulate(public_key, *, token_bytes=secrets.token_bytes)` — 返回 `(ciphertext, shared_key)`；取 `r = token_bytes(8)`、`u = E(r)`，用**解码后的向量**计算 `v = t·r mod 257`，共享密钥 `K = SHA256(b"K" + v₂)`，其中 `v₂` 为 `v` 的 2 字节大端编码；`tag = K`。`public_key` 类型错误抛 `TypeError`，令牌长度错误抛 `ValueError`
+- `toy_lattice_decapsulate(ciphertext, private_key)` — 用解码向量计算 `v = s·u mod 257`，以相同方式推出 `K`，并以常量时间比较校验 `tag`；一致则返回 `K`，`tag` 不符（含长度不同）抛 `ValueError`。参数类型错误抛 `TypeError`
+
+构造细节：向量维度固定为 8，系数环为模 257 整数；编码 `E` 把 8 个系数各编为 2 字节大端（系数允许 256，故 2 字节刚好容纳），共 16 字节。封装与解封装都先把 `E` 值解码回向量再做点积。密钥生成与封装的随机字节经注入的 `token_bytes` 取得（默认 `secrets.token_bytes`），仅被原样当作系数使用，因此系数实际落在 `0..255`；接收到的 `t`/`s`/`u` 则允许完整的 `0..256`。
+
+```python
+from pqattest import toy_lattice_keygen, toy_lattice_encapsulate, toy_lattice_decapsulate
+
+private_key, public_key = toy_lattice_keygen()
+ciphertext, enc_key = toy_lattice_encapsulate(public_key)
+assert toy_lattice_decapsulate(ciphertext, private_key) == enc_key
+
+# tag 是密钥确认：任何字节被改动都会在解封装时抛 ValueError
+tampered = ToyLatticeCiphertext(ciphertext.u, b"\x00" * 32)
+toy_lattice_decapsulate(tampered, private_key)   # ValueError
+```
+
 参数分析（纯函数，不生成密钥、不取随机数）：
 
 - `Params` — 冻结的指标值对象，字段为 `scheme, w, height, capacity, elements, sig_bytes, path_bytes, steps`；`w`/`height` 对该方案无意义时为 `None`
@@ -173,6 +207,8 @@ signer = MerkleSigner(height=params.height, w=params.w)
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。
 
 ## 限制
+
+玩具格基 KEM 是为讲解 KEM 外形（keygen/encapsulate/decapsulate、密钥确认 tag）而写的极简模型，**未经过安全审计且结构性地不安全**：私钥与公钥是同一个向量（无单向函数、无噪声、无陷门），任何人都能从公钥直接还原私钥；16 字节、模 257 的参数也无任何安全裕度。**仅供教学，严禁用于任何真实系统。**
 
 Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用（Lamport 可用 `OneTimeSigner` 在进程内防护；W-OTS 没有等价包装器）。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子；`MerkleSigner` 只在进程内跟踪已用叶子，跨进程持久化须由调用方通过 `checkpoint()`/`from_checkpoint()` 完成——检查点明文包含全部私钥且校验值不提供认证，安全存储、每次签名后原子更新、绝不回滚旧检查点的责任都在调用方，回滚即造成叶子重用。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。
 

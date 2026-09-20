@@ -582,6 +582,12 @@ class MerkleSigner:
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign` or :meth:`sign_batch`. Once every leaf
     is spent, further calls raise :class:`KeyExhaustedError`.
+
+    Leaves can also be proactively voided with :meth:`advance_to`: after a
+    crash or whenever state is uncertain, a caller skips leaves that may
+    already have been exposed so they can never be signed again. Voiding only
+    moves ``next_index`` forward — it never changes the keys, and there is no
+    public way to move it backwards.
     """
 
     def __init__(
@@ -627,6 +633,27 @@ class MerkleSigner:
     def public_key(self) -> MerklePublicKey:
         """The Merkle public key committing to every leaf (read-only)."""
         return self._public_key
+
+    @property
+    def next_index(self) -> int:
+        """Index of the next leaf that has not been spent or voided (read-only).
+
+        Shares the signing lock, so the value is linearised with every
+        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to` and
+        :meth:`checkpoint`.
+        """
+        with self._lock:
+            return self._next_index
+
+    @property
+    def remaining(self) -> int:
+        """Leaves still available for signing: ``public_key.leaf_count - next_index``.
+
+        Reads through the same lock as :attr:`next_index`; it is ``0`` once
+        every leaf has been spent or voided.
+        """
+        with self._lock:
+            return len(self._private_keys) - self._next_index
 
     def checkpoint(self) -> bytes:
         """Serialise the full signer state (all private keys) to ``bytes``.
@@ -717,6 +744,41 @@ class MerkleSigner:
         if signer._public_key.root != root:
             raise ValueError("Merkle root rebuilt from the private keys does not match")
         return signer
+
+    def advance_to(self, next_index: Any) -> tuple[int, int]:
+        """Void leaves by advancing ``next_index`` to ``next_index``.
+
+        Use this after a crash or whenever signing state is uncertain to skip
+        leaves that may already have been exposed: every leaf below the target
+        can never be signed again, and the next :meth:`sign` uses the target
+        leaf. Only the index moves — keys, public key and tree are unchanged,
+        and there is deliberately no way to move the index backwards.
+
+        ``next_index`` must be a non-boolean integer in the closed interval
+        ``[self.next_index, public_key.leaf_count]``; a boolean or any other
+        type raises ``TypeError``, and a target below the current index or
+        above the leaf count raises ``ValueError``. Returns
+        ``(before, after)``: the next-leaf index before and after the call. An
+        equal target succeeds, returns the same value twice and neither
+        changes the state nor draws randomness. The call shares the signing
+        lock with :meth:`sign`, :meth:`sign_batch` and :meth:`checkpoint`, so
+        it linearises as one atomic jump. Advancing to the leaf count
+        exhausts the signer: :attr:`remaining` is ``0`` and :meth:`sign` or a
+        non-empty :meth:`sign_batch` then raises :class:`KeyExhaustedError`.
+        The advanced state is saved and restored by the existing v1
+        checkpoint format.
+        """
+        if isinstance(next_index, bool) or not isinstance(next_index, int):
+            raise TypeError("next_index must be a non-boolean integer")
+        with self._lock:
+            before = self._next_index
+            leaf_count = len(self._private_keys)
+            if next_index < before or next_index > leaf_count:
+                raise ValueError(
+                    "next_index must be between the current index and the leaf count"
+                )
+            self._next_index = next_index
+            return before, next_index
 
     def _signature_at(self, index: int, message: Any) -> MerkleSignature:
         """Build the signature for ``message`` at leaf ``index``.

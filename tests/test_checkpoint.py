@@ -49,6 +49,40 @@ class CheckpointFormatTest(unittest.TestCase):
         blob = signer.checkpoint()
         self.assertEqual(int.from_bytes(blob[11:13], "big"), 2)
 
+    def test_v1_format_unchanged_by_advance_to(self):
+        signer = make_signer(height=2)
+        fresh = signer.checkpoint()
+        signer.advance_to(3)
+        blob = signer.checkpoint()
+        # Same magic, version and total length — only next_index differs.
+        self.assertEqual(len(blob), len(fresh))
+        self.assertEqual(blob[:8], _CHECKPOINT_MAGIC)
+        self.assertEqual(blob[8], 1)  # version
+        self.assertEqual(int.from_bytes(blob[11:13], "big"), 3)
+        # Everything except the next_index field is byte-identical in the body.
+        self.assertEqual(blob[:11], fresh[:11])
+        self.assertEqual(blob[13:-32], fresh[13:-32])
+        # The trailing checksum changes (it covers next_index) and stays valid.
+        self.assertEqual(hashlib.sha256(blob[:-32]).digest(), blob[-32:])
+
+    def test_advanced_state_round_trip(self):
+        signer = make_signer(height=3)
+        signer.advance_to(5)
+        restored = MerkleSigner.from_checkpoint(signer.checkpoint())
+        self.assertEqual(restored.public_key, signer.public_key)
+        self.assertEqual(restored.next_index, 5)
+        self.assertEqual(restored.remaining, 3)
+        self.assertEqual(restored.sign("m").index, 5)
+
+    def test_advance_to_exhausted_boundary_round_trips(self):
+        signer = make_signer(height=2)
+        signer.advance_to(4)
+        restored = MerkleSigner.from_checkpoint(signer.checkpoint())
+        self.assertEqual(restored.next_index, 4)
+        self.assertEqual(restored.remaining, 0)
+        with self.assertRaises(KeyExhaustedError):
+            restored.sign("m")
+
 
 class CheckpointRoundTripTest(unittest.TestCase):
     def test_public_key_and_state_preserved(self):

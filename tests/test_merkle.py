@@ -354,6 +354,192 @@ class SignBatchTest(unittest.TestCase):
         self.assertEqual(restored.sign("c").index, 2)
 
 
+class AdvanceToTest(unittest.TestCase):
+    def test_properties_start_at_zero(self):
+        signer = make_signer(height=3)
+        self.assertEqual(signer.next_index, 0)
+        self.assertEqual(signer.remaining, 8)
+        self.assertEqual(
+            signer.remaining, signer.public_key.leaf_count - signer.next_index
+        )
+
+    def test_properties_track_signatures(self):
+        signer = make_signer(height=2)
+        signer.sign("a")
+        signer.sign_batch(("b", "c"))
+        self.assertEqual(signer.next_index, 3)
+        self.assertEqual(signer.remaining, 1)
+
+    def test_properties_are_read_only(self):
+        signer = make_signer()
+        with self.assertRaises(AttributeError):
+            signer.next_index = 1
+        with self.assertRaises(AttributeError):
+            signer.remaining = 1
+
+    def test_advance_returns_before_and_after(self):
+        signer = make_signer(height=3)
+        self.assertEqual(signer.advance_to(3), (0, 3))
+        self.assertEqual(signer.next_index, 3)
+        self.assertEqual(signer.remaining, 5)
+
+    def test_advance_further_from_current(self):
+        signer = make_signer(height=3)
+        signer.advance_to(2)
+        self.assertEqual(signer.advance_to(6), (2, 6))
+        self.assertEqual(signer.next_index, 6)
+
+    def test_equal_target_is_a_noop(self):
+        signer = make_signer(height=3)
+        signer.advance_to(3)
+        self.assertEqual(signer.advance_to(3), (3, 3))
+        self.assertEqual(signer.next_index, 3)
+        self.assertEqual(signer.remaining, 5)
+        # Still signs the same leaf it would have before the no-op.
+        self.assertEqual(signer.sign("m").index, 3)
+
+    def test_equal_target_draws_no_randomness(self):
+        signer = make_signer(height=2)
+        signer.advance_to(2)
+
+        import pqattest.merkle
+        from unittest import mock
+
+        def exploding_token_bytes(size):
+            raise AssertionError("advance_to must not draw randomness")
+
+        with mock.patch.object(
+            pqattest.merkle.secrets, "token_bytes", exploding_token_bytes
+        ):
+            self.assertEqual(signer.advance_to(2), (2, 2))
+
+    def test_advance_to_leaf_count_exhausts(self):
+        signer = make_signer(height=2)
+        self.assertEqual(signer.advance_to(4), (0, 4))
+        self.assertEqual(signer.next_index, 4)
+        self.assertEqual(signer.remaining, 0)
+        with self.assertRaises(KeyExhaustedError):
+            signer.sign("m")
+        with self.assertRaises(KeyExhaustedError):
+            signer.sign_batch(("m",))
+        # An empty batch remains allowed on an exhausted signer.
+        self.assertEqual(signer.sign_batch(()), ())
+        # The exhausted boundary itself is a valid equal target.
+        self.assertEqual(signer.advance_to(4), (4, 4))
+
+    def test_non_integer_target_raises_type_error(self):
+        signer = make_signer(height=2)
+        for bad in (True, False, 1.0, "1", None, [1], (1,), object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    signer.advance_to(bad)
+        self.assertEqual(signer.next_index, 0)
+
+    def test_backwards_target_raises_value_error(self):
+        signer = make_signer(height=3)
+        signer.sign("a")
+        for bad in (0, -1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    signer.advance_to(bad)
+        with self.assertRaises(ValueError):
+            signer.advance_to(0)
+        self.assertEqual(signer.next_index, 1)
+
+    def test_target_above_leaf_count_raises_value_error(self):
+        signer = make_signer(height=2)  # 4 leaves
+        for bad in (5, 8, 1 << 16):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    signer.advance_to(bad)
+        self.assertEqual(signer.next_index, 0)
+        # Once partly advanced the current index is still backwards.
+        signer.advance_to(3)
+        with self.assertRaises(ValueError):
+            signer.advance_to(2)
+        self.assertEqual(signer.next_index, 3)
+
+    def test_failed_advance_does_not_move_state(self):
+        signer = make_signer(height=2)
+        with self.assertRaises(ValueError):
+            signer.advance_to(5)
+        with self.assertRaises(TypeError):
+            signer.advance_to(True)
+        self.assertEqual(signer.sign("first").index, 0)
+
+    def test_sign_uses_smallest_unvoided_leaf(self):
+        signer = make_signer(height=3)
+        signer.advance_to(3)
+        self.assertEqual(signer.sign("a").index, 3)
+        batch = signer.sign_batch(("b", "c"))
+        self.assertEqual([s.index for s in batch], [4, 5])
+        self.assertEqual(signer.next_index, 6)
+
+    def test_voided_signatures_still_verify_under_same_key(self):
+        signer = make_signer(height=3)
+        signer.advance_to(2)
+        for i in range(2, 8):
+            message = f"m{i}"
+            signature = signer.sign(message)
+            self.assertEqual(signature.index, i)
+            self.assertTrue(merkle_verify(message, signature, signer.public_key))
+
+    def test_advance_does_not_change_public_key(self):
+        signer = make_signer(height=3)
+        public_key = signer.public_key
+        signer.advance_to(5)
+        self.assertIs(signer.public_key, public_key)
+
+    def test_no_public_rollback_entry(self):
+        signer = make_signer()
+        for name in ("rewind", "rollback", "reset", "set_index"):
+            self.assertFalse(hasattr(signer, name))
+
+    def test_advanced_state_survives_checkpoint(self):
+        signer = make_signer(height=3)
+        signer.sign("a")
+        signer.advance_to(5)
+        restored = MerkleSigner.from_checkpoint(signer.checkpoint())
+        self.assertEqual(restored.public_key, signer.public_key)
+        self.assertEqual(restored.next_index, 5)
+        self.assertEqual(restored.remaining, 3)
+        self.assertEqual(restored.sign("b").index, 5)
+
+    def test_concurrent_advances_and_signs_never_overlap(self):
+        height = 4
+        signer = make_signer(height=height)
+        signed = []
+        errors = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(1 << height)
+
+        def worker(i):
+            try:
+                barrier.wait(timeout=10)
+                if i % 2 == 0:
+                    signer.advance_to(signer.next_index + 1)
+                else:
+                    try:
+                        with lock:
+                            signed.append(signer.sign(f"m{i}").index)
+                    except KeyExhaustedError:
+                        pass
+            except (ValueError, KeyExhaustedError):
+                pass
+            except Exception as exc:  # pragma: no cover - failure path
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(1 << height)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(signed), len(set(signed)))
+        self.assertEqual(signer.next_index + signer.remaining, 1 << height)
+
+
 class TypeErrorTest(unittest.TestCase):
     def test_verify_requires_merkle_public_key(self):
         signer = make_signer()

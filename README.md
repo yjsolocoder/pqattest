@@ -147,7 +147,9 @@ Merkle 聚合（有限次签名）：
 - `MerkleSignature(index, wots_signature, auth_path)` — 冻结签名：叶索引、该叶的 W-OTS 签名、自叶层至根层的认证路径（每级一个 32 字节兄弟节点）
 - `MerkleSignature.to_bytes(public_key)` / `MerkleSignature.from_bytes(data, public_key)` — 版本化的签名二进制编解码。签名对象自身不带参数，两个接口都以 `public_key` 约束：`w` 与树高须与之一致、索引小于 `2**height`、元素数等于 `w` 对应的链数、路径数等于树高；不满足抛 `ValueError`，`public_key` 类型错误抛 `TypeError`
 - `MerkleSigner(*, height=4, w=4, token_bytes=secrets.token_bytes)` — 生成 `2**height` 把 W-OTS 密钥并建成 Merkle 树；`height` 为 1 至 8 的整数（非布尔），`w` 为 4 或 8。只读属性 `public_key`；`sign(message)` 线程安全地按 0 起递增分配叶子，仅成功后消耗叶子（非法消息抛 `TypeError` 且不消耗），叶子用尽抛 `KeyExhaustedError`，并发调用不会分配到重复索引
-- `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途
+- `MerkleSigner.next_index` / `MerkleSigner.remaining` — 只读整数属性：下一可用叶索引，以及 `public_key.leaf_count - next_index`（剩余可签叶子数）。两者均与 `sign`/`sign_batch`/`checkpoint` 共用同一把锁并线性化；到达叶总数后 `remaining` 为 0。**不存在公开的回退入口**
+- `MerkleSigner.advance_to(next_index) -> (int, int)` — 主动作废叶子：把下一可用叶索引推进到 `next_index`，返回推进前后的索引二元组。供调用方在崩溃恢复或状态不确定时跳过可能已暴露的 W-OTS 叶子，使其永不再用于签名。推进只移动索引，不改变公私钥；目标必须是非布尔整数且落在闭区间 `[当前 next_index, public_key.leaf_count]`，类型错（含布尔）抛 `TypeError`，倒退或越界抛 `ValueError`。等值目标成功返回相同二元组且不改状态、不取随机数；推到叶总数后签名器用尽，`sign` 与非空 `sign_batch` 抛 `KeyExhaustedError`（空批次仍返回空元组）。与 `sign`、`sign_batch`、`checkpoint` 共用锁并线性化；推进状态由现有 v1 检查点格式原样保存与恢复
+- `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign`/`advance_to` 共用同一把锁，并发快照只会落在某次操作之前或之后，不会落在操作中途
 - `MerkleSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；公钥与原签名器相同，下一次 `sign` 从保存的 `next_index` 继续，用尽状态恢复后仍抛 `KeyExhaustedError`。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、长度、`w`、树高、`next_index` 越界（允许 `0 <= next_index <= 2**height`）、元素数量、校验值非法，或由私钥重建的 Merkle 根不符，均抛 `ValueError` 且不返回实例
 - `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余畸形、越界或不匹配一律返回 `False`（包括绕过冻结构造器造成的字段缺失、类型/范围错误或元素、路径畸形）
 - `MerkleProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `MerklePublicKey` 与 `MerkleSignature`（字段类型错误抛 `TypeError`，签名参数/计数与公钥不一致抛 `ValueError`）；把一把公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密

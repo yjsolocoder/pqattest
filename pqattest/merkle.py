@@ -581,7 +581,11 @@ class MerkleSigner:
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign` or :meth:`sign_batch`. Once every leaf
-    is spent, further calls raise :class:`KeyExhaustedError`.
+    is spent, further calls raise :class:`KeyExhaustedError`. Callers
+    recovering from a crash or otherwise unsure whether a leaf was already
+    exposed can additionally invalidate — but never reuse — leaves with
+    :meth:`advance_to`, which moves the allocation frontier strictly
+    forwards. There is deliberately no public way to move it backwards.
     """
 
     def __init__(
@@ -628,6 +632,65 @@ class MerkleSigner:
         """The Merkle public key committing to every leaf (read-only)."""
         return self._public_key
 
+    @property
+    def next_index(self) -> int:
+        """Index of the next leaf that may be allocated (read-only).
+
+        Every leaf with a smaller index has been either signed with or
+        explicitly invalidated with :meth:`advance_to` and can never be
+        allocated again. The read shares the signing lock, so it observes a
+        state that is consistent with every concurrent :meth:`sign`,
+        :meth:`sign_batch`, :meth:`advance_to` and :meth:`checkpoint`.
+        """
+        with self._lock:
+            return self._next_index
+
+    @property
+    def remaining(self) -> int:
+        """Number of leaves still available for signing (read-only).
+
+        This is always ``public_key.leaf_count - next_index`` and never goes
+        negative; it is ``0`` once the frontier reaches the leaf count, at
+        which point :meth:`sign` and a non-empty :meth:`sign_batch` raise
+        :class:`KeyExhaustedError`. The read shares the signing lock.
+        """
+        with self._lock:
+            return len(self._private_keys) - self._next_index
+
+    def advance_to(self, next_index: Any) -> tuple[int, int]:
+        """Move the allocation frontier forwards, invalidating skipped leaves.
+
+        Use this after a crash or whenever a leaf may already have been
+        exposed: every leaf below ``next_index`` is abandoned without ever
+        being signed with again, so a possibly-reused W-OTS key cannot be
+        handed out by a later :meth:`sign` / :meth:`sign_batch`. The frontier
+        only ever moves forwards — there is no way to roll it back.
+
+        ``next_index`` must be a non-boolean integer in the closed interval
+        ``[self.next_index, public_key.leaf_count]``; a boolean or any
+        non-integer raises ``TypeError`` and a target below the current index
+        or above the leaf count raises ``ValueError``. The call returns the
+        ``(previous, new)`` frontier indices. A target equal to the current
+        frontier is a no-op: it returns the same value twice, changes no
+        state and draws no randomness (it does not even touch a leaf). The
+        call is linearised with :meth:`sign`, :meth:`sign_batch` and
+        :meth:`checkpoint` under the same lock; advancing changes only the
+        frontier, never the public or private keys. Advancing to the leaf
+        count exhausts the signer: ``remaining`` becomes ``0`` and further
+        non-empty signing raises :class:`KeyExhaustedError`.
+        """
+        if isinstance(next_index, bool) or not isinstance(next_index, int):
+            raise TypeError("next_index must be a non-boolean integer")
+        with self._lock:
+            previous = self._next_index
+            leaf_count = len(self._private_keys)
+            if next_index < previous or next_index > leaf_count:
+                raise ValueError(
+                    "next_index must be between the current index and the leaf count"
+                )
+            self._next_index = next_index
+            return previous, next_index
+
     def checkpoint(self) -> bytes:
         """Serialise the full signer state (all private keys) to ``bytes``.
 
@@ -640,7 +703,10 @@ class MerkleSigner:
 
         The checkpoint shares the signing lock, so a concurrent snapshot
         reflects the state either immediately before or immediately after an
-        in-flight :meth:`sign`, never part-way through one. The blob contains
+        in-flight :meth:`sign`, :meth:`sign_batch` or :meth:`advance_to`,
+        never part-way through one. The v1 format is unchanged: the frontier
+        moved by :meth:`advance_to` is the same ``next_index`` field and is
+        therefore persisted and restored as-is. The blob contains
         every private key in the clear and the trailing hash only detects
         accidental corruption — store it as a secret.
         """
@@ -671,8 +737,9 @@ class MerkleSigner:
         or a Merkle root that does not match the one rebuilt from the private
         keys raises ``ValueError`` and no instance is returned. The restored
         signer has the same public key and resumes signing at the saved
-        ``next_index``; a checkpoint taken after the last leaf was spent
-        restores an exhausted signer.
+        ``next_index``; leaves skipped with :meth:`advance_to` stay skipped,
+        and a checkpoint taken after the last leaf was spent restores an
+        exhausted signer.
         """
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("checkpoint data must be bytes or bytearray")

@@ -37,6 +37,11 @@ public_key = signer.public_key              # 唯一的长期公钥（含 Merkle
 sig0 = signer.sign(b"position claim")       # 自动占用叶子 0
 sig1 = signer.sign(b"another claim")        # 叶子 1，依此类推
 assert merkle_verify(b"position claim", sig0, public_key)
+
+# 需要一次签署多条时，用原子批量接口：同序返回，叶子连续分配、要么整批成功
+sigs = signer.sign_batch((b"claim A", "claim B", bytearray(b"claim C")))
+assert [sig.index for sig in sigs] == [2, 3, 4]
+assert merkle_verify("claim B", sigs[1], public_key)
 ```
 
 需要把一份签名连同公钥**独立**传给没有旁带公钥的接收方时，用 `MerkleProof` 打包：
@@ -136,7 +141,8 @@ Merkle 聚合（有限次签名）：
 - `MerkleSignature(index, wots_signature, auth_path)` — 冻结签名：叶索引、该叶的 W-OTS 签名、自叶层至根层的认证路径（每级一个 32 字节兄弟节点）
 - `MerkleSignature.to_bytes(public_key)` / `MerkleSignature.from_bytes(data, public_key)` — 版本化的签名二进制编解码。签名对象自身不带参数，两个接口都以 `public_key` 约束：`w` 与树高须与之一致、索引小于 `2**height`、元素数等于 `w` 对应的链数、路径数等于树高；不满足抛 `ValueError`，`public_key` 类型错误抛 `TypeError`
 - `MerkleSigner(*, height=4, w=4, token_bytes=secrets.token_bytes)` — 生成 `2**height` 把 W-OTS 密钥并建成 Merkle 树；`height` 为 1 至 8 的整数（非布尔），`w` 为 4 或 8。只读属性 `public_key`；`sign(message)` 线程安全地按 0 起递增分配叶子，仅成功后消耗叶子（非法消息抛 `TypeError` 且不消耗），叶子用尽抛 `KeyExhaustedError`，并发调用不会分配到重复索引
-- `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途
+- `MerkleSigner.sign_batch(messages)` — 一次原子签署多条消息：`messages` 必须为**元组**（非元组抛 `TypeError`），成员沿用与 `sign` 相同的消息规则（任一成员非法抛 `TypeError`），返回与消息同序的 `MerkleSignature` 元组；空元组返回空元组且不改状态（叶子用尽后也允许）。整批在与 `sign`、`checkpoint` 相同的锁内执行：从当前 `next_index` 起连续分配，索引严格递增、位置 `i` 占用叶子 `next_index + i`，仅在全部签名生成后一次推进状态。剩余叶子不足整批时抛 `KeyExhaustedError`；任何失败都不消耗叶子、不返回部分结果。结果逐值等同从同一状态依次调用 `sign`，签名编码不变
+- `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign`/`sign_batch` 共用同一把锁，并发快照只会落在某次签名或某整批签名之前或之后，不会落在其途中
 - `MerkleSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；公钥与原签名器相同，下一次 `sign` 从保存的 `next_index` 继续，用尽状态恢复后仍抛 `KeyExhaustedError`。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、长度、`w`、树高、`next_index` 越界（允许 `0 <= next_index <= 2**height`）、元素数量、校验值非法，或由私钥重建的 Merkle 根不符，均抛 `ValueError` 且不返回实例
 - `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余畸形、越界或不匹配一律返回 `False`（包括绕过冻结构造器造成的字段缺失、类型/范围错误或元素、路径畸形）
 - `MerkleProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `MerklePublicKey` 与 `MerkleSignature`（字段类型错误抛 `TypeError`，签名参数/计数与公钥不一致抛 `ValueError`）；把一把公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密
@@ -249,9 +255,9 @@ v1 封装没有任何新旧概念；v2 封装在共享同一魔数、同一套 v
 
 - `auth_state_wrap(checkpoint, *, scheme, key, generation)` — 参数与 `auth_wrap` 完全一致（`checkpoint`/`key` 为非空 `bytes`/`bytearray`，`scheme` 仅取 `"lamport"`/`"wots"`/`"merkle"`，封装前按检查点魔数核对方案），额外的关键字参数 `generation` 必须是 `0..2**64-1` 的**非布尔整数**；类型错抛 `TypeError`，越界抛 `ValueError`。返回确定编码的 `bytes`
 - `auth_state_unwrap(data, *, key, expect=None, min_generation=None)` — 验证 v2 封装并返回 `(scheme, generation, payload)`：`generation` 为封装中的非负 `int`，`payload` 为传入 `auth_state_wrap` 的原检查点字节（`bytes`，可直接交给对应的 `from_checkpoint`）。`expect` 语义与 `auth_unwrap` 相同；`min_generation` 为 `None`（缺省，不检查）或 `0..2**64-1` 的非布尔整数，低于下限的代次一律拒绝
-- 参数类型错误抛 `TypeError`（非字节的 `data`/`key`、非字符串 `expect`、非整数或布尔的 `generation`/`min_generation`）；空 `key`、未知 `expect`、代次参数超出 uint64、坏封装魔数、版本不为 2（v1 封装也算版本不符）、未知方案标识、长度字段不符、截断、尾随数据、载荷魔数与标识不符、与 `expect` 不符、HMAC 标签错误或代次低于 `min_generation`，一律抛 `ValueError`
+- 参数类型错误抛 `TypeError`（非字节的 `data`/`key`、非字符串 `expect`、非整数或布尔的 `generation`/`min_generation`）；空 `key`、未知 `expect`、代次参数超出 uint64、数据不足 32 字节、HMAC 标签错误、坏封装魔数、版本不为 2（v1 封装标签可通过但版本不符）、未知方案标识、长度字段不符、截断、尾随数据、载荷魔数与标识不符、与 `expect` 不符或代次低于 `min_generation`，一律抛 `ValueError`
 
-v2 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（2）；1 字节方案标识（lamport=1、wots=2、merkle=3）；**8 字节大端 `generation`**；4 字节大端载荷长度；原样嵌入的检查点载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `22 + 载荷长度 + 32` 字节。编码确定、同输入同字节。解封**先用 `hmac.compare_digest` 验证标签**，此后才信任任何字段；标签通过后再核对载荷魔数与方案（含 `expect`），**最后**应用代次下限。v1 与 v2 仅以版本字节区分：`auth_unwrap` 只接受版本 1、`auth_state_unwrap` 只接受版本 2，互不解析对方的封装；旧的 v1 封装与三类检查点的字节格式保持逐字节不变。
+v2 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（2）；1 字节方案标识（lamport=1、wots=2、merkle=3）；**8 字节大端 `generation`**；4 字节大端载荷长度；原样嵌入的检查点载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `22 + 载荷长度 + 32` 字节。编码确定、同输入同字节。解封时数据至少要有 32 字节：**先取末 32 字节为标签、其余为认证体，以密钥计算 HMAC-SHA-256 并用 `hmac.compare_digest` 比较**；不足 32 字节或标签不符立即抛 `ValueError`，此前不解析任何字段。标签通过后才按既有 v2 格式解析字段与载荷，再核对载荷魔数、方案与 `expect`，**最后**应用 `min_generation` 代次下限。v1 与 v2 仅以版本字节区分：`auth_unwrap` 只接受版本 1、`auth_state_unwrap` 只接受版本 2，互不解析对方的封装；旧的 v1 封装与三类检查点的字节格式保持逐字节不变。
 
 ```python
 from pqattest import MerkleSigner, auth_state_wrap, auth_state_unwrap

@@ -554,6 +554,17 @@ class MerkleSigner:
             raise ValueError("Merkle root rebuilt from the private keys does not match")
         return signer
 
+    def _signature_at(self, index: int, message: Any) -> MerkleSignature:
+        """Build the signature spending leaf ``index`` (lock held by callers)."""
+        wots_signature = wots_sign(message, self._private_keys[index])
+        auth_path = tuple(
+            self._layers[level][(index >> level) ^ 1]
+            for level in range(self._height)
+        )
+        return MerkleSignature(
+            index=index, wots_signature=wots_signature, auth_path=auth_path
+        )
+
     def sign(self, message: Any) -> MerkleSignature:
         """Sign ``message`` with the next unused leaf.
 
@@ -567,15 +578,54 @@ class MerkleSigner:
             if self._next_index >= len(self._private_keys):
                 raise KeyExhaustedError("all Merkle leaves have been used")
             index = self._next_index
-            wots_signature = wots_sign(message, self._private_keys[index])
+            signature = self._signature_at(index, message)
             self._next_index += 1
-            auth_path = tuple(
-                self._layers[level][(index >> level) ^ 1]
-                for level in range(self._height)
+            return signature
+
+    def sign_batch(self, messages: Any) -> tuple[MerkleSignature, ...]:
+        """Atomically sign several ``messages``, one leaf per message.
+
+        ``messages`` must be a tuple; every member follows the same
+        ``bytes``/``bytearray``/``str`` rule as :meth:`sign`. An empty tuple
+        returns an empty tuple without touching the state. On success the
+        leaves are allocated consecutively from the current ``next_index`` in
+        message order: the returned signatures carry strictly increasing
+        indices, position ``i`` spending leaf ``next_index + i``, and the state
+        advances past the whole batch in one step only after every signature
+        has been generated. The whole batch runs under the same lock as
+        :meth:`sign` and :meth:`checkpoint`, so concurrent callers see it as a
+        single indivisible allocation and no batch can consume only part of
+        its leaf range.
+
+        A non-tuple ``messages`` or a member rejected by the message rule
+        raises ``TypeError``; fewer unspent leaves than messages raises
+        :class:`KeyExhaustedError`. On any failure no leaf is consumed and no
+        partial result is returned: a retry from the unchanged state, or the
+        same number of sequential :meth:`sign` calls, yields signatures equal
+        in every value (same indices, W-OTS elements and auth paths).
+        """
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        # Validate every member up front with the same message rule sign uses:
+        # a single illegal member rejects the whole batch without depending on
+        # (or touching) the leaf state.
+        for message in messages:
+            _signing_digits(message, self._w)
+        with self._lock:
+            start = self._next_index
+            count = len(messages)
+            if start + count > len(self._private_keys):
+                raise KeyExhaustedError(
+                    "not enough unused Merkle leaves for the whole batch"
+                )
+            # Generate every signature before advancing the state once; message
+            # types were validated above, so nothing here can fail part-way.
+            signatures = tuple(
+                self._signature_at(start + offset, message)
+                for offset, message in enumerate(messages)
             )
-            return MerkleSignature(
-                index=index, wots_signature=wots_signature, auth_path=auth_path
-            )
+            self._next_index = start + count
+            return signatures
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

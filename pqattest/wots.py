@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
+from ._errors import KeyExhaustedError
+
 __all__ = [
     "ELEMENT_BYTES",
+    "WOTSOneTimeSigner",
     "WOTSPrivateKey",
     "WOTSPublicKey",
     "wots_keygen",
@@ -133,6 +137,62 @@ def _signing_digits(message: Any, w: int) -> tuple[int, ...]:
     digest = hashlib.sha256(_as_bytes(message)).digest()
     message_part = _message_digits(digest, w, b, l1)
     return message_part + _checksum_digits(message_part, w, b, l2)
+
+
+class WOTSOneTimeSigner:
+    """Thread-safe, single-use wrapper around a :class:`WOTSPrivateKey`.
+
+    The first :meth:`sign` call returns the ordinary :func:`wots_sign`
+    signature and marks the key as used; every later call raises
+    :class:`~pqattest.KeyExhaustedError`. The guard is per instance and per
+    process — copying the private key, calling the stateless :func:`wots_sign`
+    directly or reusing the key in another process is the caller's
+    responsibility.
+    """
+
+    __slots__ = ("_lock", "_private_key", "_public_key", "_used")
+
+    def __init__(self, private_key: WOTSPrivateKey) -> None:
+        if not isinstance(private_key, WOTSPrivateKey):
+            raise TypeError("private_key must be a WOTSPrivateKey")
+        self._lock = threading.Lock()
+        self._private_key = private_key
+        b = 1 << private_key.w
+        self._public_key = WOTSPublicKey(
+            w=private_key.w,
+            elements=tuple(
+                _chain_walk(start, b - 1) for start in private_key.elements
+            ),
+        )
+        self._used = False
+
+    @property
+    def public_key(self) -> WOTSPublicKey:
+        """Public key derived from the wrapped private key (read-only)."""
+        return self._public_key
+
+    @property
+    def used(self) -> bool:
+        """``True`` once a signature has been produced (read-only)."""
+        return self._used
+
+    def sign(self, message: Any) -> tuple[bytes, ...]:
+        """Sign once.
+
+        Behaves exactly like :func:`wots_sign` on the first successful call,
+        accepting ``bytes``/``bytearray``/``str``; an unsupported message type
+        raises the same ``TypeError`` that :func:`wots_sign` raises without
+        consuming the key. Any later call raises
+        :class:`~pqattest.KeyExhaustedError`. Concurrent calls are serialised
+        on one lock so that at most one succeeds and every loser raises
+        :class:`~pqattest.KeyExhaustedError`.
+        """
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            signature = wots_sign(message, self._private_key)
+            self._used = True
+            return signature
 
 
 def wots_keygen(

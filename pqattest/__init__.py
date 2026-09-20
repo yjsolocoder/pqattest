@@ -5,7 +5,9 @@ OneTimeSigner / KeyExhaustedError, with a deterministic, versioned v1 binary
 codec for the Lamport keys and stateless signatures:
 PrivateKey.to_bytes / PrivateKey.from_bytes,
 PublicKey.to_bytes / PublicKey.from_bytes,
-lamport_signature_to_bytes / lamport_signature_from_bytes; the Winternitz
+lamport_signature_to_bytes / lamport_signature_from_bytes, and a versioned
+state checkpoint for the signer: OneTimeSigner.checkpoint /
+OneTimeSigner.from_checkpoint; the Winternitz
 construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
@@ -102,6 +104,11 @@ _PUBLIC_KEY_MAGIC = b"PQALPUB\0"
 _SIGNATURE_MAGIC = b"PQALSIG\0"
 _CODEC_VERSION = 1
 _CODEC_HEADER_BYTES = 8 + 1 + 2 + 2
+
+_CHECKPOINT_MAGIC = b"PQALCP\0\0"
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 4
+_CHECKPOINT_CHECKSUM_BYTES = 32
 
 
 def _validate_bits(bits: Any) -> int:
@@ -325,8 +332,13 @@ class OneTimeSigner:
 
     The first :meth:`sign` call returns the ordinary Lamport signature and
     marks the key as used; every later call raises :class:`KeyExhaustedError`.
-    The guard is per instance — calling the stateless :func:`sign` directly is
-    unaffected.
+    The guard is per instance and per process — copying the private key,
+    calling the stateless :func:`sign` directly or reusing the key in another
+    process is the caller's responsibility. State can be persisted with
+    :meth:`checkpoint` and restored in another process with
+    :meth:`from_checkpoint`; the checkpoint contains the private key in the
+    clear and is protected only by a SHA-256 checksum against accidental
+    corruption, so callers must store it securely.
     """
 
     __slots__ = ("_lock", "_private_key", "_public_key", "_used")
@@ -334,10 +346,18 @@ class OneTimeSigner:
     def __init__(self, private_key: PrivateKey) -> None:
         if not isinstance(private_key, PrivateKey):
             raise TypeError("private_key must be a PrivateKey")
+        self._restore_state(private_key, public_key_from(private_key), False)
+
+    def _restore_state(
+        self,
+        private_key: PrivateKey,
+        public_key: PublicKey,
+        used: bool,
+    ) -> None:
         self._lock = threading.Lock()
         self._private_key = private_key
-        self._public_key = public_key_from(private_key)
-        self._used = False
+        self._public_key = public_key
+        self._used = used
 
     @property
     def public_key(self) -> PublicKey:
@@ -364,6 +384,74 @@ class OneTimeSigner:
             signature = sign(message, self._private_key)
             self._used = True
             return signature
+
+    def checkpoint(self) -> bytes:
+        """Serialise the signer state (private key plus ``used``) to ``bytes``.
+
+        The v1 layout is: the 8-byte magic ``b"PQALCP\\0\\0"``; one byte each
+        for the version (1) and ``used`` (0 or 1); the length of the nested
+        private key encoding as 4 big-endian bytes; the complete
+        :meth:`PrivateKey.to_bytes` output; and finally the SHA-256 of all
+        preceding content. Encoding is deterministic: the same state always
+        produces the same bytes.
+
+        The checkpoint shares the signing lock, so a concurrent snapshot
+        reflects the state either immediately before or immediately after an
+        in-flight :meth:`sign`, never part-way through one. The blob contains
+        the private key in the clear and the trailing hash only detects
+        accidental corruption — it provides neither authentication nor
+        encryption, so store it as a secret.
+        """
+        with self._lock:
+            key_blob = self._private_key.to_bytes()
+            body = (
+                _CHECKPOINT_MAGIC
+                + bytes((_CHECKPOINT_VERSION, int(self._used)))
+                + len(key_blob).to_bytes(4, "big")
+                + key_blob
+            )
+            return body + hashlib.sha256(body).digest()
+
+    @classmethod
+    def from_checkpoint(cls, data: Any) -> "OneTimeSigner":
+        """Restore a signer from ``checkpoint()`` output without randomness.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, a ``used`` flag that
+        is not 0 or 1, a private key length field that does not match the
+        content, an invalid nested private key encoding, truncation, trailing
+        data or a checksum mismatch raises ``ValueError`` and no instance is
+        returned. The private key and the public key rebuilt from it are
+        identical to the original's, so a restored unused signer still allows
+        exactly one signature and a checkpoint taken after signing restores a
+        signer whose every call raises :class:`KeyExhaustedError`.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("checkpoint data must be bytes or bytearray")
+        data = bytes(data)
+        header = _CHECKPOINT_HEADER_BYTES
+        if len(data) < header + _CHECKPOINT_CHECKSUM_BYTES:
+            raise ValueError("checkpoint is too short")
+        body, checksum = data[:-_CHECKPOINT_CHECKSUM_BYTES], data[-_CHECKPOINT_CHECKSUM_BYTES:]
+        if body[:8] != _CHECKPOINT_MAGIC:
+            raise ValueError("bad checkpoint magic")
+        if body[8] != _CHECKPOINT_VERSION:
+            raise ValueError(f"unsupported checkpoint version: {body[8]}")
+        used_byte = body[9]
+        if used_byte not in (0, 1):
+            raise ValueError("used flag must be 0 or 1")
+        key_length = int.from_bytes(body[10:14], "big")
+        if len(body) != header + key_length:
+            raise ValueError("private key length field does not match the checkpoint length")
+        if hashlib.sha256(body).digest() != checksum:
+            raise ValueError("checkpoint checksum mismatch")
+        try:
+            private_key = PrivateKey.from_bytes(body[header:])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid nested private key encoding: {exc}") from exc
+        signer = cls.__new__(cls)
+        signer._restore_state(private_key, public_key_from(private_key), bool(used_byte))
+        return signer
 
 
 def lamport_signature_to_bytes(signature: Any, *, bits: int) -> bytes:

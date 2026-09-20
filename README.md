@@ -85,6 +85,8 @@ Lamport：
 - `verify(message, signature, public_key)` — 逐位比对
 - `lamport_signature_to_bytes(signature, *, bits)` / `lamport_signature_from_bytes(data)` — 无状态签名的确定性 v1 二进制编解码；前者要求 `signature` 为成员全为 `bytes` 的元组（容器或成员类型错抛 `TypeError`）并返回 `bytes`，`bits` 仅限关键字且须为 1..256 的非布尔整数、等于元素数（否则抛 `ValueError`）；后者返回 `(bits, elements)`，`bits` 为 `int`，`elements` 为保持原序的不可变 `bytes` 元组、每项 32 字节，可直接交给 `verify`。计数或成员长度不符、坏魔数、未知版本、截断或尾随数据均抛 `ValueError`；解码入口只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`）
 - `OneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `sign(message, private_key)` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
+- `OneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
+- `OneTimeSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；按既有 Lamport 规则原序重建私钥及公钥，公钥与原实例相等，`used` 状态也一致（未用恢复后仍只允许一签，已用恢复后任何 `sign` 都抛 `KeyExhaustedError`）。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；坏魔数、未知版本、`used` 非 0/1、私钥长度字段不符、嵌套私钥编码非法、截断、尾随数据或校验值不符，均抛 `ValueError` 且不返回实例
 - `KeyExhaustedError` — 已用签名器再次签名时抛出（继承 `RuntimeError`）
 
 ```python
@@ -149,6 +151,8 @@ W-OTS 一次性签名器检查点 v1 二进制格式（`WOTSOneTimeSigner.checkp
 
 Lamport 密钥与签名 v1 线格式（`PrivateKey.to_bytes` / `PublicKey.to_bytes` / `lamport_signature_to_bytes`）：三种格式结构相同——8 字节魔数（私钥 `b"PQALPRV\0"`、公钥 `b"PQALPUB\0"`、签名 `b"PQALSIG\0"`）；1 字节版本（1）；两个 2 字节大端无符号整数依次为 `bits`（1..256）与元素计数（密钥严格等于 `2 * bits`，签名严格等于 `bits`）；随后按原序拼接全部 32 字节元素。总长度为 `13 + 元素计数 × 32` 字节（默认 bits=256 时：密钥 16397 字节，签名 8205 字节）。编码确定、同值同字节；私钥编码含明文秘密。
 
+Lamport 一次性签名器检查点 v1 二进制格式（`OneTimeSigner.checkpoint`）：8 字节魔数 `b"PQALCP\0\0"`；各 1 字节的版本（1）与 `used`（仅 0 或 1）；4 字节大端无符号嵌套私钥编码长度；随后是完整的 `PrivateKey.to_bytes()` 输出（即上面的 Lamport 私钥 v1 编码原样嵌入）；最后为此前全部内容的 SHA-256。总长度为 `14 + 私钥编码长度 + 32` 字节（默认 bits=256 时 16443 字节）。编码确定、同状态同字节；检查点含明文秘密，末尾校验值只发现意外损坏，不提供认证或加密。
+
 W-OTS 密钥与签名 v1 线格式（`WOTSPrivateKey.to_bytes` / `WOTSPublicKey.to_bytes` / `wots_signature_to_bytes`）：三种格式结构相同——8 字节魔数（私钥 `b"PQAWPRV\0"`、公钥 `b"PQAWPUB\0"`、签名 `b"PQAWSIG\0"`）；各 1 字节的版本（1）与 `w`；2 字节大端元素数（由 `w` 严格限定：`w=4` 为 67、`w=8` 为 34）；随后按原序拼接全部 32 字节元素。总长度为 `12 + 元素数 × 32` 字节（w=4 时 2156 字节，w=8 时 1100 字节）。编码确定、同值同字节；私钥编码含明文秘密。
 
 公钥 v1 线格式（`MerklePublicKey.to_bytes`，固定 43 字节）：8 字节魔数 `b"PQAMPK\0\0"`；各 1 字节的版本（1）、`w`、`height`；32 字节 Merkle 根。
@@ -203,7 +207,19 @@ assert WOTSOneTimeSigner.from_checkpoint(
 ).used                                      # 已用状态恢复后 used=True
 ```
 
-**检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
+`OneTimeSigner`（Lamport）用法相同：
+
+```python
+from pqattest import OneTimeSigner, keygen
+
+one_time = OneTimeSigner(keygen()[0])
+blob = one_time.checkpoint()               # 含明文私钥，须当秘密保管
+restored = OneTimeSigner.from_checkpoint(blob)
+assert restored.public_key == one_time.public_key
+restored.sign(b"position claim")           # 成功；此后任何 sign 都抛 KeyExhaustedError
+```
+
+**检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：
 
@@ -251,7 +267,7 @@ signer = MerkleSigner(height=params.height, w=params.w)
 
 玩具格基 KEM 是为讲解 KEM 外形（keygen/encapsulate/decapsulate、密钥确认 tag）而写的极简模型，**未经过安全审计且结构性地不安全**：私钥与公钥是同一个向量（无单向函数、无噪声、无陷门），任何人都能从公钥直接还原私钥；16 字节、模 257 的参数也无任何安全裕度。**仅供教学，严禁用于任何真实系统。**
 
-Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用；Lamport 可用 `OneTimeSigner`、W-OTS 可用 `WOTSOneTimeSigner` 在进程内防护，后者还可经 `checkpoint()`/`from_checkpoint()` 跨进程恢复同一私钥及 `used` 状态。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子；`MerkleSigner` 在进程内跟踪已用叶子，跨进程持久化同样由调用方通过 `checkpoint()`/`from_checkpoint()` 完成——检查点明文包含私钥且校验值不提供认证，安全存储、每次签名后原子更新、绝不回滚旧检查点的责任都在调用方，回滚即造成一次性密钥重用。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。
+Lamport 与 W-OTS 构造都是纯一次性签名：**同一密钥对签第二条消息就会同时暴露多个链位置的哈希原像（Lamport 为两个分支的秘密），签名即可被伪造**。无状态的 `sign`/`wots_sign` 不阻止也不检测重复使用；Lamport 可用 `OneTimeSigner`、W-OTS 可用 `WOTSOneTimeSigner` 在进程内防护，两者都可经 `checkpoint()`/`from_checkpoint()` 跨进程恢复同一私钥及 `used` 状态。Merkle 构造把上限提高到 `2**height` 条消息，但每签一条就永久消耗一片叶子；`MerkleSigner` 在进程内跟踪已用叶子，跨进程持久化同样由调用方通过 `checkpoint()`/`from_checkpoint()` 完成——检查点明文包含私钥且校验值不提供认证，安全存储、每次签名后原子更新、绝不回滚旧检查点的责任都在调用方，回滚即造成一次性密钥重用。参数固定为 SHA-256 安全级：Lamport 为 256 位（签名 256 × 32 = 8 KB）；W-OTS 仅提供 `w ∈ {4, 8}` 两档尺寸/速度权衡，链元素固定 32 字节，不含针对多消息或可变安全裕度的参数。
 
 ## 测试
 

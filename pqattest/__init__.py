@@ -16,9 +16,13 @@ parameter analysis: Params / profile / recommend, and the teaching-only toy
 lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
 ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
-in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; the envelope
-authenticates but does not encrypt and gives no replay or rollback
-protection.
+in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; the v2
+auth_state_wrap / auth_state_unwrap pair additionally binds an 8-byte
+generation so a caller with trustworthy external storage can reject
+rollbacks below a floor. Both envelopes authenticate but do not encrypt
+and give no replay protection; v1 gives no rollback protection either, and
+v2 cannot see a same-generation replay or a floor that is rolled back
+together with the checkpoint.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from ._errors import KeyExhaustedError
-from .auth import auth_unwrap, auth_wrap
+from .auth import auth_state_unwrap, auth_state_wrap, auth_unwrap, auth_wrap
 from .merkle import (
     MerkleProof,
     MerklePublicKey,
@@ -78,6 +82,8 @@ __all__ = [
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
     "WOTSPublicKey",
+    "auth_state_unwrap",
+    "auth_state_wrap",
     "auth_unwrap",
     "auth_wrap",
     "keygen",

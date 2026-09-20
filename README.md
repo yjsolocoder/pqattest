@@ -243,6 +243,30 @@ restored = MerkleSigner.from_checkpoint(checkpoint)
 
 **封装安全边界**：HMAC 只提供**来源/完整性认证**，**不加密**——载荷依旧是明文，任何拿到封装的人都能读到检查点内容；它也**不防复制、重放或回滚**：旧的合法封装随时可以重新提交，`auth_unwrap` 无法判断新旧。需要防回滚/重放时，调用方仍须自行加入单调序号或受信存储，并把封装连同明文检查点一起当秘密保管。旧的明文 `checkpoint()`/`from_checkpoint()` 接口保持不变，封装是可选的外层。
 
+### 带代次的认证封装 `auth_state_wrap` / `auth_state_unwrap`（v2）
+
+v2 封装在 v1 之上绑定一个 **8 字节认证代次（generation）**，配合调用方在**可信存储**中维护的“已接受最高代次”，可以把回滚到旧检查点变成可检测的拒绝：
+
+- `auth_state_wrap(checkpoint, *, scheme, key, generation)` — `checkpoint`/`scheme`/`key` 的约束与 `auth_wrap` 完全一致；`generation` 为仅限关键字的 `0..2**64-1` **非布尔整数**（`bool` 因是 `int` 子类而被显式拒绝）。布尔值、非整数抛 `TypeError`，越界抛 `ValueError`。返回确定编码的 `bytes`
+- `auth_state_unwrap(data, *, key, expect=None, min_generation=None)` — 验证 v2 封装并返回 `(scheme, generation, payload)`：方案名、封装中读出的代次（`int`）与原检查点字节（`bytes`，可直接交给对应的 `from_checkpoint`）。`expect` 语义同 v1；`min_generation` 为 `None`（缺省，不检查）或非布尔 `uint64`，代次低于下限即抛 `ValueError` 拒绝
+- 类型错误抛 `TypeError`；空 `key`、未知或与 `expect` 不符的方案、坏封装魔数/方案标识/长度字段、截断、尾随数据、载荷魔数不符、HMAC 标签错误、**版本不是 2（v1 封装不会被当 v2 解析）**或代次低于 `min_generation`，一律抛 `ValueError`
+
+v2 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（**2**）；1 字节方案标识（lamport=1、wots=2、merkle=3）；**8 字节大端 `generation`**；4 字节大端载荷长度；原样嵌入的检查点载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `22 + 载荷长度 + 32` 字节。解封时**先用 `hmac.compare_digest` 常量时间验证标签，再核对载荷魔数、方案及 `expect`，最后才应用代次下限**——标签通过前不信任任何字段。编码确定、同输入同字节。v1 的 `auth_wrap`/`auth_unwrap` 与 v1 字节格式保持逐字节不变。
+
+```python
+from pqattest import MerkleSigner, auth_state_wrap, auth_state_unwrap
+
+signer = MerkleSigner(height=4, w=4)
+generation = 7
+blob = auth_state_wrap(signer.checkpoint(), scheme="merkle", key=b"shared-secret", generation=generation)
+# floor 由调用方持久化在攻击者无法改写的可信存储中
+scheme, gen, checkpoint = auth_state_unwrap(blob, key=b"shared-secret", expect="merkle", min_generation=7)
+assert (scheme, gen) == ("merkle", 7)
+restored = MerkleSigner.from_checkpoint(checkpoint)
+```
+
+**代次安全边界**：标签只认证不**加密**，载荷仍是明文；代次是**状态外**的单调线索，其安全性完全依赖调用方的下限存储——`min_generation` 必须放在外部**可信存储**中。它**无法检测同一代次内的重放**（同代的旧合法封装仍可提交），也**无法检测“封装 + 下限”被一并回滚**（攻击者若能把可信存储里的下限也改回旧值，检查等同失效）。因此下限须与检查点一起原子、可信地持久化；这与 v1 一样不防复制，也不提供加密。
+
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：
 

@@ -7,7 +7,9 @@ carries the authentication path from that leaf to the root. Only the standard
 library is used. Public keys and signatures have a versioned binary wire
 format via ``to_bytes`` / ``from_bytes`` (the signature codec is constrained
 by the corresponding :class:`MerklePublicKey`). A :class:`MerkleProof`
-bundles one public key and one signature for independent transport. Signer
+bundles one public key and one signature for independent transport; a
+:class:`MerkleBatchProof` bundles one public key and several of its
+signatures the same way. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -36,6 +38,7 @@ from .wots import (
 )
 
 __all__ = [
+    "MerkleBatchProof",
     "MerkleProof",
     "MerklePublicKey",
     "MerkleSignature",
@@ -51,6 +54,10 @@ _MAX_HEIGHT = 8
 _PROOF_MAGIC = b"PQAMPRF\0"
 _PROOF_VERSION = 1
 _PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
+
+_BATCH_MAGIC = b"PQAMBAT\0"
+_BATCH_VERSION = 1
+_BATCH_HEADER_BYTES = 8 + 1 + 4 + 2
 
 _CHECKPOINT_MAGIC = b"PQAMSCP\0"
 _CHECKPOINT_VERSION = 1
@@ -410,6 +417,153 @@ def _signature_matches_key(signature: MerkleSignature, public_key: MerklePublicK
     if len(auth_path) != height:
         return False
     return True
+
+
+def _validate_signature_tuple(signatures: Any, public_key: MerklePublicKey) -> None:
+    """Enforce the batch invariants: a non-empty tuple of distinct, ordered,
+    key-consistent :class:`MerkleSignature` members."""
+    if not isinstance(signatures, tuple):
+        raise TypeError("signatures must be a tuple of MerkleSignature values")
+    for signature in signatures:
+        if not isinstance(signature, MerkleSignature):
+            raise TypeError("every signature must be a MerkleSignature")
+    if not signatures:
+        raise ValueError("signatures must not be empty")
+    for signature in signatures:
+        if not _signature_matches_key(signature, public_key):
+            raise ValueError("every signature must be consistent with the public key")
+    indices = [signature.index for signature in signatures]
+    if any(b <= a for a, b in zip(indices, indices[1:])):
+        raise ValueError("signature indices must be strictly increasing and unique")
+
+
+@dataclass(frozen=True)
+class MerkleBatchProof:
+    """Frozen, self-contained bundle of one public key and many of its signatures.
+
+    Like :class:`MerkleProof`, but carries a non-empty tuple of
+    :class:`MerkleSignature` values — all constrained by the same embedded
+    :class:`MerklePublicKey`, with strictly increasing (hence unique) leaf
+    indices — so a batch produced by :meth:`MerkleSigner.sign_batch` can be
+    transported on its own and checked with :meth:`verify`. The batch stores
+    no message and is a pure serialisation container: it offers neither
+    authentication nor encryption of the wrapper itself.
+    """
+
+    public_key: MerklePublicKey
+    signatures: tuple[MerkleSignature, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        _validate_signature_tuple(self.signatures, self.public_key)
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 batch wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAMBAT\\0"``; one version byte
+        (1); the public-key length as 4 big-endian bytes and the signature
+        count as 2 big-endian bytes; then the complete v1 encoding of the
+        public key; then, in tuple order, each signature's length as 4
+        big-endian bytes followed by its existing v1 encoding constrained by
+        that key. Encoding is deterministic: the same batch always produces
+        the same bytes. Fields corrupted by bypassing the frozen constructor
+        raise ``TypeError`` or ``ValueError`` instead of producing a malformed
+        encoding.
+        """
+        if not isinstance(self, MerkleBatchProof):
+            raise TypeError("to_bytes must be called on a MerkleBatchProof")
+        if not isinstance(self.public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        _validate_signature_tuple(self.signatures, self.public_key)
+        key_bytes = self.public_key.to_bytes()
+        signature_blobs = [
+            signature.to_bytes(self.public_key) for signature in self.signatures
+        ]
+        return (
+            _BATCH_MAGIC
+            + bytes((_BATCH_VERSION,))
+            + len(key_bytes).to_bytes(4, "big")
+            + len(signature_blobs).to_bytes(2, "big")
+            + key_bytes
+            + b"".join(
+                len(blob).to_bytes(4, "big") + blob for blob in signature_blobs
+            )
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "MerkleBatchProof":
+        """Parse ``to_bytes()`` output back into a :class:`MerkleBatchProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The embedded public key is recovered first and then
+        constrains every signature. A bad magic, an unknown version, a length
+        or count field that is out of bounds or disagrees with the actual
+        content, a zero signature count, truncation, trailing data, an
+        invalid nested encoding, or signatures inconsistent with the key
+        (wrong parameters or counts, or indices not strictly increasing)
+        raises ``ValueError`` and no half-valid object is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("batch proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _BATCH_HEADER_BYTES:
+            raise ValueError("batch proof encoding is truncated")
+        if data[:8] != _BATCH_MAGIC:
+            raise ValueError("bad batch proof magic")
+        if data[8] != _BATCH_VERSION:
+            raise ValueError(f"unsupported batch proof version: {data[8]}")
+        key_length = int.from_bytes(data[9:13], "big")
+        signature_count = int.from_bytes(data[13:15], "big")
+        if key_length == 0:
+            raise ValueError("the public key length must not be zero")
+        if signature_count == 0:
+            raise ValueError("the signature count must not be zero")
+        key_end = _BATCH_HEADER_BYTES + key_length
+        if key_end > len(data):
+            raise ValueError("batch proof encoding is truncated")
+        public_key = MerklePublicKey.from_bytes(data[_BATCH_HEADER_BYTES:key_end])
+        signatures = []
+        offset = key_end
+        for _ in range(signature_count):
+            if offset + 4 > len(data):
+                raise ValueError("batch proof encoding is truncated")
+            signature_length = int.from_bytes(data[offset : offset + 4], "big")
+            offset += 4
+            if signature_length == 0:
+                raise ValueError("a signature length must not be zero")
+            if offset + signature_length > len(data):
+                raise ValueError("batch proof encoding is truncated")
+            signatures.append(
+                MerkleSignature.from_bytes(
+                    data[offset : offset + signature_length], public_key
+                )
+            )
+            offset += signature_length
+        if offset < len(data):
+            raise ValueError("trailing data after the batch proof encoding")
+        return cls(public_key=public_key, signatures=tuple(signatures))
+
+    def verify(self, messages: Any) -> bool:
+        """Verify every embedded signature against the embedded public key.
+
+        ``messages`` must be a ``tuple`` of the same length as
+        ``self.signatures``; each member follows the usual message rules
+        (``bytes``/``bytearray``/``str``) and is checked with
+        :func:`merkle_verify` against the signature in the same position.
+        Returns ``True`` only when every pair verifies; a non-tuple argument,
+        a length mismatch, an illegal message or any verification failure
+        returns ``False``. The batch itself carries no messages and cannot
+        authenticate its own origin.
+        """
+        if not isinstance(messages, tuple):
+            return False
+        if len(messages) != len(self.signatures):
+            return False
+        return all(
+            merkle_verify(message, signature, self.public_key)
+            for message, signature in zip(messages, self.signatures)
+        )
 
 
 class MerkleSigner:

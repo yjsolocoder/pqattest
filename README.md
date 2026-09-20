@@ -49,6 +49,17 @@ blob = proof.to_bytes()                     # 单块字节即可传输
 assert MerkleProof.from_bytes(blob).verify(b"position claim")
 ```
 
+同一公钥的多份签名可用 `MerkleBatchProof` 打成一个批次整体传输（签名索引须严格递增，与 `sign`/`sign_batch` 的产出顺序天然一致）：
+
+```python
+from pqattest import MerkleBatchProof
+
+messages = (b"claim 0", b"claim 1", b"claim 2")
+batch = MerkleBatchProof(public_key=public_key, signatures=signer.sign_batch(messages))
+blob = batch.to_bytes()
+assert MerkleBatchProof.from_bytes(blob).verify(messages)
+```
+
 消息统一接受 `bytes`、`bytearray`、`str`（str 按 UTF-8 编码）。
 
 教学用格基玩具 KEM（仅演示封装/解封装流程）：
@@ -142,6 +153,9 @@ Merkle 聚合（有限次签名）：
 - `MerkleProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `MerklePublicKey` 与 `MerkleSignature`（字段类型错误抛 `TypeError`，签名参数/计数与公钥不一致抛 `ValueError`）；把一把公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密
 - `MerkleProof.to_bytes()` / `MerkleProof.from_bytes(data)` — 证明包的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束签名；魔数、版本、长度越界或与内容不符、截断、尾随数据、嵌套编码非法或公钥与签名交叉不一致均抛 `ValueError`，不返回半有效对象
 - `MerkleProof.verify(message)` — 接受 `bytes`/`bytearray`/`str`，等价于 `merkle_verify(message, proof.signature, proof.public_key)`；只对被签署的消息返回 `True`，消息、公钥或签名被改动后返回 `False`（非法消息类型返回 `False`）
+- `MerkleBatchProof(public_key, signatures)` — 冻结的批次证明值对象：`public_key` 须为 `MerklePublicKey`，`signatures` 须为**非空**的 `MerkleSignature` 元组，索引严格递增（故唯一）且每份签名都与该公钥参数/计数一致（字段类型错误抛 `TypeError`，结构约束违反抛 `ValueError`）；把同一公钥的多份签名打包成一份可**独立传输**的批次证明。批次包不存消息，本身不提供认证或加密
+- `MerkleBatchProof.to_bytes()` / `MerkleBatchProof.from_bytes(data)` — 批次证明的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束每份签名；魔数、版本、长度/计数越界或为零、截断、尾随数据、嵌套编码非法、签名与公钥交叉不一致或索引非严格递增均抛 `ValueError`，不返回半有效对象
+- `MerkleBatchProof.verify(messages)` — `messages` 须为与签名等长的元组，成员接受 `bytes`/`bytearray`/`str`；逐项等价于 `merkle_verify(message, signature, public_key)`，全部成功才返回 `True`；非元组、数量不符、非法消息成员或任一验签失败均返回 `False`
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 
@@ -160,6 +174,8 @@ W-OTS 密钥与签名 v1 线格式（`WOTSPrivateKey.to_bytes` / `WOTSPublicKey.
 签名 v1 线格式（`MerkleSignature.to_bytes(public_key)`）：8 字节魔数 `b"PQAMSIG\0"`；各 1 字节的版本（1）、`w`、`height`；2 字节大端叶索引；2 字节大端 W-OTS 元素数（等于 `w` 对应的链数）；1 字节路径数（等于树高）；随后依次是全部 W-OTS 签名元素和**自叶层向根层**排列的认证路径节点，每项 32 字节。总长度为 `16 + (元素数 + 树高) × 32` 字节。
 
 证明包 v1 线格式（`MerkleProof.to_bytes`）：8 字节魔数 `b"PQAMPRF\0"`；1 字节版本（1）；4 字节大端公钥长度；4 字节大端签名长度；随后先拼接完整的公钥 v1 编码，再拼接以该公钥约束的签名 v1 编码（即上面两种既有编码原样串联，证明包不另造单体编码）。长度字段必须与各自编码的实际内容一致；解析顺序固定为先公钥、后签名，签名始终由同包内刚恢复的公钥约束。总长度为 `17 + 公钥编码长度 + 签名编码长度` 字节。
+
+批次证明 v1 线格式（`MerkleBatchProof.to_bytes`）：8 字节魔数 `b"PQAMBAT\0"`；1 字节版本（1）；4 字节大端公钥长度；2 字节大端签名数（至少 1）；完整的公钥 v1 编码；随后按元组顺序，每份签名先写 4 字节大端长度、再写以该公钥约束的既有签名 v1 编码。总长度为 `15 + 公钥编码长度 + Σ(4 + 各签名编码长度)` 字节。
 
 ```python
 from pqattest import MerkleProof, MerklePublicKey, MerkleSignature, MerkleSigner

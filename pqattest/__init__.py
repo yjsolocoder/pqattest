@@ -11,7 +11,8 @@ OneTimeSigner.from_checkpoint; the Winternitz
 construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
-MerklePublicKey / MerkleSignature / MerkleProof / merkle_verify, static
+MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
+merkle_verify, static
 parameter analysis: Params / profile / recommend, and the teaching-only toy
 lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -39,6 +40,7 @@ from .auth import (
     auth_wrap,
 )
 from .merkle import (
+    MerkleBatchProof,
     MerkleProof,
     MerklePublicKey,
     MerkleSignature,
@@ -71,6 +73,7 @@ __all__ = [
     "ELEMENT_BYTES",
     "HASH_BYTES",
     "KeyExhaustedError",
+    "MerkleBatchProof",
     "MerkleProof",
     "MerklePublicKey",
     "MerkleSignature",

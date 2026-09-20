@@ -42,6 +42,15 @@ _TOKEN_BYTES = _DIMENSION
 _TAG_BYTES = 32
 _KEY_DOMAIN = b"K"
 
+_PUBLIC_KEY_MAGIC = b"PQALPK\0\0"
+_PRIVATE_KEY_MAGIC = b"PQALSK\0\0"
+_CIPHERTEXT_MAGIC = b"PQALCT\0\0"
+_LATTICE_VERSION = 1
+_KEY_BYTES = 8 + 1 + _ELEMENT_BYTES
+_TAG_LENGTH_BYTES = 4
+_CIPHERTEXT_HEADER_BYTES = 8 + 1 + _ELEMENT_BYTES + _TAG_LENGTH_BYTES
+_MAX_TAG_LENGTH = 2**32 - 1
+
 
 def _encode_e(coeffs: Iterable[int]) -> bytes:
     """Encode ``coeffs`` as 2-byte big-endian values (the encoding ``E``)."""
@@ -70,6 +79,14 @@ def _validate_e(value: Any, name: str) -> None:
             )
 
 
+def _serializable_e(value: Any, name: str) -> None:
+    """Validate an ``E`` field for ``to_bytes``; any corrupt field is ``ValueError``."""
+    try:
+        _validate_e(value, name)
+    except TypeError as exc:
+        raise ValueError(f"{name} is not a valid E encoding") from exc
+
+
 def _dot_mod(left: Iterable[int], right: Iterable[int]) -> int:
     return sum(a * b for a, b in zip(left, right)) % _MODULUS
 
@@ -88,6 +105,31 @@ class ToyLatticePrivateKey:
     def __post_init__(self) -> None:
         _validate_e(self.s, "s")
 
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALSK\\0\\0"``, one version byte
+        (1), and the 16-byte ``E``-encoded ``s`` — 25 bytes in total.
+        Encoding is deterministic: the same key always produces the same
+        bytes. A field corrupted by bypassing the frozen constructor raises
+        ``ValueError`` instead of producing a malformed encoding.
+        """
+        if not isinstance(self, ToyLatticePrivateKey):
+            raise TypeError("to_bytes must be called on a ToyLatticePrivateKey")
+        _serializable_e(self.s, "s")
+        return _PRIVATE_KEY_MAGIC + bytes((_LATTICE_VERSION,)) + self.s
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "ToyLatticePrivateKey":
+        """Parse ``to_bytes()`` output back into a :class:`ToyLatticePrivateKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, a truncated or
+        over-long encoding, or an ``s`` that is not a valid ``E`` encoding
+        (eight coefficients in ``0..256``) raises ``ValueError``.
+        """
+        return cls(s=_decode_key_field(data, _PRIVATE_KEY_MAGIC, "private key"))
+
 
 @dataclass(frozen=True)
 class ToyLatticePublicKey:
@@ -97,6 +139,31 @@ class ToyLatticePublicKey:
 
     def __post_init__(self) -> None:
         _validate_e(self.t, "t")
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALPK\\0\\0"``, one version byte
+        (1), and the 16-byte ``E``-encoded ``t`` — 25 bytes in total.
+        Encoding is deterministic: the same key always produces the same
+        bytes. A field corrupted by bypassing the frozen constructor raises
+        ``ValueError`` instead of producing a malformed encoding.
+        """
+        if not isinstance(self, ToyLatticePublicKey):
+            raise TypeError("to_bytes must be called on a ToyLatticePublicKey")
+        _serializable_e(self.t, "t")
+        return _PUBLIC_KEY_MAGIC + bytes((_LATTICE_VERSION,)) + self.t
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "ToyLatticePublicKey":
+        """Parse ``to_bytes()`` output back into a :class:`ToyLatticePublicKey`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, a truncated or
+        over-long encoding, or a ``t`` that is not a valid ``E`` encoding
+        (eight coefficients in ``0..256``) raises ``ValueError``.
+        """
+        return cls(t=_decode_key_field(data, _PUBLIC_KEY_MAGIC, "public key"))
 
 
 @dataclass(frozen=True)
@@ -110,6 +177,80 @@ class ToyLatticeCiphertext:
         _validate_e(self.u, "u")
         if not isinstance(self.tag, bytes):
             raise TypeError("tag must be bytes")
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALCT\\0\\0"``; one version byte
+        (1); the 16-byte ``E``-encoded ``u``; the tag length as four big-endian
+        unsigned bytes; and the tag bytes verbatim. The tag may be any
+        ``bytes`` from empty up to ``2 ** 32 - 1`` bytes. Encoding is
+        deterministic. A field corrupted by bypassing the frozen constructor
+        raises ``ValueError`` instead of producing a malformed encoding.
+        """
+        if not isinstance(self, ToyLatticeCiphertext):
+            raise TypeError("to_bytes must be called on a ToyLatticeCiphertext")
+        _serializable_e(self.u, "u")
+        if not isinstance(self.tag, bytes):
+            raise ValueError("tag is not a valid bytes field")
+        if len(self.tag) > _MAX_TAG_LENGTH:
+            raise ValueError("tag is too long to encode")
+        return (
+            _CIPHERTEXT_MAGIC
+            + bytes((_LATTICE_VERSION,))
+            + self.u
+            + len(self.tag).to_bytes(_TAG_LENGTH_BYTES, "big")
+            + self.tag
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "ToyLatticeCiphertext":
+        """Parse ``to_bytes()`` output back into a :class:`ToyLatticeCiphertext`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, a truncated or
+        over-long encoding, a tag length that disagrees with the remaining
+        bytes, or a ``u`` that is not a valid ``E`` encoding (eight
+        coefficients in ``0..256``) raises ``ValueError``.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("ciphertext data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _CIPHERTEXT_HEADER_BYTES:
+            raise ValueError("ciphertext encoding is truncated")
+        if data[:8] != _CIPHERTEXT_MAGIC:
+            raise ValueError("bad ciphertext magic")
+        if data[8] != _LATTICE_VERSION:
+            raise ValueError(f"unsupported ciphertext version: {data[8]}")
+        u = data[9 : 9 + _ELEMENT_BYTES]
+        _validate_e(u, "u")
+        tag_length = int.from_bytes(
+            data[9 + _ELEMENT_BYTES : _CIPHERTEXT_HEADER_BYTES], "big"
+        )
+        expected = _CIPHERTEXT_HEADER_BYTES + tag_length
+        if len(data) < expected:
+            raise ValueError("ciphertext encoding is truncated")
+        if len(data) > expected:
+            raise ValueError("trailing data after the ciphertext encoding")
+        return cls(u=u, tag=data[_CIPHERTEXT_HEADER_BYTES:expected])
+
+
+def _decode_key_field(data: Any, magic: bytes, label: str) -> bytes:
+    """Validate a fixed-length public/private key blob and return its ``E`` field."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"{label} data must be bytes or bytearray")
+    data = bytes(data)
+    if len(data) < _KEY_BYTES:
+        raise ValueError(f"{label} encoding is truncated")
+    if len(data) > _KEY_BYTES:
+        raise ValueError(f"trailing data after the {label} encoding")
+    if data[:8] != magic:
+        raise ValueError(f"bad {label} magic")
+    if data[8] != _LATTICE_VERSION:
+        raise ValueError(f"unsupported {label} version: {data[8]}")
+    field = data[9:_KEY_BYTES]
+    _validate_e(field, label)
+    return field
 
 
 def toy_lattice_keygen(

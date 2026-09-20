@@ -170,11 +170,14 @@ assert restored.public_key == signer.public_key
 玩具格基 KEM（教学用，**未审计，禁止生产**）：
 
 - `ToyLatticePrivateKey(s)` / `ToyLatticePublicKey(t)` / `ToyLatticeCiphertext(u, tag)` — 三个冻结值对象，可位置构造、按值相等（含可哈希）。字段均为 `bytes`：`s`/`t`/`u` 必须是编码 `E` 值（恰好 16 字节、8 个 2 字节大端系数、每项在 `0..256`），`tag` 为任意 `bytes`。字段类型错误抛 `TypeError`，长度或系数越界抛 `ValueError`
+- `ToyLatticePrivateKey.to_bytes()` / `ToyLatticePrivateKey.from_bytes(data)`、`ToyLatticePublicKey.to_bytes()` / `ToyLatticePublicKey.from_bytes(data)`、`ToyLatticeCiphertext.to_bytes()` / `ToyLatticeCiphertext.from_bytes(data)` — 三类对象的版本化二进制编解码；编码确定、同值同字节，往返后仍是可位置构造、按值相等的冻结对象。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），魔数、版本、长度、截断、尾随数据或非法 `E` 系数抛 `ValueError`
 - `toy_lattice_keygen(*, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`；取 `x = token_bytes(8)`，令 `s = t = E(x)`（即私钥与公钥是同一个向量，毫无难度可求逆——这正是它只能教学的原因之一）。令牌源未返回恰好 8 字节抛 `ValueError`
 - `toy_lattice_encapsulate(public_key, *, token_bytes=secrets.token_bytes)` — 返回 `(ciphertext, shared_key)`；取 `r = token_bytes(8)`、`u = E(r)`，用**解码后的向量**计算 `v = t·r mod 257`，共享密钥 `K = SHA256(b"K" + v₂)`，其中 `v₂` 为 `v` 的 2 字节大端编码；`tag = K`。`public_key` 类型错误抛 `TypeError`，令牌长度错误抛 `ValueError`
 - `toy_lattice_decapsulate(ciphertext, private_key)` — 用解码向量计算 `v = s·u mod 257`，以相同方式推出 `K`，并以常量时间比较校验 `tag`；一致则返回 `K`，`tag` 不符（含长度不同）抛 `ValueError`。参数类型错误抛 `TypeError`
 
 构造细节：向量维度固定为 8，系数环为模 257 整数；编码 `E` 把 8 个系数各编为 2 字节大端（系数允许 256，故 2 字节刚好容纳），共 16 字节。封装与解封装都先把 `E` 值解码回向量再做点积。密钥生成与封装的随机字节经注入的 `token_bytes` 取得（默认 `secrets.token_bytes`），仅被原样当作系数使用，因此系数实际落在 `0..255`；接收到的 `t`/`s`/`u` 则允许完整的 `0..256`。
+
+线格式（v1）：公钥固定 25 字节——8 字节魔数 `b"PQALPK\0\0"`、1 字节版本（1）、16 字节 `t`；私钥同序，魔数为 `b"PQALSK\0\0"`，随后 16 字节 `s`，同样固定 25 字节。密文依次为 8 字节魔数 `b"PQALCT\0\0"`、1 字节版本（1）、16 字节 `u`、4 字节大端无符号 `tag` 长度、原样拼接的 `tag`；`tag` 可为任意 `bytes`，长度范围 `0..2**32-1`，故密文总长为 `29 + tag 长度` 字节。
 
 ```python
 from pqattest import toy_lattice_keygen, toy_lattice_encapsulate, toy_lattice_decapsulate

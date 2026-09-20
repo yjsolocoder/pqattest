@@ -33,6 +33,7 @@ from .auth import _validate_generation, _validate_key, auth_state_wrap
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
+    _as_bytes,
     _chain_walk,
     _params,
     _signing_digits,
@@ -582,8 +583,9 @@ class MerkleSigner:
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign`, :meth:`sign_batch`,
-    :meth:`sign_with_checkpoint` or :meth:`sign_with_auth_state`. Once every
-    leaf is spent, further calls raise :class:`KeyExhaustedError`.
+    :meth:`sign_with_checkpoint`, :meth:`sign_with_auth_state` or
+    :meth:`sign_batch_with_auth_state`. Once every leaf is spent, further
+    calls raise :class:`KeyExhaustedError`.
 
     Leaves can also be proactively voided with :meth:`advance_to`: after a
     crash or whenever state is uncertain, a caller skips leaves that may
@@ -934,6 +936,71 @@ class MerkleSigner:
                 generation=generation_value,
             )
             return signature, envelope
+
+    def sign_batch_with_auth_state(
+        self, messages: Any, *, key: Any, generation: Any
+    ) -> tuple[tuple[MerkleSignature, ...], bytes]:
+        """Sign a whole batch and return the advanced state as a v2 envelope.
+
+        Combines :meth:`sign_batch` and :meth:`sign_with_auth_state` in one
+        atomic call. Returns ``(signatures, envelope)``: ``signatures`` is a
+        tuple with one :class:`MerkleSignature` per message, in the same
+        order — value-for-value identical to calling :meth:`sign_batch` on
+        the same messages from the same starting state, drawing no extra
+        randomness — and ``envelope`` is the :func:`auth_state_wrap` v2
+        envelope (``bytes``) over the post-advance v1 :meth:`checkpoint`
+        bytes with ``scheme="merkle"`` and the given ``key`` and
+        ``generation``, byte-for-byte the same as signing the batch and then
+        wrapping an explicit checkpoint.
+
+        Every input is validated before any capacity check: ``messages``
+        must be a ``tuple`` whose members each follow the usual message
+        rules (``bytes``/``bytearray``/``str``); ``key`` is keyword-only and
+        must be a non-empty ``bytes``/``bytearray`` shared secret;
+        ``generation`` is keyword-only and must be a non-boolean integer in
+        ``0 .. 2**64 - 1``. A non-tuple ``messages``, an illegal message
+        member or a wrong key/generation type raises ``TypeError``; an empty
+        key or an out-of-range generation raises ``ValueError``.
+
+        The whole batch then runs under the same lock as :meth:`sign`,
+        :meth:`sign_batch`, :meth:`advance_to`, the index properties and
+        :meth:`checkpoint`: leaves are allocated consecutively from the
+        current ``next_index`` and the state advances exactly once, after
+        every signature has been generated, so a concurrent observer never
+        sees a half-consumed batch. A batch larger than the number of
+        remaining leaves raises :class:`KeyExhaustedError`; every failure
+        happens without spending a leaf and returns no partial result. An
+        empty tuple is legal: it returns ``((), envelope)`` where the
+        envelope wraps the unchanged state. The envelope is plaintext and
+        authenticated only; it provides neither encryption nor protection
+        against replay or rollback on its own.
+        """
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if len(messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the batch"
+                )
+            signatures = tuple(
+                self._signature_at(base + offset, message)
+                for offset, message in enumerate(messages)
+            )
+            self._next_index = base + len(signatures)
+            checkpoint = self._checkpoint_bytes()
+            envelope = auth_state_wrap(
+                checkpoint,
+                scheme="merkle",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            return signatures, envelope
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ._errors import KeyExhaustedError
+from .auth import _validate_generation, _validate_key, auth_state_wrap
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -580,9 +581,9 @@ class MerkleSigner:
     """Thread-safe, in-process few-times signer over a Merkle tree of W-OTS keys.
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
-    only by a successful :meth:`sign`, :meth:`sign_batch` or
-    :meth:`sign_with_checkpoint`. Once every leaf is spent, further calls
-    raise :class:`KeyExhaustedError`.
+    only by a successful :meth:`sign`, :meth:`sign_batch`,
+    :meth:`sign_with_checkpoint` or :meth:`sign_with_auth_state`. Once every
+    leaf is spent, further calls raise :class:`KeyExhaustedError`.
 
     Leaves can also be proactively voided with :meth:`advance_to`: after a
     crash or whenever state is uncertain, a caller skips leaves that may
@@ -640,7 +641,8 @@ class MerkleSigner:
         """Index of the next leaf that has not been spent or voided (read-only).
 
         Shares the signing lock, so the value is linearised with every
-        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to` and
+        :meth:`sign`, :meth:`sign_batch`, :meth:`sign_with_checkpoint`,
+        :meth:`sign_with_auth_state`, :meth:`advance_to` and
         :meth:`checkpoint`.
         """
         with self._lock:
@@ -766,7 +768,8 @@ class MerkleSigner:
         ``(before, after)``: the next-leaf index before and after the call. An
         equal target succeeds, returns the same value twice and neither
         changes the state nor draws randomness. The call shares the signing
-        lock with :meth:`sign`, :meth:`sign_batch` and :meth:`checkpoint`, so
+        lock with :meth:`sign`, :meth:`sign_batch`, :meth:`sign_with_checkpoint`,
+        :meth:`sign_with_auth_state` and :meth:`checkpoint`, so
         it linearises as one atomic jump. Advancing to the leaf count
         exhausts the signer: :attr:`remaining` is ``0`` and :meth:`sign` or a
         non-empty :meth:`sign_batch` then raises :class:`KeyExhaustedError`.
@@ -865,7 +868,8 @@ class MerkleSigner:
         ``bytes`` that :meth:`checkpoint` returns for the advanced state,
         byte-for-byte the same v1 encoding holding the new ``next_index`` and
         every private key. Both halves are produced under the same lock as
-        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the index
+        :meth:`sign`, :meth:`sign_batch`, :meth:`sign_with_auth_state`,
+        :meth:`advance_to`, the index
         properties and :meth:`checkpoint`, so a concurrent observer sees the
         state either before the whole call or after both the signature and
         the snapshot are complete — never part-way through.
@@ -884,6 +888,64 @@ class MerkleSigner:
             signature = self._signature_at(index, message)
             self._next_index += 1
             return signature, self._checkpoint_bytes()
+
+    def sign_with_auth_state(
+        self, message: Any, *, key: Any, generation: Any
+    ) -> tuple[MerkleSignature, bytes]:
+        """Sign ``message`` and wrap the advanced state in one atomic step.
+
+        Returns ``(signature, wrapped_checkpoint)`` in that fixed order: the
+        :class:`MerkleSignature` produced by the existing signing path —
+        value-for-value identical to calling :meth:`sign` on the same message
+        from the same starting state, drawing no extra randomness — and the
+        advanced-state v1 :meth:`checkpoint` bytes sealed in the existing v2
+        authenticated envelope by :func:`pqattest.auth_state_wrap` with
+        ``scheme="merkle"`` and the given ``key`` and ``generation``. Pairing
+        the signature with the authenticated snapshot in one call stops a
+        concurrent caller from observing the signature together with a
+        checkpoint of the wrong state.
+
+        ``message`` accepts ``bytes``/``bytearray``/``str`` exactly like
+        :meth:`sign`. ``key`` must be a non-empty ``bytes``/``bytearray``
+        shared secret and ``generation`` a non-boolean integer in
+        ``0 .. 2**64 - 1``; both follow the existing
+        :func:`pqattest.auth_state_wrap` rules, raising ``TypeError`` for a
+        wrong type and ``ValueError`` for an empty key or an out-of-range
+        generation. ``key`` and ``generation`` are validated before any leaf
+        is touched, so a rejected argument never spends one.
+
+        Signing, advancing ``next_index``, snapshotting and wrapping all run
+        under the same lock as :meth:`sign`, :meth:`sign_batch`,
+        :meth:`sign_with_checkpoint`, :meth:`advance_to`, the index
+        properties and :meth:`checkpoint`, so the whole call linearises: a
+        concurrent observer sees the state either before the call or after
+        the signature, the advance, the snapshot and the envelope are all
+        complete — never part-way through.
+
+        A rejected message type raises ``TypeError`` without spending a leaf,
+        and an exhausted signer raises :class:`KeyExhaustedError`; a failed
+        call returns no partial result. The wrapped checkpoint still carries
+        every private key in the clear: the v2 envelope authenticates but
+        does not encrypt, and it does not prevent replay of a same-generation
+        blob or a rollback that also rewinds the caller's trusted generation
+        floor — confidentiality, durable storage and rollback protection
+        remain the caller's responsibility.
+        """
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            index = self._next_index
+            signature = self._signature_at(index, message)
+            self._next_index += 1
+            wrapped = auth_state_wrap(
+                self._checkpoint_bytes(),
+                scheme="merkle",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            return signature, wrapped
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

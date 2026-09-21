@@ -17,6 +17,7 @@ parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
 merkle_deployment_frontier /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
+merkle_transport_deployment_frontier /
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
 merkle_transport_workload_frontier, and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
@@ -63,6 +64,7 @@ from .params import (
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
+    merkle_transport_deployment_frontier,
     merkle_transport_workload_frontier,
     profile,
     recommend,
@@ -125,6 +127,7 @@ __all__ = [
     "merkle_deployment_frontier",
     "merkle_storage_profile",
     "merkle_transport_profile",
+    "merkle_transport_deployment_frontier",
     "merkle_transport_workload_frontier",
     "message_bits",
     "message_digest",

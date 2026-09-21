@@ -15,8 +15,11 @@ budgets. :func:`merkle_transport_workload_frontier` returns every feasible,
 non-dominated choice of the same workload as a tuple instead of ranking one.
 :func:`merkle_deployment_frontier` likewise returns the whole Pareto frontier
 of ordinary Merkle deployments under checkpoint, signature, proof and
-verifier-step budgets. All nine are pure functions: no randomness, no state,
-no I/O, no keys are generated.
+verifier-step budgets, and
+:func:`merkle_transport_deployment_frontier` returns the whole Pareto
+frontier of the joint tree/transport deployment under checkpoint, batch,
+multi-proof and verifier-step budgets. All ten are pure functions: no
+randomness, no state, no I/O, no keys are generated.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ __all__ = [
     "recommend_merkle_transport_deployment",
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
+    "merkle_transport_deployment_frontier",
     "merkle_storage_profile",
     "merkle_transport_profile",
 ]
@@ -649,6 +653,169 @@ def recommend_merkle_transport_deployment(
     return MerkleTransportDeploymentProfile(
         config=storage, nodes=node_count, batch=batch_bytes, multi=multi_bytes
     )
+
+
+def merkle_transport_deployment_frontier(
+    capacity: Any,
+    indices: Any,
+    budgets: Any,
+) -> tuple[MerkleTransportDeploymentProfile, ...]:
+    """Return every feasible, non-dominated joint deployment as a tuple.
+
+    Where :func:`recommend_merkle_transport_deployment` ranks the feasible
+    configs and returns one, this function keeps the whole Pareto frontier so
+    a caller can inspect the trade-off between checkpoint, transport and
+    verification costs: it enumerates every Merkle candidate — ``w`` in
+    ``(4, 8)`` times ``height`` from 1 to 8 — whose ``leaf_count`` covers both
+    ``capacity`` and the requested leaf ``indices``, keeps those satisfying
+    every set budget, reusing :func:`merkle_storage_profile` for the tree and
+    checkpoint sizes, :func:`merkle_transport_profile` for the canonical node
+    count and both wire lengths and :func:`profile` for the per-signature
+    verifier hash-chain step count, and drops every dominated candidate.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``indices``
+    must be a non-empty tuple of strictly increasing, non-negative,
+    non-boolean integers; the same index set is sized for every candidate and
+    its largest member must be below every covering tree's leaf count.
+    ``budgets`` must be a four-tuple, in order: an upper bound on the
+    checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), on the batch-proof wire
+    length (:attr:`MerkleTransportDeploymentProfile.batch`), on the
+    multi-proof wire length
+    (:attr:`MerkleTransportDeploymentProfile.multi`) and on the per-signature
+    verifier hash-chain step count (``profile("merkle", ...)``'s ``steps``).
+    Each entry is either ``None`` (no bound) or a positive, non-boolean
+    integer, and at least one entry must be set; every bound is inclusive.
+
+    A feasible profile *A* dominates another feasible profile *B* when
+    ``A`` is no greater than ``B`` on all four metrics — checkpoint bytes,
+    batch-proof wire bytes, multi-proof wire bytes and verifier steps — and
+    strictly smaller on at least one; every dominated candidate is dropped
+    and the survivors are deduplicated by value. No preference is applied,
+    so a configuration trading speed for size (or the reverse) is never
+    discarded ahead of the dominance test. The returned tuple is sorted
+    stably and ascending by verifier steps, multi-proof wire bytes,
+    batch-proof wire bytes, checkpoint bytes, leaf count, ``w`` and
+    ``height``.
+
+    A non-tuple ``indices`` or ``budgets`` raises ``TypeError``; an
+    out-of-range ``capacity``, an empty, non-integer, boolean, negative or
+    non-strictly-increasing ``indices``, a wrong-length or otherwise illegal
+    ``budgets`` tuple, or the absence of any feasible candidate raises
+    ``ValueError``. The function is pure: it draws no randomness, generates
+    no keys and changes no state.
+    """
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of leaf indices")
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 4-tuple of budget limits")
+    if len(budgets) != 4:
+        raise ValueError("budgets must contain exactly four entries")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+    if not indices:
+        raise ValueError("indices must not be empty")
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in indices):
+        raise ValueError("every index must be a non-boolean integer")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+    if indices[0] < 0:
+        raise ValueError("every index must be non-negative")
+
+    labels = ("checkpoint", "batch", "multiproof", "steps")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    checkpoint_limit, batch_limit, multi_limit, steps_limit = limits
+
+    required_leaves = max(capacity, indices[-1] + 1)
+    candidates: list[tuple[MerkleStorageProfile, int, int, int, int]] = []
+    for w in (4, 8):
+        for height in range(1, 9):
+            storage = merkle_storage_profile(w, height)
+            if storage.leaf_count < required_leaves:
+                continue
+            if checkpoint_limit is not None and storage.checkpoint_bytes > checkpoint_limit:
+                continue
+            node_count, batch_bytes, multi_bytes = merkle_transport_profile(
+                w, height, indices
+            )
+            if batch_limit is not None and batch_bytes > batch_limit:
+                continue
+            if multi_limit is not None and multi_bytes > multi_limit:
+                continue
+            steps = profile("merkle", w=w, height=height).steps
+            if steps_limit is not None and steps > steps_limit:
+                continue
+            candidates.append((storage, node_count, batch_bytes, multi_bytes, steps))
+    if not candidates:
+        raise ValueError("no Merkle configuration fits the requested capacity, indices and budgets")
+
+    def dominates(
+        a: tuple[MerkleStorageProfile, int, int, int, int],
+        b: tuple[MerkleStorageProfile, int, int, int, int],
+    ) -> bool:
+        a_storage, _a_nodes, a_batch, a_multi, a_steps = a
+        b_storage, _b_nodes, b_batch, b_multi, b_steps = b
+        no_worse = (
+            a_storage.checkpoint_bytes <= b_storage.checkpoint_bytes
+            and a_batch <= b_batch
+            and a_multi <= b_multi
+            and a_steps <= b_steps
+        )
+        strictly_better = (
+            a_storage.checkpoint_bytes < b_storage.checkpoint_bytes
+            or a_batch < b_batch
+            or a_multi < b_multi
+            or a_steps < b_steps
+        )
+        return no_worse and strictly_better
+
+    non_dominated = [
+        candidate
+        for candidate in candidates
+        if not any(dominates(other, candidate) for other in candidates)
+    ]
+
+    profiles = [
+        MerkleTransportDeploymentProfile(
+            config=storage, nodes=node_count, batch=batch_bytes, multi=multi_bytes
+        )
+        for storage, node_count, batch_bytes, multi_bytes, _steps in non_dominated
+    ]
+
+    unique: list[MerkleTransportDeploymentProfile] = []
+    seen: set[MerkleTransportDeploymentProfile] = set()
+    for deployment in profiles:
+        if deployment not in seen:
+            seen.add(deployment)
+            unique.append(deployment)
+
+    unique.sort(
+        key=lambda deployment: (
+            profile(
+                "merkle", w=deployment.config.w, height=deployment.config.height
+            ).steps,
+            deployment.multi,
+            deployment.batch,
+            deployment.config.checkpoint_bytes,
+            deployment.config.leaf_count,
+            deployment.config.w,
+            deployment.config.height,
+        )
+    )
+    return tuple(unique)
 
 
 @dataclass(frozen=True)

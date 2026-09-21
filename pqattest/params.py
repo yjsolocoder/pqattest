@@ -3,7 +3,10 @@
 :func:`profile` reports the size and cost metrics of a scheme/parameter
 combination without generating any keys, and :func:`recommend` picks a Merkle
 configuration for a desired signature capacity, :func:`recommend_merkle_deployment`
-picks one that additionally fits deployment budgets. :func:`merkle_storage_profile`
+picks one that additionally fits deployment budgets and
+:func:`merkle_deployment_frontier` keeps every feasible, non-dominated choice
+of that ordinary deployment as a tuple instead of ranking one.
+:func:`merkle_storage_profile`
 breaks the Merkle wire sizes down per serialised object and
 :func:`merkle_transport_profile` sizes a batch or multi-proof over a chosen
 leaf-index set. :func:`recommend_merkle_transport_deployment` chooses both the
@@ -13,7 +16,7 @@ extends that joint choice to several independent leaf-index groups, each carried
 in its own transport, under checkpoint, per-group, aggregate and verifier-step
 budgets. :func:`merkle_transport_workload_frontier` returns every feasible,
 non-dominated choice of the same workload as a tuple instead of ranking one.
-All eight are pure functions: no randomness, no state, no I/O, no keys
+All nine are pure functions: no randomness, no state, no I/O, no keys
 are generated.
 """
 
@@ -33,6 +36,7 @@ __all__ = [
     "profile",
     "recommend",
     "recommend_merkle_deployment",
+    "merkle_deployment_frontier",
     "recommend_merkle_transport_deployment",
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
@@ -248,6 +252,134 @@ def recommend_merkle_deployment(
 
     feasible.sort(key=ranking)
     return feasible[0][0]
+
+
+def merkle_deployment_frontier(
+    capacity: Any,
+    budgets: Any,
+) -> tuple[MerkleStorageProfile, ...]:
+    """Return every feasible, non-dominated ordinary deployment as a tuple.
+
+    Where :func:`recommend_merkle_deployment` ranks the feasible configs and
+    returns one, this function keeps the whole Pareto frontier: it enumerates
+    every Merkle candidate — ``w`` in ``(4, 8)`` times ``height`` from 1 to
+    8 — whose leaf count covers ``capacity``, reuses
+    :func:`merkle_storage_profile` for the checkpoint, single-signature and
+    standalone-proof wire sizes, and reuses :func:`profile`'s Merkle
+    ``steps`` for the per-signature verifier hash-chain step count.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``budgets``
+    must be a four-tuple, in order: an upper bound on the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), on one signature wire
+    length (:attr:`MerkleStorageProfile.signature_wire_bytes`), on one
+    standalone proof wire length
+    (:attr:`MerkleStorageProfile.proof_wire_bytes`) and on the verifier
+    hash-chain step count (``profile("merkle", ...)``'s ``steps``). Each
+    entry is either ``None`` (no bound) or a positive, non-boolean integer,
+    and at least one entry must be set; every bound is inclusive.
+
+    A feasible profile *A* dominates another feasible profile *B* when
+    ``A`` is no greater than ``B`` on all four metrics — checkpoint bytes,
+    signature wire bytes, proof wire bytes and verifier steps — and is
+    strictly smaller on at least one of them. Every dominated profile is
+    dropped and the survivors are deduplicated by value, so a speed/size
+    trade-off is never pre-emptively collapsed. The returned tuple is
+    sorted stably and ascending by verifier steps, signature wire bytes,
+    proof wire bytes, checkpoint bytes, leaf count, ``w`` and ``height``.
+
+    A non-tuple ``budgets`` raises ``TypeError``; a tuple of the wrong
+    length, an illegal member, an out-of-range ``capacity`` or the absence
+    of any feasible candidate raises ``ValueError``. The function is pure:
+    it draws no randomness, generates no keys and changes no state.
+    """
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 4-tuple of budget limits")
+    if len(budgets) != 4:
+        raise ValueError("budgets must contain exactly four entries")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+
+    labels = ("checkpoint", "signature", "proof", "steps")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    checkpoint_limit, signature_limit, proof_limit, steps_limit = limits
+
+    candidates: list[tuple[MerkleStorageProfile, int]] = []
+    for w in (4, 8):
+        for height in range(1, 9):
+            storage = merkle_storage_profile(w, height)
+            if storage.leaf_count < capacity:
+                continue
+            if checkpoint_limit is not None and storage.checkpoint_bytes > checkpoint_limit:
+                continue
+            if signature_limit is not None and storage.signature_wire_bytes > signature_limit:
+                continue
+            if proof_limit is not None and storage.proof_wire_bytes > proof_limit:
+                continue
+            steps = profile("merkle", w=w, height=height).steps
+            if steps_limit is not None and steps > steps_limit:
+                continue
+            candidates.append((storage, steps))
+    if not candidates:
+        raise ValueError("no Merkle configuration fits the requested capacity and budgets")
+
+    def dominates(
+        a: tuple[MerkleStorageProfile, int],
+        b: tuple[MerkleStorageProfile, int],
+    ) -> bool:
+        a_storage, a_steps = a
+        b_storage, b_steps = b
+        no_worse = (
+            a_storage.checkpoint_bytes <= b_storage.checkpoint_bytes
+            and a_storage.signature_wire_bytes <= b_storage.signature_wire_bytes
+            and a_storage.proof_wire_bytes <= b_storage.proof_wire_bytes
+            and a_steps <= b_steps
+        )
+        strictly_better = (
+            a_storage.checkpoint_bytes < b_storage.checkpoint_bytes
+            or a_storage.signature_wire_bytes < b_storage.signature_wire_bytes
+            or a_storage.proof_wire_bytes < b_storage.proof_wire_bytes
+            or a_steps < b_steps
+        )
+        return no_worse and strictly_better
+
+    non_dominated = [
+        candidate
+        for candidate in candidates
+        if not any(dominates(other, candidate) for other in candidates)
+    ]
+
+    unique: list[MerkleStorageProfile] = []
+    seen: set[MerkleStorageProfile] = set()
+    for storage, _steps in non_dominated:
+        if storage not in seen:
+            seen.add(storage)
+            unique.append(storage)
+
+    unique.sort(
+        key=lambda storage: (
+            profile("merkle", w=storage.w, height=storage.height).steps,
+            storage.signature_wire_bytes,
+            storage.proof_wire_bytes,
+            storage.checkpoint_bytes,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+        )
+    )
+    return tuple(unique)
 
 
 @dataclass(frozen=True)

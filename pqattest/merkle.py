@@ -585,6 +585,7 @@ class MerkleSigner:
     only by a successful :meth:`sign`, :meth:`sign_batch`,
     :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_multiproof_with_checkpoint`,
+    :meth:`sign_batch_proof_with_checkpoint`,
     :meth:`sign_with_auth_state`, :meth:`sign_batch_with_auth_state`,
     :meth:`sign_multiproof_with_auth_state`,
     :meth:`sign_proof_with_auth_state` or
@@ -1081,6 +1082,77 @@ class MerkleSigner:
             proof = multiproof_encode(self._public_key, signatures)
             self._next_index = base + len(signatures)
             return proof, self._checkpoint_bytes()
+
+    def sign_batch_proof_with_checkpoint(self, messages: Any) -> tuple[bytes, bytes]:
+        """Sign a non-empty tuple and return a batch proof plus a checkpoint.
+
+        Combines :meth:`sign_batch`, :class:`MerkleBatchProof` serialisation
+        and :meth:`checkpoint` in one atomic call. Returns ``(proof,
+        checkpoint)``, both ``bytes``: ``proof`` is byte-for-byte identical to
+        ``MerkleBatchProof(public_key=self.public_key,
+        signatures=signatures).to_bytes()`` for the tuple of consecutive
+        :class:`MerkleSignature` values produced for ``messages`` from the
+        current ``next_index`` — the same bytes
+        :meth:`MerkleBatchProof.from_bytes` parses back into a batch whose
+        :meth:`MerkleBatchProof.verify` accepts exactly the signed messages —
+        and ``checkpoint`` is the ``bytes`` :meth:`checkpoint` returns for the
+        advanced state, byte-for-byte the same v1 encoding holding the new
+        ``next_index`` and every private key. Pairing the two halves in one
+        call keeps the proof and the state it advanced to together, so a
+        caller can never match a proof against a checkpoint taken at the wrong
+        point under concurrency.
+
+        ``messages`` must be a **non-empty** ``tuple`` whose members each
+        follow the usual message rules (``bytes``/``bytearray``/``str``; a
+        ``str`` is encoded as UTF-8). Every member is validated before the
+        remaining-leaf capacity check: a non-tuple argument or an illegal
+        member raises ``TypeError`` even on an exhausted signer, and an empty
+        tuple raises ``ValueError``. The whole call then runs under the same
+        lock as :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the
+        index properties and :meth:`checkpoint`: leaves are allocated
+        consecutively from the current ``next_index`` and the proof, the
+        candidate checkpoint and the index advance form one linearised
+        operation, so a concurrent observer never sees a half-consumed batch
+        or an advanced state without the finished proof.
+
+        A tuple larger than the number of remaining leaves raises
+        :class:`KeyExhaustedError`. The proof bytes and the candidate
+        checkpoint are both built before ``next_index`` is committed, so a
+        failed proof encoding or checkpoint generation consumes no leaf,
+        leaves the state untouched and returns no partial result. No
+        randomness is drawn anywhere in the call. A signer restored from the
+        returned checkpoint keeps the same public key and resumes signing at
+        the first index after the batch. The checkpoint still carries every
+        private key in the clear and offers no authentication, encryption or
+        atomic persistence — confidentiality, durable storage and rollback
+        protection remain the caller's responsibility.
+        """
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+        if not messages:
+            raise ValueError("messages must not be empty")
+        with self._lock:
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if len(messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the batch"
+                )
+            signatures = tuple(
+                self._signature_at(base + offset, message)
+                for offset, message in enumerate(messages)
+            )
+            # Build both outputs before advancing: any failure must consume
+            # no leaf, and no observer must ever see the advanced state
+            # without the finished proof and checkpoint.
+            proof = MerkleBatchProof(
+                public_key=self._public_key, signatures=signatures
+            ).to_bytes()
+            checkpoint = self._checkpoint_bytes(base + len(signatures))
+            self._next_index = base + len(signatures)
+            return proof, checkpoint
 
     def sign_with_auth_state(
         self, message: Any, *, key: Any, generation: Any

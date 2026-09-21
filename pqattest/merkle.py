@@ -585,7 +585,8 @@ class MerkleSigner:
     only by a successful :meth:`sign`, :meth:`sign_batch`,
     :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_multiproof_with_checkpoint`,
-    :meth:`sign_with_auth_state`, :meth:`sign_batch_with_auth_state` or
+    :meth:`sign_with_auth_state`, :meth:`sign_proof_with_auth_state`,
+    :meth:`sign_batch_with_auth_state` or
     :meth:`sign_multiproof_with_auth_state`. Once
     every leaf is spent, further calls raise :class:`KeyExhaustedError`.
 
@@ -1128,6 +1129,73 @@ class MerkleSigner:
                 generation=generation_value,
             )
             return signature, envelope
+
+    def sign_proof_with_auth_state(
+        self, message: Any, *, key: Any, generation: Any
+    ) -> tuple[bytes, bytes]:
+        """Sign ``message`` and return the proof and the advanced state envelope.
+
+        Combines :meth:`sign`, :class:`MerkleProof` and
+        :func:`auth_state_wrap` in one atomic call. Returns ``(proof,
+        envelope)``: ``proof`` is byte-for-byte identical to
+        ``MerkleProof(public_key=self.public_key,
+        signature=signature).to_bytes()`` for the signature this call
+        produces at the current ``next_index`` — the same bytes
+        :meth:`MerkleProof.from_bytes` accepts and :meth:`MerkleProof.verify`
+        confirms for ``message`` — and ``envelope`` is the
+        :func:`auth_state_wrap` v2 envelope (``bytes``) over the post-advance
+        v1 :meth:`checkpoint` bytes with ``scheme="merkle"`` and the given
+        ``key`` and ``generation``, byte-for-byte the same as signing and then
+        wrapping an explicit checkpoint; the existing v2 field order and
+        HMAC-SHA-256 tag are unchanged. Pairing the two halves in one call
+        keeps the proof and the state it advanced to together, so a caller
+        can never match a proof against an envelope taken at the wrong point
+        under concurrency.
+
+        Every input is validated before the remaining-leaf-capacity check and
+        before any state change: ``message`` accepts
+        ``bytes``/``bytearray``/``str`` exactly like :meth:`sign`` (a string
+        is encoded as UTF-8); ``key`` is keyword-only and must be a non-empty
+        ``bytes``/``bytearray`` shared secret; ``generation`` is keyword-only
+        and must be a non-boolean integer in ``0 .. 2**64 - 1``. A wrong
+        message or key type raises ``TypeError``; an empty key or an
+        out-of-range generation raises ``ValueError``.
+
+        The whole call then runs under the same lock as :meth:`sign`,
+        :meth:`sign_batch`, :meth:`advance_to`, the index properties and
+        :meth:`checkpoint`: the smallest usable leaf signs the message, and
+        the proof bytes, the candidate checkpoint and the envelope form one
+        linearised operation. Proof, candidate checkpoint and envelope are
+        all built before ``next_index`` is committed, so an exhausted signer
+        raises :class:`KeyExhaustedError` and every other failure consumes no
+        leaf and returns no partial result; on success the state advances by
+        exactly one leaf. No randomness is drawn anywhere in the call. The
+        envelope is plaintext and authenticated only; it provides neither
+        encryption nor protection against replay or rollback on its own.
+        """
+        message_bytes = _as_bytes(message)
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            index = self._next_index
+            signature = self._signature_at(index, message_bytes)
+            # Build both outputs before advancing: any failure must consume
+            # no leaf, and no observer must ever see the advanced state
+            # without the finished proof and envelope.
+            proof = MerkleProof(
+                public_key=self._public_key, signature=signature
+            ).to_bytes()
+            checkpoint = self._checkpoint_bytes(index + 1)
+            envelope = auth_state_wrap(
+                checkpoint,
+                scheme="merkle",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            self._next_index = index + 1
+            return proof, envelope
 
     def sign_batch_with_auth_state(
         self, messages: Any, *, key: Any, generation: Any

@@ -14,6 +14,7 @@ wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
 merkle_verify / multiproof_encode / multiproof_verify, static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
+merkle_deployment_frontier /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
@@ -66,6 +67,7 @@ from .params import (
     profile,
     recommend,
     recommend_merkle_deployment,
+    merkle_deployment_frontier,
     recommend_merkle_transport_deployment,
     recommend_merkle_transport_workload,
 )
@@ -120,6 +122,7 @@ __all__ = [
     "lamport_signature_from_bytes",
     "lamport_signature_to_bytes",
     "merkle_verify",
+    "merkle_deployment_frontier",
     "merkle_storage_profile",
     "merkle_transport_profile",
     "merkle_transport_workload_frontier",

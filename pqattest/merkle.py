@@ -584,7 +584,8 @@ class MerkleSigner:
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign`, :meth:`sign_batch`,
     :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
-    :meth:`sign_with_auth_state` or :meth:`sign_batch_with_auth_state`. Once
+    :meth:`sign_with_auth_state`, :meth:`sign_batch_with_auth_state` or
+    :meth:`sign_multiproof_with_checkpoint`. Once
     every leaf is spent, further calls raise :class:`KeyExhaustedError`.
 
     Leaves can also be proactively voided with :meth:`advance_to` (or
@@ -1119,6 +1120,67 @@ class MerkleSigner:
                 generation=generation_value,
             )
             return signatures, envelope
+
+    def sign_multiproof_with_checkpoint(self, messages: Any) -> tuple[bytes, bytes]:
+        """Sign a whole batch and return one compressed proof plus a snapshot.
+
+        Combines :meth:`sign_batch`, :func:`multiproof_encode` and
+        :meth:`checkpoint` in one atomic call. Returns
+        ``(proof, checkpoint)``: ``proof`` is the ``bytes`` that
+        :func:`multiproof_encode` produces for this call's consecutive
+        signature tuple — byte-for-byte identical to signing the same
+        messages with :meth:`sign_batch` from the same starting state and
+        encoding the result with ``multiproof_encode(self.public_key,
+        signatures)``, verifiable by :func:`multiproof_verify` against
+        ``messages``, and drawing no extra randomness — and ``checkpoint``
+        is the ``bytes`` that :meth:`checkpoint` returns for the advanced
+        state, byte-for-byte the same v1 encoding holding the new
+        ``next_index`` and every private key. Pairing the two halves in one
+        call keeps the proof and the state it advanced to together, so a
+        caller can never match a proof against a checkpoint taken at the
+        wrong point under concurrency.
+
+        ``messages`` must be a non-empty ``tuple`` whose members each
+        follow the usual message rules (``bytes``/``bytearray``/``str``);
+        every member is validated before the capacity check, so a non-tuple
+        argument or an illegal member raises ``TypeError`` even on an
+        exhausted signer, and an empty tuple raises ``ValueError`` (the
+        multiproof format has no encoding for an empty leaf set, and a
+        structural failure of :func:`multiproof_encode` likewise surfaces
+        as ``ValueError``). The whole batch then runs under the same lock
+        as :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the index
+        properties and :meth:`checkpoint`: leaves are allocated
+        consecutively from the current ``next_index`` and the state
+        advances exactly once, after every signature has been generated and
+        the proof encoded, so a concurrent observer never sees a
+        half-consumed batch. A batch larger than the number of remaining
+        leaves raises :class:`KeyExhaustedError`; every failure happens
+        without spending a leaf and returns no partial result. The returned
+        checkpoint still carries every private key in the clear and offers
+        no authentication, encryption or atomic persistence —
+        confidentiality, durable storage and rollback protection remain the
+        caller's responsibility.
+        """
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+        if not messages:
+            raise ValueError("messages must not be empty")
+        with self._lock:
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if len(messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the batch"
+                )
+            signatures = tuple(
+                self._signature_at(base + offset, message)
+                for offset, message in enumerate(messages)
+            )
+            proof = multiproof_encode(self._public_key, signatures)
+            self._next_index = base + len(signatures)
+            return proof, self._checkpoint_bytes()
 
 
 def merkle_verify(message: Any, signature: Any, public_key: MerklePublicKey) -> bool:

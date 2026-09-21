@@ -161,6 +161,7 @@ Merkle 聚合（有限次签名）：
 - `MerkleBatchProof.verify(messages)` — `messages` 须为与签名等长的元组，成员接受 `bytes`/`bytearray`/`str`；逐项等价于 `merkle_verify(message, signature, public_key)`，全部成功才返回 `True`；非元组、数量不符、非法消息成员或任一验签失败均返回 `False`
 - `multiproof_encode(public_key, signatures)` — 顶层函数，把同一 `MerklePublicKey` 的多份 `MerkleSignature` 压成一份去重认证路径的确定性证明 `bytes`；不引入新对象、不改动任何旧接口与格式。`public_key` 须为 `MerklePublicKey`，`signatures` 须为非空的 `MerkleSignature` 元组（类型错抛 `TypeError`）；空集合、索引非严格递增、签名不被公钥约束（`w`/树高/索引越界/W-OTS 元素数或路径数不符、元素畸形）或同一坐标节点冲突抛 `ValueError`
 - `multiproof_verify(messages, data)` — 顶层验证；`data` 只接受 `bytes`/`bytearray`，`messages` 须为与叶数等长的元组，成员沿用现有消息规则（`bytes`/`bytearray`/`str`）。按各消息恢复 W-OTS 公钥，沿用现有叶哈希与内部节点字节规则逐层合并，必须得到包内公钥根、且每个证明节点恰好使用一次；消息不符，或 `data`/`messages` 类型或数量错、魔数/版本/长度/计数错、截断、尾随、叶块乱序或重复、节点缺失/多余/重复/乱序/坐标非规范，一律返回 `False`
+- `MerkleSigner.sign_multiproof_with_checkpoint(messages) -> (bytes, bytes)` — 在一次原子调用内完成连续签名、多签名证明压缩与状态快照：返回 `(proof, checkpoint)`，`proof` 与对本次连续签名元组调用 `multiproof_encode(self.public_key, signatures)` 的结果逐字节相同（可由 `multiproof_verify(messages, proof)` 验证），`checkpoint` 为状态推进后 `checkpoint()` 的逐字节相同 v1 数据（保存新的 `next_index` 与全部私钥）。`messages` 须为**非空**元组，成员接受 `bytes`/`bytearray`/`str`；先验证全部成员再检查剩余叶容量。与 `sign`、`sign_batch`、`checkpoint`、`advance_to` 共用锁，从当前 `next_index` 连续取叶，证明、状态推进与快照一次线性化完成，全程不取随机数。非元组或非法成员抛 `TypeError`，空元组或证明结构失败抛 `ValueError`，容量不足抛 `KeyExhaustedError`；任何失败不耗叶且无部分返回，旧接口与全部线格式不变
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 

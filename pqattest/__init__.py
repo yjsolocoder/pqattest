@@ -14,7 +14,8 @@ wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
 merkle_verify / multiproof_encode / multiproof_verify, static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
-MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile, and
+MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
+recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile, and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
 ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
@@ -54,12 +55,14 @@ from .merkle import (
 )
 from .params import (
     MerkleStorageProfile,
+    MerkleTransportDeploymentProfile,
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
     profile,
     recommend,
     recommend_merkle_deployment,
+    recommend_merkle_transport_deployment,
 )
 from .toy_lattice import (
     ToyLatticeCiphertext,
@@ -92,6 +95,7 @@ __all__ = [
     "MerkleSignature",
     "MerkleSigner",
     "MerkleStorageProfile",
+    "MerkleTransportDeploymentProfile",
     "OneTimeSigner",
     "Params",
     "PrivateKey",
@@ -120,6 +124,7 @@ __all__ = [
     "public_key_from",
     "recommend",
     "recommend_merkle_deployment",
+    "recommend_merkle_transport_deployment",
     "sign",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",

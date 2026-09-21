@@ -6,8 +6,10 @@ configuration for a desired signature capacity, :func:`recommend_merkle_deployme
 picks one that additionally fits deployment budgets. :func:`merkle_storage_profile`
 breaks the Merkle wire sizes down per serialised object and
 :func:`merkle_transport_profile` sizes a batch or multi-proof over a chosen
-leaf-index set. All five are pure functions: no randomness, no state, no
-I/O, no keys are generated.
+leaf-index set. :func:`recommend_merkle_transport_deployment` chooses both the
+tree parameters and the transport encoding together under checkpoint, batch,
+multi-proof and verifier-step budgets. All six are pure functions: no
+randomness, no state, no I/O, no keys are generated.
 """
 
 from __future__ import annotations
@@ -21,9 +23,11 @@ from .wots import ELEMENT_BYTES, _params, _validate_w
 __all__ = [
     "Params",
     "MerkleStorageProfile",
+    "MerkleTransportDeploymentProfile",
     "profile",
     "recommend",
     "recommend_merkle_deployment",
+    "recommend_merkle_transport_deployment",
     "merkle_storage_profile",
     "merkle_transport_profile",
 ]
@@ -353,3 +357,149 @@ def merkle_transport_profile(
     batch_bytes = 58 + k * (4 + signature_wire_bytes)
     multiproof_bytes = 60 + k * (4 + ELEMENT_BYTES * n) + 35 * node_count
     return node_count, batch_bytes, multiproof_bytes
+
+
+@dataclass(frozen=True)
+class MerkleTransportDeploymentProfile:
+    """Frozen joint choice of Merkle tree parameters and transport encoding.
+
+    Fields, in positional order:
+
+    - ``config``: the chosen :class:`MerkleStorageProfile` (``w``, ``height``
+      and its leaf/wire sizes);
+    - ``nodes``: the canonical multi-proof node count ``m`` for the chosen
+      leaf-index set;
+    - ``batch``: the ``MerkleBatchProof`` wire size in bytes;
+    - ``multi``: the :func:`multiproof_encode` wire size in bytes.
+
+    Instances are frozen, support positional construction and compare (and
+    hash) by value; no key material or randomness is involved.
+    """
+
+    config: MerkleStorageProfile
+    nodes: int
+    batch: int
+    multi: int
+
+
+def recommend_merkle_transport_deployment(
+    capacity: Any,
+    indices: Any,
+    budgets: Any,
+    prefer: str = "multiproof",
+) -> MerkleTransportDeploymentProfile:
+    """Jointly choose Merkle tree parameters and a transport encoding.
+
+    Enumerates every Merkle candidate — ``w`` in ``(4, 8)`` times ``height``
+    from 1 to 8 — keeps those whose ``leaf_count`` covers both ``capacity``
+    and the requested leaf ``indices`` and that satisfy every set budget, and
+    ranks the feasible set, reusing :func:`merkle_storage_profile`,
+    :func:`merkle_transport_profile` and :func:`profile` for every size and
+    step count.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``indices``
+    must be a non-empty tuple of strictly increasing, non-boolean integers
+    whose largest member is below the candidate tree's leaf count; the same
+    index set is sized for every candidate. ``budgets`` must be a four-tuple,
+    in order: an upper bound on the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), on the batch-proof wire
+    length (:attr:`MerkleTransportDeploymentProfile.batch`), on the
+    multi-proof wire length (:attr:`MerkleTransportDeploymentProfile.multi`)
+    and on the verifier hash-chain step count (``profile("merkle", ...)``'s
+    ``steps``). Each entry is either ``None`` (no bound) or a positive,
+    non-boolean integer, and at least one entry must be set.
+
+    ``prefer`` selects the ranking: ``"multiproof"`` minimises ``multi``
+    first and then ``batch``, ``"batch"`` minimises ``batch`` first and then
+    ``multi``, and ``"speed"`` minimises steps first and then ``multi`` and
+    ``batch``. All three finish with the same tie-break in ascending order —
+    checkpoint bytes, leaf count, ``w`` and ``height`` — and the first
+    candidate after sorting is returned as a
+    :class:`MerkleTransportDeploymentProfile`.
+
+    A non-tuple ``indices`` or ``budgets`` raises ``TypeError``; an
+    out-of-range ``capacity``, an empty, non-integer, boolean,
+    out-of-range or non-strictly-increasing ``indices``, a wrong-length or
+    otherwise illegal ``budgets`` tuple, an unknown ``prefer`` value, or
+    the absence of any feasible candidate raises ``ValueError``. The
+    function is pure: it draws no randomness, generates no keys and
+    changes no state.
+    """
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of leaf indices")
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 4-tuple of budget limits")
+    if len(budgets) != 4:
+        raise ValueError("budgets must contain exactly four entries")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+    if not indices:
+        raise ValueError("indices must not be empty")
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in indices):
+        raise ValueError("every index must be a non-boolean integer")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+    if indices[0] < 0:
+        raise ValueError("every index must be within the tree's leaf range")
+    if prefer not in ("multiproof", "batch", "speed"):
+        raise ValueError('prefer must be "multiproof", "batch" or "speed"')
+
+    labels = ("checkpoint", "batch", "multiproof", "steps")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    checkpoint_limit, batch_limit, multi_limit, steps_limit = limits
+
+    required_leaves = max(capacity, indices[-1] + 1)
+    feasible = []
+    for w in (4, 8):
+        for height in range(1, 9):
+            storage = merkle_storage_profile(w, height)
+            if storage.leaf_count < required_leaves:
+                continue
+            if checkpoint_limit is not None and storage.checkpoint_bytes > checkpoint_limit:
+                continue
+            node_count, batch_bytes, multi_bytes = merkle_transport_profile(
+                w, height, indices
+            )
+            if batch_limit is not None and batch_bytes > batch_limit:
+                continue
+            if multi_limit is not None and multi_bytes > multi_limit:
+                continue
+            steps = profile("merkle", w=w, height=height).steps
+            if steps_limit is not None and steps > steps_limit:
+                continue
+            feasible.append((storage, node_count, batch_bytes, multi_bytes, steps))
+    if not feasible:
+        raise ValueError("no Merkle configuration fits the requested capacity, indices and budgets")
+
+    def ranking(candidate: tuple) -> tuple[int, ...]:
+        storage, _node_count, batch_bytes, multi_bytes, steps = candidate
+        tail = (
+            storage.checkpoint_bytes,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+        )
+        if prefer == "multiproof":
+            return (multi_bytes, batch_bytes) + tail
+        if prefer == "batch":
+            return (batch_bytes, multi_bytes) + tail
+        return (steps, multi_bytes, batch_bytes) + tail
+
+    feasible.sort(key=ranking)
+    storage, node_count, batch_bytes, multi_bytes, _steps = feasible[0]
+    return MerkleTransportDeploymentProfile(
+        config=storage, nodes=node_count, batch=batch_bytes, multi=multi_bytes
+    )

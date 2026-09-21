@@ -583,9 +583,9 @@ class MerkleSigner:
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign`, :meth:`sign_batch`,
-    :meth:`sign_with_checkpoint`, :meth:`sign_with_auth_state` or
-    :meth:`sign_batch_with_auth_state`. Once every leaf is spent, further
-    calls raise :class:`KeyExhaustedError`.
+    :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
+    :meth:`sign_with_auth_state` or :meth:`sign_batch_with_auth_state`. Once
+    every leaf is spent, further calls raise :class:`KeyExhaustedError`.
 
     Leaves can also be proactively voided with :meth:`advance_to` (or
     atomically recorded with :meth:`advance_to_with_auth_state`): after a
@@ -820,7 +820,8 @@ class MerkleSigner:
         The whole call — index advance, checkpoint snapshot and wrapping —
         runs under the same lock as :meth:`sign`, :meth:`sign_batch`,
         :meth:`advance_to`, :meth:`sign_with_checkpoint`,
-        :meth:`sign_with_auth_state`, :meth:`sign_batch_with_auth_state`, the
+        :meth:`sign_batch_with_checkpoint`, :meth:`sign_with_auth_state`,
+        :meth:`sign_batch_with_auth_state`, the
         index properties and :meth:`checkpoint`, so it linearises as one
         atomic jump. The keys and public key are unchanged, no randomness is
         drawn, and the advanced state is saved and restored by the existing
@@ -948,6 +949,62 @@ class MerkleSigner:
             signature = self._signature_at(index, message)
             self._next_index += 1
             return signature, self._checkpoint_bytes()
+
+    def sign_batch_with_checkpoint(
+        self, messages: Any
+    ) -> tuple[tuple[MerkleSignature, ...], bytes]:
+        """Sign a whole batch and snapshot the advanced state atomically.
+
+        Combines :meth:`sign_batch` and :meth:`checkpoint` in one atomic
+        call. Returns ``(signatures, checkpoint)``: ``signatures`` is a
+        tuple with one :class:`MerkleSignature` per message, in the same
+        order — value-for-value identical to calling :meth:`sign_batch` on
+        the same messages from the same starting state, drawing no extra
+        randomness, with strictly increasing leaf indices and the existing
+        ``to_bytes`` codec unchanged — and ``checkpoint`` is the ``bytes``
+        that :meth:`checkpoint` returns for the advanced state,
+        byte-for-byte the same v1 encoding holding the new ``next_index``
+        and every private key. Pairing the two halves in one call keeps the
+        batch and the state it advanced to together, so a caller can never
+        match signatures against a checkpoint taken at the wrong point
+        under concurrency.
+
+        ``messages`` must be a ``tuple`` whose members each follow the
+        usual message rules (``bytes``/``bytearray``/``str``); every member
+        is validated before the capacity check, so a non-tuple argument or
+        an illegal member raises ``TypeError`` even on an exhausted signer.
+        The whole batch then runs under the same lock as :meth:`sign`,
+        :meth:`sign_batch`, :meth:`advance_to`, the index properties and
+        :meth:`checkpoint`: leaves are allocated consecutively from the
+        current ``next_index`` and the state advances exactly once, after
+        every signature has been generated, so a concurrent observer never
+        sees a half-consumed batch. A batch larger than the number of
+        remaining leaves raises :class:`KeyExhaustedError`; every failure
+        happens without spending a leaf and returns no partial result. An
+        empty tuple is legal: it returns ``((), checkpoint)`` where the
+        checkpoint snapshots the unchanged state. The returned checkpoint
+        still carries every private key in the clear and offers no
+        authentication, encryption or atomic persistence — confidentiality,
+        durable storage and rollback protection remain the caller's
+        responsibility.
+        """
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+        with self._lock:
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if len(messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the batch"
+                )
+            signatures = tuple(
+                self._signature_at(base + offset, message)
+                for offset, message in enumerate(messages)
+            )
+            self._next_index = base + len(signatures)
+            return signatures, self._checkpoint_bytes()
 
     def sign_with_auth_state(
         self, message: Any, *, key: Any, generation: Any

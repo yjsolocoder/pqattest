@@ -2,8 +2,11 @@
 
 :func:`profile` reports the size and cost metrics of a scheme/parameter
 combination without generating any keys, and :func:`recommend` picks a Merkle
-configuration for a desired signature capacity. Both are pure functions: no
-randomness, no state, no I/O.
+configuration for a desired signature capacity. :func:`merkle_storage_profile`
+breaks the Merkle wire sizes down per serialised object and
+:func:`merkle_transport_profile` sizes a batch or multi-proof over a chosen
+leaf-index set. All four are pure functions: no randomness, no state, no
+I/O, no keys are generated.
 """
 
 from __future__ import annotations
@@ -11,10 +14,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .merkle import _validate_height
+from .merkle import _canonical_multiproof_nodes, _validate_height
 from .wots import ELEMENT_BYTES, _params, _validate_w
 
-__all__ = ["Params", "profile", "recommend"]
+__all__ = [
+    "Params",
+    "MerkleStorageProfile",
+    "profile",
+    "recommend",
+    "merkle_storage_profile",
+    "merkle_transport_profile",
+]
 
 _SCHEMES = ("lamport", "wots", "merkle")
 _MAX_CAPACITY = 256
@@ -129,3 +139,120 @@ def recommend(capacity: Any, prefer: str = "size") -> Params:
         raise ValueError('prefer must be "size" or "speed"')
     height = max(1, (capacity - 1).bit_length())
     return profile("merkle", w=w, height=height)
+
+
+@dataclass(frozen=True)
+class MerkleStorageProfile:
+    """Frozen on-the-wire byte sizes for one Merkle ``(w, height)`` choice.
+
+    Every value is a size in bytes of the matching serialised object,
+    excluding Python object overhead:
+
+    - ``w`` / ``height`` echo the validated parameters;
+    - ``leaf_count`` is ``L = 2 ** height`` W-OTS leaves;
+    - ``signature_wire_bytes`` (``S``) is one ``MerkleSignature.to_bytes``
+      blob: a 16-byte v1 header followed by ``n + height`` 32-byte elements
+      (``n`` W-OTS chains plus ``height`` auth-path nodes);
+    - ``proof_wire_bytes`` is one ``MerkleProof.to_bytes`` blob — an
+      ``S``-byte signature plus its 60-byte frame (17-byte proof header,
+      43-byte public key);
+    - ``checkpoint_bytes`` (``C``) is one ``MerkleSigner.checkpoint`` blob:
+      the 49-byte v1 header, ``L * n`` 32-byte private elements and the
+      32-byte checksum;
+    - ``auth_v1_bytes`` / ``auth_v2_bytes`` are the matching checkpoint
+      sealed in a :func:`auth_wrap` (v1, 14-byte header) or
+      :func:`auth_state_wrap` (v2, 22-byte header) envelope, each adding a
+      32-byte HMAC tag.
+
+    Instances are frozen, support keyword construction and compare (and
+    hash) by value; no key material or randomness is involved.
+    """
+
+    w: int
+    height: int
+    leaf_count: int
+    signature_wire_bytes: int
+    proof_wire_bytes: int
+    checkpoint_bytes: int
+    auth_v1_bytes: int
+    auth_v2_bytes: int
+
+
+def merkle_storage_profile(w: Any, height: Any) -> MerkleStorageProfile:
+    """Return the frozen :class:`MerkleStorageProfile` wire sizes.
+
+    ``w`` must be 4 or 8 and ``height`` a non-boolean integer from 1 to 8;
+    anything else raises ``ValueError``. The profile is a pure static
+    estimate: no keys are generated and no randomness is drawn.
+
+    With ``n`` the W-OTS chain count (67 for ``w=4``, 34 for ``w=8``),
+    ``L = 2 ** height``, ``S = 16 + 32 * (n + height)`` and
+    ``C = 81 + 32 * L * n``, the sizes are ``S``, ``S + 60``, ``C``,
+    ``C + 46`` and ``C + 54`` for the signature, proof, plain checkpoint,
+    v1 envelope and v2 envelope respectively.
+    """
+    w = _validate_w(w)
+    height = _validate_height(height)
+    b, l1, l2 = _params(w)
+    n = l1 + l2
+    leaf_count = 1 << height
+    signature_wire_bytes = 16 + ELEMENT_BYTES * (n + height)
+    checkpoint_bytes = 81 + ELEMENT_BYTES * leaf_count * n
+    return MerkleStorageProfile(
+        w=w,
+        height=height,
+        leaf_count=leaf_count,
+        signature_wire_bytes=signature_wire_bytes,
+        proof_wire_bytes=signature_wire_bytes + 60,
+        checkpoint_bytes=checkpoint_bytes,
+        auth_v1_bytes=checkpoint_bytes + 46,
+        auth_v2_bytes=checkpoint_bytes + 54,
+    )
+
+
+def merkle_transport_profile(
+    w: Any, height: Any, indices: Any
+) -> tuple[int, int, int]:
+    """Return ``(node_count, batch_bytes, multiproof_bytes)`` for leaf indices.
+
+    Sizes a batch proof and a multi-proof over the same leaf set. ``w`` must
+    be 4 or 8 and ``height`` a non-boolean integer from 1 to 8; ``indices``
+    must be a non-empty tuple of strictly increasing, non-boolean integers,
+    each in ``0 .. 2 ** height - 1``. A non-tuple ``indices`` or a member
+    that is not an ``int`` raises ``TypeError``; an empty set, a boolean
+    member, an out-of-range index or a non-strictly-increasing (duplicate or
+    descending) sequence raises ``ValueError``.
+
+    With ``k = len(indices)``, ``S`` the single-signature wire size
+    (``16 + 32 * (n + height)``) and ``m`` the canonical multi-proof node
+    count — siblings outside the current index set at each level, with the
+    set shifted right and deduplicated between levels — the result is
+    ``(m, 58 + k * (4 + S), 60 + k * (4 + 32 * n) + 35 * m)``: the carried
+    node count, the length of a ``MerkleBatchProof.to_bytes`` blob, and the
+    length of a :func:`multiproof_encode` blob. The estimate is pure: no
+    signatures are produced and no randomness is drawn.
+    """
+    w = _validate_w(w)
+    height = _validate_height(height)
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of leaf indices")
+    if not indices:
+        raise ValueError("indices must not be empty")
+    if any(isinstance(index, bool) for index in indices):
+        raise ValueError("index members must not be booleans")
+    if any(not isinstance(index, int) for index in indices):
+        raise TypeError("every index must be an integer")
+    leaf_count = 1 << height
+    if any(index < 0 or index >= leaf_count for index in indices):
+        raise ValueError("every index must be within the tree's leaf range")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+
+    b, l1, l2 = _params(w)
+    n = l1 + l2
+    k = len(indices)
+    node_count = len(_canonical_multiproof_nodes(indices, height))
+    signature_wire_bytes = 16 + ELEMENT_BYTES * (n + height)
+    batch_bytes = 58 + k * (4 + signature_wire_bytes)
+    multiproof_bytes = 60 + k * (4 + ELEMENT_BYTES * n) + 35 * node_count
+    return node_count, batch_bytes, multiproof_bytes

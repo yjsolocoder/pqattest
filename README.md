@@ -336,15 +336,24 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `Params` — 冻结的指标值对象，字段为 `scheme, w, height, capacity, elements, sig_bytes, path_bytes, steps`；`w`/`height` 对该方案无意义时为 `None`
 - `profile(scheme, w=None, height=None)` — 返回某方案参数组合的 `Params`。`"lamport"` 不收 `w`/`height`；`"wots"` 只收 `w ∈ {4, 8}`；`"merkle"` 收 `w` 与 `height`（1 至 8 非布尔整数）。未知方案、参数缺失或多余一律抛 `ValueError`
 - `recommend(capacity, prefer="size")` — 为期望的签名条数选 Merkle 配置并返回其 `Params`。`capacity` 限 1 至 256 的非布尔整数；`height` 取满足 `2**height >= capacity` 的最小值且至少为 1；`prefer="size"` 选 `w=8`（签名更短），`prefer="speed"` 选 `w=4`（链步更少、验签更快）。非法输入抛 `ValueError`
+- `MerkleStorageProfile` — 冻结的 Merkle 线长估算值对象，八个字段均为 `int` 且按位置依次为 `w, height, leaf_count, signature_wire_bytes, proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes`；冻结、可位置构造、按值相等（可哈希）
+- `merkle_storage_profile(w, height)` — 纯函数：返回 `(w, height)` 对应的 `MerkleStorageProfile`，不生成密钥、不取随机数。`w` 限 4/8，`height` 限 1 至 8 非布尔整数，非法抛 `ValueError`。令 `n = 67/34`（对应 `w = 4/8`）、`L = 2**height`、`S = 16 + 32*(n+height)`、`C = 81 + 32*L*n`：前四字段为 `w, height, L, S`，后四字段 `proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes` 依次为 `S+60, C, C+46, C+54`，分别对应 `MerkleProof` 线长、明文检查点、v1 封装、v2 封装
+- `merkle_transport_profile(w, height, indices)` — 纯函数：为同一叶集合估算批量证明与多证明线长，返回三元组 `(m, 58+k*(4+S), 60+k*(4+32*n)+35*m)`，分别为多证明携带的节点数 `m`、批量证明线长、多证明线长，其中 `k = len(indices)`，`m` 按既有多证明规范计入集合外兄弟并逐级右移去重。`indices` 必须为非空、严格递增的整数元组，成员均在 `0 .. 2**height-1`；容器或成员类型错抛 `TypeError`，空元组、布尔成员、越界或非严格递增抛 `ValueError`；`w`/`height` 非法同样抛 `ValueError`
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
 ```python
-from pqattest import profile, recommend
+from pqattest import profile, recommend, merkle_storage_profile, merkle_transport_profile
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
 params = recommend(100)       # 最小覆盖 100 条的 Merkle 配置：w=8, height=7
 signer = MerkleSigner(height=params.height, w=params.w)
+
+merkle_storage_profile(8, 7)
+# MerkleStorageProfile(w=8, height=7, leaf_count=128, signature_wire_bytes=1328,
+#                      proof_wire_bytes=1388, checkpoint_bytes=139345,
+#                      auth_v1_bytes=139391, auth_v2_bytes=139399)
+merkle_transport_profile(8, 7, (3, 11, 70))   # (节点数, 批量线长, 多证明线长)
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

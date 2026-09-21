@@ -15,7 +15,8 @@ MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
 merkle_verify / multiproof_encode / multiproof_verify, static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
-recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile, and
+recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
+recommend_merkle_transport_workload / MerkleTransportWorkloadProfile, and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
 ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
@@ -56,6 +57,7 @@ from .merkle import (
 from .params import (
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
+    MerkleTransportWorkloadProfile,
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
@@ -63,6 +65,7 @@ from .params import (
     recommend,
     recommend_merkle_deployment,
     recommend_merkle_transport_deployment,
+    recommend_merkle_transport_workload,
 )
 from .toy_lattice import (
     ToyLatticeCiphertext,
@@ -96,6 +99,7 @@ __all__ = [
     "MerkleSigner",
     "MerkleStorageProfile",
     "MerkleTransportDeploymentProfile",
+    "MerkleTransportWorkloadProfile",
     "OneTimeSigner",
     "Params",
     "PrivateKey",
@@ -125,6 +129,7 @@ __all__ = [
     "recommend",
     "recommend_merkle_deployment",
     "recommend_merkle_transport_deployment",
+    "recommend_merkle_transport_workload",
     "sign",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",

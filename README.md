@@ -342,6 +342,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `merkle_transport_profile(w, height, indices)` — 纯函数：为同一叶集合估算批量证明与多证明线长，返回三元组 `(m, 58+k*(4+S), 60+k*(4+32*n)+35*m)`，分别为多证明携带的节点数 `m`、批量证明线长、多证明线长，其中 `k = len(indices)`，`m` 按既有多证明规范计入集合外兄弟并逐级右移去重。`indices` 必须为非空、严格递增的整数元组，成员均在 `0 .. 2**height-1`；容器或成员类型错抛 `TypeError`，空元组、布尔成员、越界或非严格递增抛 `ValueError`；`w`/`height` 非法同样抛 `ValueError`
 - `recommend_merkle_transport_deployment(capacity, indices, budgets, prefer="multiproof")` — 在预算内**联合**选择树参数与传输方案，返回 `MerkleTransportDeploymentProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`indices` 必须为非空、严格递增的非布尔整数元组，最大成员须小于候选树叶数；`budgets` 必须为四元组，按顺序分别为检查点字节、批次证明字节、多证明字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须同时覆盖 `capacity` 与 `indices`，尺寸与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。`prefer` 取 `"multiproof"`/`"batch"`/`"speed"`：主排序键分别为多证明字节、批次字节、步数；前两者次键取另一传输线长（multiproof 先多证明后批次，batch 反之），speed 依次再多证明字节、批次字节；三种偏好末段均按检查点字节、叶数、`w`、`height` 升序取首项。`indices`/`budgets` 容器类型错抛 `TypeError`，其余非法输入（含非整数或布尔索引成员）或无可行候选抛 `ValueError`
 - `MerkleTransportDeploymentProfile` — 冻结的联合部署选择值对象，四个字段按位置依次为 `config, nodes, batch, multi`，类型依次为 `MerkleStorageProfile, int, int, int`：所选配置、多证明节点数、批次证明字节数、多证明字节数；冻结、可位置构造、按值相等（可哈希）
+- `recommend_merkle_transport_workload(capacity, groups, budgets, prefer="compact")` — 在预算内为**多组叶集合**的工作负载选择树参数与逐组传输格式，返回 `MerkleTransportWorkloadProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，成员各自为非空、严格递增的非负非布尔整数元组（每组为一起传输的叶集合）；`budgets` 必须为四元组，按顺序分别为检查点字节、单组传输字节、总传输字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须同时覆盖 `capacity` 与全部索引，尺寸与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。`prefer="compact"`/`"speed"` 逐组取批量与多证明中较短者（等长取多证明），`"batch"`/`"multiproof"` 则各组固定同名格式；compact/batch/multiproof 先按总传输字节排序，speed 先按步数再按总字节，四种偏好末段均按检查点字节、叶数、`w`、`height` 升序取首项。`groups`/`budgets` 或任一组的容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
+- `MerkleTransportWorkloadProfile` — 冻结的工作负载传输选择值对象，四个字段按位置依次为 `config, modes, sizes, total`，类型依次为 `MerkleStorageProfile, str 元组, int 元组, int`：所选配置、逐组传输格式（`"batch"`/`"multiproof"`）、逐组线长及各组之和；冻结、可位置构造、按值相等（可哈希）
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -352,6 +354,7 @@ from pqattest import (
     merkle_storage_profile,
     merkle_transport_profile,
     recommend_merkle_transport_deployment,
+    recommend_merkle_transport_workload,
 )
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
@@ -378,6 +381,14 @@ recommend_merkle_transport_deployment(16, (3, 5), (None, None, 8000, None))
 # MerkleTransportDeploymentProfile(config=MerkleStorageProfile(...), nodes=...,
 #                                  batch=..., multi=...)
 # prefer="batch" 先压批次线长，prefer="speed" 先压验签步数
+
+# 多组工作负载：两组叶集合一起评估，逐组选较短传输格式，顺序为
+# (检查点, 单组传输, 总传输, 步数)，不限的项传 None
+recommend_merkle_transport_workload(16, ((3, 5), (0,)), (None, None, 8000, None))
+# MerkleTransportWorkloadProfile(config=MerkleStorageProfile(...),
+#                                modes=("multiproof", "multiproof"),
+#                                sizes=(..., ...), total=...)
+# prefer="batch"/"multiproof" 固定逐组格式，prefer="speed" 先压验签步数
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

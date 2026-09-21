@@ -340,6 +340,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `MerkleStorageProfile` — 冻结的 Merkle 线长估算值对象，八个字段均为 `int` 且按位置依次为 `w, height, leaf_count, signature_wire_bytes, proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes`；冻结、可位置构造、按值相等（可哈希）
 - `merkle_storage_profile(w, height)` — 纯函数：返回 `(w, height)` 对应的 `MerkleStorageProfile`，不生成密钥、不取随机数。`w` 限 4/8，`height` 限 1 至 8 非布尔整数，非法抛 `ValueError`。令 `n = 67/34`（对应 `w = 4/8`）、`L = 2**height`、`S = 16 + 32*(n+height)`、`C = 81 + 32*L*n`：前四字段为 `w, height, L, S`，后四字段 `proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes` 依次为 `S+60, C, C+46, C+54`，分别对应 `MerkleProof` 线长、明文检查点、v1 封装、v2 封装
 - `merkle_transport_profile(w, height, indices)` — 纯函数：为同一叶集合估算批量证明与多证明线长，返回三元组 `(m, 58+k*(4+S), 60+k*(4+32*n)+35*m)`，分别为多证明携带的节点数 `m`、批量证明线长、多证明线长，其中 `k = len(indices)`，`m` 按既有多证明规范计入集合外兄弟并逐级右移去重。`indices` 必须为非空、严格递增的整数元组，成员均在 `0 .. 2**height-1`；容器或成员类型错抛 `TypeError`，空元组、布尔成员、越界或非严格递增抛 `ValueError`；`w`/`height` 非法同样抛 `ValueError`
+- `recommend_merkle_transport_deployment(capacity, indices, budgets, prefer="multiproof")` — 联合选择树参数与传输方案，返回冻结值对象 `MerkleTransportDeploymentProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`indices` 须为非空、严格递增的非布尔整数元组，最大成员须小于所选树的叶数 `L`（同时 `L` 仍须覆盖 `capacity`），其容器/成员类型错抛 `TypeError`，空元组、布尔成员、负成员、非严格递增抛 `ValueError`。`budgets` 必须为四元组，按顺序分别为检查点字节（`checkpoint_bytes`）、批量证明字节、多证明字节（后两者由 `merkle_transport_profile` 给出）及单签验签链步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，至少一项非空；非元组抛 `TypeError`，长度或成员非法、至少一项的要求不满足抛 `ValueError`。枚举 `w=4/8` × `height=1..8` 全部候选，尺寸与步数全部复用既有分析函数。`prefer="multiproof"`（默认）主键依次为多证明线长、批量线长；`prefer="batch"` 为批量线长、多证明线长；`prefer="speed"` 为步数、多证明线长、批量线长；三者末键均依次为检查点字节、叶数、`w`、`height` 升序，取排序首项。无可行候选或 `prefer` 非法抛 `ValueError`
+- `MerkleTransportDeploymentProfile` — 冻结的联合部署值对象，字段按位置依次为 `config, nodes, batch, multi`，类型依次为 `MerkleStorageProfile, int, int, int`：所选配置、多证明节点数、批量证明字节数、多证明字节数；可位置构造、冻结、按值相等（可哈希）
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -363,6 +365,14 @@ recommend_merkle_deployment(16, (None, 1300, None, None))
 # 覆盖 4 条、只限验签步数 <= 9000：speed 先压步数，选 w=4；size 则选签名更短的 w=8
 recommend_merkle_deployment(4, (None, None, None, 9000), prefer="speed")
 # MerkleStorageProfile(w=4, height=2, ...)；预算过紧、无可行候选时抛 ValueError
+
+# 联合选择树与传输方案：覆盖 8 条、证明叶 (2, 5)，多证明线长 <= 1300 字节
+# budgets 顺序为 (检查点, 批量证明, 多证明, 步数)，不限的项传 None
+from pqattest import recommend_merkle_transport_deployment
+recommend_merkle_transport_deployment(8, (2, 5), (None, None, 1300, None))
+# MerkleTransportDeploymentProfile(config=MerkleStorageProfile(w=8, height=3, ...),
+#                                  nodes=4, batch=..., multi=...)
+# prefer 取 multiproof/batch/speed；叶索引超出全部候选叶数或预算无解时抛 ValueError
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

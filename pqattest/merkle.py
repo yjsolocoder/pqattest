@@ -587,11 +587,12 @@ class MerkleSigner:
     :meth:`sign_batch_with_auth_state`. Once every leaf is spent, further
     calls raise :class:`KeyExhaustedError`.
 
-    Leaves can also be proactively voided with :meth:`advance_to`: after a
-    crash or whenever state is uncertain, a caller skips leaves that may
-    already have been exposed so they can never be signed again. Voiding only
-    moves ``next_index`` forward — it never changes the keys, and there is no
-    public way to move it backwards.
+    Leaves can also be proactively voided with :meth:`advance_to` or
+    :meth:`advance_to_with_auth_state`: after a crash or whenever state is
+    uncertain, a caller skips leaves that may already have been exposed so
+    they can never be signed again. Voiding only moves ``next_index``
+    forward — it never changes the keys, and there is no public way to move
+    it backwards.
     """
 
     def __init__(
@@ -787,6 +788,68 @@ class MerkleSigner:
                 )
             self._next_index = next_index
             return before, next_index
+
+    def advance_to_with_auth_state(
+        self, next_index: Any, *, key: Any, generation: Any
+    ) -> tuple[tuple[int, int], bytes]:
+        """Void leaves and return the advanced state as a v2 auth envelope.
+
+        Behaves like :meth:`advance_to` — the same target validation, the
+        same atomic forward-only jump of ``next_index`` and the same
+        ``(before, after)`` pair — but additionally returns the
+        :func:`auth_state_wrap` v2 envelope (``bytes``) over the
+        post-advance v1 :meth:`checkpoint` bytes with ``scheme="merkle"``
+        and the given ``key`` and ``generation``, byte-for-byte the same as
+        advancing and then wrapping an explicit checkpoint. The full result
+        is ``((before, after), envelope)``: pairing the jump with the state
+        it produced keeps a caller from matching an advance against a
+        checkpoint taken at the wrong point under concurrency.
+
+        Every argument is validated before the state is touched:
+        ``next_index`` must be a non-boolean integer in the closed interval
+        ``[self.next_index, public_key.leaf_count]``; ``key`` is
+        keyword-only and must be a non-empty ``bytes``/``bytearray`` shared
+        secret; ``generation`` is keyword-only and must be a non-boolean
+        integer in ``0 .. 2**64 - 1``. A boolean or otherwise wrongly typed
+        ``next_index``, ``key`` or ``generation`` raises ``TypeError``; an
+        empty key, an out-of-range generation, or a target below the current
+        index or above the leaf count raises ``ValueError``. Every failure
+        leaves the signer untouched and returns no partial result.
+
+        The whole call — validation of the target, the advance, the
+        snapshot and the wrapping — runs under the same lock as
+        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the index
+        properties and :meth:`checkpoint`, so it linearises as one atomic
+        step and a concurrent observer sees the state either before the
+        call or after the envelope is complete. An equal target succeeds:
+        the state does not change, ``before`` and ``after`` are equal, and
+        the envelope still wraps the unchanged checkpoint. Only the index
+        moves — keys, public key and tree are unchanged, no randomness is
+        drawn, and the advanced state remains compatible with the existing
+        v1 checkpoint format and every other method. The envelope is
+        plaintext and authenticated only; it provides neither encryption
+        nor protection against replay or rollback on its own.
+        """
+        if isinstance(next_index, bool) or not isinstance(next_index, int):
+            raise TypeError("next_index must be a non-boolean integer")
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            before = self._next_index
+            leaf_count = len(self._private_keys)
+            if next_index < before or next_index > leaf_count:
+                raise ValueError(
+                    "next_index must be between the current index and the leaf count"
+                )
+            self._next_index = next_index
+            checkpoint = self._checkpoint_bytes()
+            envelope = auth_state_wrap(
+                checkpoint,
+                scheme="merkle",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            return (before, next_index), envelope
 
     def _signature_at(self, index: int, message: Any) -> MerkleSignature:
         """Build the signature for ``message`` at leaf ``index``.

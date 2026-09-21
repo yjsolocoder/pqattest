@@ -349,6 +349,27 @@ signer = MerkleSigner(height=params.height, w=params.w)
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。
 
+存储与传输尺寸估算（纯函数，不生成密钥、不取随机数）：
+
+- `MerkleStorageProfile` — 冻结的尺寸值对象，可位置构造、按值相等（含可哈希）。八个 `int` 字段依次为 `w, height, leaf_count, signature_wire_bytes, proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes`
+- `merkle_storage_profile(w, height)` — 返回给定配置的 `MerkleStorageProfile`。令 `n = 67/34`（对应 `w = 4/8`，即该 `w` 的 W-OTS 链数）、`L = 2**height`、`S = 16 + 32*(n + height)`、`C = 81 + 32*L*n`；字段值依次为 `w, height, L, S, S+60, C, C+46, C+54`——分别对应单条 Merkle 签名线长、自包含 `MerkleProof` 线长、`MerkleSigner.checkpoint()` 检查点大小，以及该检查点外封 `auth_wrap` v1 / `auth_state_wrap` v2 封装的大小。`w` 限 `4`/`8`，`height` 为 1 至 8 的非布尔整数；非法输入抛 `ValueError`
+- `merkle_transport_profile(w, height, indices)` — 返回 `(m, 58 + k*(4 + S), 60 + k*(4 + 32*n) + 35*m)`，三项依次为多证明规范下的规范兄弟节点数 `m`、`MerkleBatchProof` 批次线长、`multiproof_encode` 多证明线长，其中 `k = len(indices)`。节点计数沿用既有多证明规范：每层计入当前集合中「兄弟不在集合内」的兄弟，再把集合右移一位并去重。`indices` 必须为非空、严格递增（因而唯一）的非布尔整数元组，每个索引在 `0 .. 2**height - 1` 内。容器或成员类型错抛 `TypeError`；空元组、布尔成员、越界或非严格递增抛 `ValueError`；`w`/`height` 非法抛 `ValueError`
+
+这些函数只复述既有 v1/v2 线格式的确定大小，不改变任何旧接口或格式。
+
+```python
+from pqattest import merkle_storage_profile, merkle_transport_profile
+
+merkle_storage_profile(4, 1)
+# MerkleStorageProfile(w=4, height=1, leaf_count=2, signature_wire_bytes=2192,
+#                      proof_wire_bytes=2252, checkpoint_bytes=4369,
+#                      auth_v1_bytes=4415, auth_v2_bytes=4423)
+
+# height=3 的树上证明偶数叶子 0、2、4、6：需携带 4 个节点（各自的奇数
+# 兄弟 1、3、5、7），向上两层的兄弟都已在集合内被去重
+m, batch, multiproof = merkle_transport_profile(4, 3, (0, 2, 4, 6))  # (4, 9098, 8792)
+```
+
 ## 限制
 
 玩具格基 KEM 是为讲解 KEM 外形（keygen/encapsulate/decapsulate、密钥确认 tag）而写的极简模型，**未经过安全审计且结构性地不安全**：私钥与公钥是同一个向量（无单向函数、无噪声、无陷门），任何人都能从公钥直接还原私钥；16 字节、模 257 的参数也无任何安全裕度。**仅供教学，严禁用于任何真实系统。**

@@ -18,6 +18,10 @@ state can be persisted explicitly with
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
 key and is protected only by a SHA-256 checksum against accidental
 corruption, so callers must store it securely.
+:func:`merkle_storage_profile` and :func:`merkle_transport_profile` report
+the deterministic on-the-wire sizes of these objects for a given ``w``,
+``height`` and (for transport) leaf-index tuple without generating keys or
+drawing randomness.
 """
 
 from __future__ import annotations
@@ -29,7 +33,14 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ._errors import KeyExhaustedError
-from .auth import _validate_generation, _validate_key, auth_state_wrap
+from .auth import (
+    _AUTH_TAG_BYTES,
+    _AUTH_V1_HEADER_BYTES,
+    _AUTH_V2_HEADER_BYTES,
+    _validate_generation,
+    _validate_key,
+    auth_state_wrap,
+)
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -48,6 +59,9 @@ __all__ = [
     "MerklePublicKey",
     "MerkleSignature",
     "MerkleSigner",
+    "MerkleStorageProfile",
+    "merkle_storage_profile",
+    "merkle_transport_profile",
     "merkle_verify",
     "multiproof_encode",
     "multiproof_verify",
@@ -1852,3 +1866,146 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
             i += 1
         current = parents
     return len(current) == 1 and current.get(0) == root and not proof_nodes
+
+
+# Fixed wire-format overheads reused by the storage/transport profiles below.
+_STORAGE_SIGNATURE_OVERHEAD = _SIGNATURE_HEADER_BYTES  # 16 header bytes
+_STORAGE_CHECKPOINT_OVERHEAD = (
+    _CHECKPOINT_HEADER_BYTES + _CHECKPOINT_CHECKSUM_BYTES  # 49 + 32 = 81
+)
+_PROOF_OVERHEAD = _PROOF_HEADER_BYTES + _PUBLIC_KEY_BYTES  # 17 + 43 = 60
+_BATCH_OVERHEAD = _BATCH_PROOF_HEADER_BYTES + _PUBLIC_KEY_BYTES  # 15 + 43 = 58
+_MULTIPROOF_OVERHEAD = _MULTIPROOF_HEADER_BYTES + _PUBLIC_KEY_BYTES  # 17 + 43 = 60
+_AUTH_V1_OVERHEAD = _AUTH_V1_HEADER_BYTES + _AUTH_TAG_BYTES  # 14 + 32 = 46
+_AUTH_V2_OVERHEAD = _AUTH_V2_HEADER_BYTES + _AUTH_TAG_BYTES  # 22 + 32 = 54
+
+
+@dataclass(frozen=True)
+class MerkleStorageProfile:
+    """Frozen on-the-wire storage estimates for a Merkle key configuration.
+
+    A pure size table — no keys are generated and no randomness is drawn. The
+    eight ``int`` fields, in positional order, are:
+
+    1. ``w`` and ``height``: the validated Winternitz and tree parameters;
+    2. ``leaf_count``: ``L = 2 ** height`` W-OTS leaves;
+    3. ``signature_wire_bytes``: ``S``, the size of one
+       :meth:`MerkleSignature.to_bytes` v1 encoding constrained by the key,
+       ``16 + 32 * (n + height)`` where ``n`` is the W-OTS chain count
+       (67 for ``w=4``, 34 for ``w=8``);
+    4. ``proof_wire_bytes``: ``S + 60``, the size of one self-contained
+       :meth:`MerkleProof.to_bytes` blob (proof header plus the 43-byte public
+       key);
+    5. ``checkpoint_bytes``: ``C = 81 + 32 * L * n``, the size of one
+       :meth:`MerkleSigner.checkpoint` v1 blob (49-byte header, every private
+       chain element, 32-byte checksum);
+    6. ``auth_v1_bytes``: ``C + 46``, the size of a :func:`auth_wrap` v1
+       envelope around that checkpoint;
+    7. ``auth_v2_bytes``: ``C + 54``, the size of an
+       :func:`auth_state_wrap` v2 envelope around that checkpoint.
+
+    Instances are immutable, constructible positionally and equal by value.
+    """
+
+    w: int
+    height: int
+    leaf_count: int
+    signature_wire_bytes: int
+    proof_wire_bytes: int
+    checkpoint_bytes: int
+    auth_v1_bytes: int
+    auth_v2_bytes: int
+
+
+def _storage_numbers(w: int, height: int) -> tuple[int, int, int, int]:
+    """Return ``(n, L, S, C)`` for validated ``w``/``height``."""
+    _, l1, l2 = _params(w)
+    n = l1 + l2
+    leaf_count = 1 << height
+    signature_bytes = _STORAGE_SIGNATURE_OVERHEAD + (n + height) * ELEMENT_BYTES
+    checkpoint_bytes = (
+        _STORAGE_CHECKPOINT_OVERHEAD + leaf_count * n * ELEMENT_BYTES
+    )
+    return n, leaf_count, signature_bytes, checkpoint_bytes
+
+
+def merkle_storage_profile(w: Any, height: Any) -> MerkleStorageProfile:
+    """Return the frozen :class:`MerkleStorageProfile` for ``w``/``height``.
+
+    Pure parameter arithmetic: no keys are generated and no randomness is
+    drawn, so the same arguments always return an equal-by-value profile.
+    ``w`` must be ``4`` or ``8`` and ``height`` a non-boolean integer from 1
+    to 8; anything else (including booleans) raises ``ValueError``. The
+    existing interfaces and wire formats are unchanged; the returned values
+    simply state their sizes.
+    """
+    w = _validate_w(w)
+    height = _validate_height(height)
+    _, leaf_count, signature_bytes, checkpoint_bytes = _storage_numbers(w, height)
+    return MerkleStorageProfile(
+        w,
+        height,
+        leaf_count,
+        signature_bytes,
+        signature_bytes + _PROOF_OVERHEAD,
+        checkpoint_bytes,
+        checkpoint_bytes + _AUTH_V1_OVERHEAD,
+        checkpoint_bytes + _AUTH_V2_OVERHEAD,
+    )
+
+
+def merkle_transport_profile(
+    w: Any, height: Any, indices: Any
+) -> tuple[int, int, int]:
+    """Return ``(m, batch_bytes, multiproof_bytes)`` for proofs over ``indices``.
+
+    Pure size arithmetic over the existing multi-proof spec: the canonical
+    node set counts, at every level, the sibling of each current-set index
+    whose sibling lies outside the set, then shifts the set right and
+    deduplicates it (the same coordinates
+    :func:`multiproof_encode` carries). ``m`` is the resulting node count and
+    ``k = len(indices)``. The three returned ints are:
+
+    1. ``m``: canonical sibling-node count;
+    2. ``58 + k * (4 + S)``: the v1 :meth:`MerkleBatchProof.to_bytes` size —
+       batch header plus 43-byte public key, and per signature a 4-byte
+       length prefix plus one ``S``-byte Merkle signature;
+    3. ``60 + k * (4 + 32 * n) + 35 * m``: the v1
+       :func:`multiproof_encode` size — multiproof header plus 43-byte public
+       key, per leaf a 2-byte index, a 2-byte element count and ``n``
+       32-byte W-OTS elements, and per canonical node a 1-byte level, a
+       2-byte index and a 32-byte hash.
+
+    ``indices`` must be a non-empty tuple of strictly increasing, unique,
+    non-boolean integers in ``0 .. 2 ** height - 1``. A non-tuple container
+    or a non-integer member raises ``TypeError``; an empty tuple, a boolean
+    member, an out-of-range index or indices that are not strictly increasing
+    raise ``ValueError``. ``w`` must be 4 or 8 and ``height`` a non-boolean
+    integer from 1 to 8; otherwise ``ValueError``.
+    """
+    w = _validate_w(w)
+    height = _validate_height(height)
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of integers")
+    for index in indices:
+        if isinstance(index, bool):
+            raise ValueError("indices must not contain booleans")
+        if not isinstance(index, int):
+            raise TypeError("every index must be an integer")
+    if not indices:
+        raise ValueError("indices must not be empty")
+    leaf_count = 1 << height
+    if any(index < 0 or index >= leaf_count for index in indices):
+        raise ValueError("an index is out of range for the tree height")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+    n, _, signature_bytes, _ = _storage_numbers(w, height)
+    coordinates = _canonical_multiproof_nodes(indices, height)
+    node_count = len(coordinates)
+    k = len(indices)
+    batch_bytes = _BATCH_OVERHEAD + k * (4 + signature_bytes)
+    multiproof_bytes = (
+        _MULTIPROOF_OVERHEAD + k * (4 + n * ELEMENT_BYTES)
+        + node_count * _MULTIPROOF_NODE_BYTES
+    )
+    return node_count, batch_bytes, multiproof_bytes

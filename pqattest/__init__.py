@@ -12,7 +12,9 @@ construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
-merkle_verify / multiproof_encode / multiproof_verify, static
+merkle_verify / multiproof_encode / multiproof_verify, and
+randomness-free storage/transport size estimates: MerkleStorageProfile /
+merkle_storage_profile / merkle_transport_profile, static
 parameter analysis: Params / profile / recommend, and the teaching-only toy
 lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -47,6 +49,9 @@ from .merkle import (
     MerklePublicKey,
     MerkleSignature,
     MerkleSigner,
+    MerkleStorageProfile,
+    merkle_storage_profile,
+    merkle_transport_profile,
     merkle_verify,
     multiproof_encode,
     multiproof_verify,
@@ -82,6 +87,7 @@ __all__ = [
     "MerklePublicKey",
     "MerkleSignature",
     "MerkleSigner",
+    "MerkleStorageProfile",
     "OneTimeSigner",
     "Params",
     "PrivateKey",
@@ -99,6 +105,8 @@ __all__ = [
     "keygen",
     "lamport_signature_from_bytes",
     "lamport_signature_to_bytes",
+    "merkle_storage_profile",
+    "merkle_transport_profile",
     "merkle_verify",
     "message_bits",
     "message_digest",

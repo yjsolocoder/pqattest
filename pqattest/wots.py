@@ -14,6 +14,9 @@ it securely. :class:`WOTSOneTimeSigner` state can be persisted with a
 versioned binary checkpoint (``checkpoint`` / ``from_checkpoint``); the blob
 holds the private key in the clear and is integrity-protected only by a
 SHA-256 checksum, so callers must store it securely.
+``WOTSOneTimeSigner.sign_with_auth_state`` returns the single signature
+together with a keyed, generation-tagged v2 envelope over the post-sign
+checkpoint in one atomic call.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 from ._errors import KeyExhaustedError
+from .auth import _validate_generation, _validate_key, auth_state_wrap
 
 __all__ = [
     "ELEMENT_BYTES",
@@ -280,6 +284,9 @@ class WOTSOneTimeSigner:
     restored in another process with :meth:`from_checkpoint`; the checkpoint
     contains the private key in the clear and is protected only by a SHA-256
     checksum against accidental corruption, so callers must store it securely.
+    :meth:`sign_with_auth_state` pairs the single signature with a keyed,
+    generation-tagged v2 envelope over the post-sign checkpoint in one atomic
+    call.
     """
 
     __slots__ = ("_lock", "_private_key", "_public_key", "_used")
@@ -338,6 +345,16 @@ class WOTSOneTimeSigner:
             self._used = True
             return signature
 
+    def _checkpoint_bytes(self) -> bytes:
+        """V1 checkpoint encoding of the current state; caller holds the lock."""
+        body = (
+            _CHECKPOINT_MAGIC
+            + bytes((_CHECKPOINT_VERSION, self._private_key.w, int(self._used)))
+            + len(self._private_key.elements).to_bytes(2, "big")
+            + b"".join(self._private_key.elements)
+        )
+        return body + hashlib.sha256(body).digest()
+
     def checkpoint(self) -> bytes:
         """Serialise the signer state (private key plus ``used``) to ``bytes``.
 
@@ -355,13 +372,58 @@ class WOTSOneTimeSigner:
         accidental corruption — store it as a secret.
         """
         with self._lock:
-            body = (
-                _CHECKPOINT_MAGIC
-                + bytes((_CHECKPOINT_VERSION, self._private_key.w, int(self._used)))
-                + len(self._private_key.elements).to_bytes(2, "big")
-                + b"".join(self._private_key.elements)
+            return self._checkpoint_bytes()
+
+    def sign_with_auth_state(
+        self, message: Any, *, key: Any, generation: Any
+    ) -> tuple[tuple[bytes, ...], bytes]:
+        """Sign once and return the used state as a v2 auth envelope.
+
+        Combines :meth:`sign` and :func:`auth_state_wrap` in one atomic call.
+        Returns ``(signature, envelope)``: ``signature`` is the immutable
+        ``tuple`` of 32-byte ``bytes`` that :meth:`sign` returns for the same
+        message from the same starting state — drawing no randomness — and
+        ``envelope`` is the ``bytes`` :func:`auth_state_wrap` v2 envelope over
+        the post-sign v1 :meth:`checkpoint` bytes (``used`` set) with
+        ``scheme="wots"`` and the given ``key`` and ``generation``,
+        byte-for-byte identical to signing and then wrapping an explicit
+        checkpoint. Pairing the two halves in one call keeps the signature
+        and the state it consumed together, so a caller can never match a
+        signature against a checkpoint taken at the wrong point under
+        concurrency.
+
+        Every argument is validated before the key is spent: ``message``
+        accepts ``bytes``/``bytearray``/``str`` exactly like :meth:`sign`;
+        ``key`` is keyword-only and must be a non-empty
+        ``bytes``/``bytearray`` shared secret; ``generation`` is keyword-only
+        and must be a non-boolean integer in ``0 .. 2**64 - 1``. A rejected
+        message, key or generation type raises ``TypeError``; an empty key or
+        an out-of-range generation raises ``ValueError``; an already used
+        signer raises :class:`~pqattest.KeyExhaustedError`. Every failure
+        leaves ``used`` unchanged and returns no partial result.
+
+        The whole call — signature, the ``used`` flip, the checkpoint
+        snapshot and the wrapping — runs under the same lock as :meth:`sign`
+        and :meth:`checkpoint`, so a concurrent observer sees the state
+        either before the call or after all four steps are complete. The
+        envelope is plaintext and authenticated only; it provides neither
+        encryption nor protection against replay or rollback on its own.
+        """
+        _as_bytes(message)
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            signature = wots_sign(message, self._private_key)
+            self._used = True
+            envelope = auth_state_wrap(
+                self._checkpoint_bytes(),
+                scheme="wots",
+                key=key_bytes,
+                generation=generation_value,
             )
-            return body + hashlib.sha256(body).digest()
+            return signature, envelope
 
     @classmethod
     def from_checkpoint(cls, data: Any) -> "WOTSOneTimeSigner":

@@ -2,10 +2,11 @@
 
 :func:`profile` reports the size and cost metrics of a scheme/parameter
 combination without generating any keys, and :func:`recommend` picks a Merkle
-configuration for a desired signature capacity. :func:`merkle_storage_profile`
+configuration for a desired signature capacity, :func:`recommend_merkle_deployment`
+picks one that additionally fits deployment budgets. :func:`merkle_storage_profile`
 breaks the Merkle wire sizes down per serialised object and
 :func:`merkle_transport_profile` sizes a batch or multi-proof over a chosen
-leaf-index set. All four are pure functions: no randomness, no state, no
+leaf-index set. All five are pure functions: no randomness, no state, no
 I/O, no keys are generated.
 """
 
@@ -22,6 +23,7 @@ __all__ = [
     "MerkleStorageProfile",
     "profile",
     "recommend",
+    "recommend_merkle_deployment",
     "merkle_storage_profile",
     "merkle_transport_profile",
 ]
@@ -139,6 +141,101 @@ def recommend(capacity: Any, prefer: str = "size") -> Params:
         raise ValueError('prefer must be "size" or "speed"')
     height = max(1, (capacity - 1).bit_length())
     return profile("merkle", w=w, height=height)
+
+
+def recommend_merkle_deployment(
+    capacity: Any, budgets: Any, prefer: Any = "size"
+) -> MerkleStorageProfile:
+    """Return the :class:`MerkleStorageProfile` fitting deployment budgets.
+
+    Unlike :func:`recommend`, which only minimises the tree height, this
+    enumerates every Merkle candidate — ``w`` in ``(4, 8)`` times ``height``
+    from 1 to 8 — keeps those whose ``leaf_count`` covers ``capacity`` and
+    that satisfy every set budget, and ranks the feasible set.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``budgets``
+    must be a four-tuple, in order: an upper bound on the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), on one signature wire
+    length (:attr:`MerkleStorageProfile.signature_wire_bytes`), on one
+    standalone proof wire length (:attr:`MerkleStorageProfile.proof_wire_bytes`)
+    and on the verifier hash-chain step count (``profile("merkle", ...)``'s
+    ``steps``). Each entry is either ``None`` (no bound) or a positive,
+    non-boolean integer, and at least one entry must be set.
+
+    ``prefer="size"`` ranks candidates lexicographically by signature wire
+    length, proof wire length, checkpoint bytes, steps, leaf count, ``w`` and
+    ``height``; ``prefer="speed"`` minimises steps first and then applies the
+    same remaining order. The first candidate after sorting is returned as a
+    :class:`MerkleStorageProfile`.
+
+    A non-tuple ``budgets`` raises ``TypeError``; a tuple of the wrong length,
+    an illegal member, an out-of-range ``capacity``, an unknown ``prefer``
+    value or the absence of any feasible candidate raises ``ValueError``. The
+    function is pure: it draws no randomness, generates no keys and changes
+    no state.
+    """
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 4-tuple of budget limits")
+    if len(budgets) != 4:
+        raise ValueError("budgets must contain exactly four entries")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+    if prefer not in ("size", "speed"):
+        raise ValueError('prefer must be "size" or "speed"')
+
+    labels = ("checkpoint", "signature", "proof", "steps")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    checkpoint_limit, signature_limit, proof_limit, steps_limit = limits
+
+    feasible = []
+    for w in (4, 8):
+        for height in range(1, 9):
+            storage = merkle_storage_profile(w, height)
+            if storage.leaf_count < capacity:
+                continue
+            if checkpoint_limit is not None and storage.checkpoint_bytes > checkpoint_limit:
+                continue
+            if signature_limit is not None and storage.signature_wire_bytes > signature_limit:
+                continue
+            if proof_limit is not None and storage.proof_wire_bytes > proof_limit:
+                continue
+            steps = profile("merkle", w=w, height=height).steps
+            if steps_limit is not None and steps > steps_limit:
+                continue
+            feasible.append((storage, steps))
+    if not feasible:
+        raise ValueError("no Merkle configuration fits the requested capacity and budgets")
+
+    def ranking(candidate: tuple[MerkleStorageProfile, int]) -> tuple[int, ...]:
+        storage, steps = candidate
+        ordered = (
+            storage.signature_wire_bytes,
+            storage.proof_wire_bytes,
+            storage.checkpoint_bytes,
+            steps,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+        )
+        if prefer == "speed":
+            return (steps,) + ordered
+        return ordered
+
+    feasible.sort(key=ranking)
+    return feasible[0][0]
 
 
 @dataclass(frozen=True)

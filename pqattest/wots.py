@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 from ._errors import KeyExhaustedError
+from .auth import _validate_generation, _validate_key, auth_state_wrap
 
 __all__ = [
     "ELEMENT_BYTES",
@@ -338,6 +339,16 @@ class WOTSOneTimeSigner:
             self._used = True
             return signature
 
+    def _checkpoint_bytes(self) -> bytes:
+        """Serialise the signer state; the caller holds the lock."""
+        body = (
+            _CHECKPOINT_MAGIC
+            + bytes((_CHECKPOINT_VERSION, self._private_key.w, int(self._used)))
+            + len(self._private_key.elements).to_bytes(2, "big")
+            + b"".join(self._private_key.elements)
+        )
+        return body + hashlib.sha256(body).digest()
+
     def checkpoint(self) -> bytes:
         """Serialise the signer state (private key plus ``used``) to ``bytes``.
 
@@ -355,13 +366,59 @@ class WOTSOneTimeSigner:
         accidental corruption — store it as a secret.
         """
         with self._lock:
-            body = (
-                _CHECKPOINT_MAGIC
-                + bytes((_CHECKPOINT_VERSION, self._private_key.w, int(self._used)))
-                + len(self._private_key.elements).to_bytes(2, "big")
-                + b"".join(self._private_key.elements)
+            return self._checkpoint_bytes()
+
+    def sign_with_auth_state(
+        self, message: Any, *, key: Any, generation: Any
+    ) -> tuple[tuple[bytes, ...], bytes]:
+        """Sign once and return the advanced state as a v2 auth envelope.
+
+        Behaves like :meth:`sign` — same ``bytes``/``bytearray``/``str``
+        message rules, same one-time signature and the same post-sign
+        ``used=True`` state, all under the signing lock — but instead of the
+        signature alone it returns ``(signature, envelope)``: the first half
+        is the ordinary immutable W-OTS signature tuple that :meth:`sign`
+        returns, and the second is the :func:`auth_state_wrap` v2 envelope
+        (``bytes``) over the v1 :meth:`checkpoint` bytes of the used state
+        with ``scheme="wots"`` and the given ``key`` and ``generation``. The
+        wrapped checkpoint is byte-for-byte identical to the one
+        :meth:`checkpoint` returns immediately after signing, so the envelope
+        is byte-for-byte identical to signing and then wrapping an explicit
+        checkpoint. Pairing the two halves in one call keeps the signature
+        and the state it advanced to together, so a caller can never match a
+        signature against a checkpoint taken at the wrong point under
+        concurrency.
+
+        Every argument is validated before the key is spent: ``key`` is
+        keyword-only and must be a non-empty ``bytes``/``bytearray`` shared
+        secret; ``generation`` is keyword-only and must be a non-boolean
+        integer in ``0 .. 2**64 - 1``. A wrong message or key type raises
+        ``TypeError``; an empty key or an out-of-range generation raises
+        ``ValueError``; an already used instance raises
+        :class:`~pqattest.KeyExhaustedError`. Every failure leaves ``used``
+        untouched and returns no partial result. The whole call — signature,
+        ``used`` flip, snapshot and wrapping — linearises with :meth:`sign`
+        and :meth:`checkpoint` under the same lock, and no randomness is
+        drawn. The envelope is plaintext and authenticated only; it provides
+        neither encryption nor protection against replay or rollback on its
+        own.
+        """
+        message = _as_bytes(message)
+        key_bytes = _validate_key(key)
+        generation_value = _validate_generation(generation, "generation")
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            signature = wots_sign(message, self._private_key)
+            self._used = True
+            checkpoint = self._checkpoint_bytes()
+            envelope = auth_state_wrap(
+                checkpoint,
+                scheme="wots",
+                key=key_bytes,
+                generation=generation_value,
             )
-            return body + hashlib.sha256(body).digest()
+            return signature, envelope
 
     @classmethod
     def from_checkpoint(cls, data: Any) -> "WOTSOneTimeSigner":

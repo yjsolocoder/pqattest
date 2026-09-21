@@ -11,8 +11,10 @@ tree parameters and the transport encoding together under checkpoint, batch,
 multi-proof and verifier-step budgets. :func:`recommend_merkle_transport_workload`
 extends that joint choice to several independent leaf-index groups, each carried
 in its own transport, under checkpoint, per-group, aggregate and verifier-step
-budgets. All seven are pure functions: no randomness, no state, no I/O, no keys
-are generated.
+budgets. :func:`merkle_transport_workload_frontier` keeps the per-group shortest
+transport and returns every feasible deployment that survives Pareto-style
+non-domination under the same budgets. All eight are pure functions: no
+randomness, no state, no I/O, no keys are generated.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ __all__ = [
     "recommend_merkle_transport_workload",
     "merkle_storage_profile",
     "merkle_transport_profile",
+    "merkle_transport_workload_frontier",
 ]
 
 _SCHEMES = ("lamport", "wots", "merkle")
@@ -689,3 +692,170 @@ def recommend_merkle_transport_workload(
     return MerkleTransportWorkloadProfile(
         config=storage, modes=modes, sizes=sizes, total=total
     )
+
+
+def merkle_transport_workload_frontier(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+) -> tuple[MerkleTransportWorkloadProfile, ...]:
+    """Return every feasible, non-dominated multi-group Merkle deployment.
+
+    Like :func:`recommend_merkle_transport_workload`, this enumerates every
+    Merkle candidate — ``w`` in ``(4, 8)`` times ``height`` from 1 to 8 —
+    whose leaf count covers both ``capacity`` and every group, and sizes each
+    group with :func:`merkle_storage_profile`, :func:`merkle_transport_profile`
+    and :func:`profile`. Unlike it, there is no ``prefer``: every group always
+    takes the shorter of the batch and multi-proof wire lengths, breaking a
+    tie towards ``"multiproof"``, and instead of one ranked winner the whole
+    Pareto frontier is returned.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``groups``
+    must be a non-empty tuple; each member must itself be a non-empty tuple
+    of strictly increasing, non-negative, non-boolean integers (a leaf-index
+    set). The candidate tree's leaf count must cover both ``capacity`` and
+    every group's largest index.
+
+    ``budgets`` must be a four-tuple, in order: an upper bound on the
+    checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), on the wire length of
+    any single group's chosen transport (every entry of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), on the aggregate
+    transport bytes (:attr:`MerkleTransportWorkloadProfile.total`) and on
+    the per-signature verifier hash-chain step count
+    (``profile("merkle", ...)``'s ``steps``). Each entry is either ``None``
+    (no bound) or a positive, non-boolean integer, and at least one entry
+    must be set.
+
+    A feasible deployment ``A`` dominates ``B`` when its
+    ``config.checkpoint_bytes``, ``total`` and per-signature ``steps`` are
+    each no greater than ``B``'s and at least one is strictly smaller; the
+    per-group transports are already fixed to the shortest format, so they
+    do not participate in the comparison. Deployments dominated by another
+    feasible candidate are removed, the survivors are deduplicated by
+    value, and the returned tuple is sorted stably and ascending by
+    verifier steps, aggregate transport bytes, checkpoint bytes, leaf
+    count, ``w`` and ``height``.
+
+    A non-tuple ``groups`` or ``budgets`` (a group that is not itself a
+    tuple included) raises ``TypeError``; an out-of-range ``capacity``, an
+    empty group tuple or group, a non-integer, boolean, negative or
+    non-strictly-increasing group member, a wrong-length or otherwise
+    illegal ``budgets`` tuple, or the absence of any feasible candidate
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state.
+    """
+    if not isinstance(groups, tuple):
+        raise TypeError("groups must be a tuple of leaf-index groups")
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 4-tuple of budget limits")
+    if len(budgets) != 4:
+        raise ValueError("budgets must contain exactly four entries")
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+    if not groups:
+        raise ValueError("groups must not be empty")
+    for group in groups:
+        if not isinstance(group, tuple):
+            raise TypeError("every group must be a tuple of leaf indices")
+        if not group:
+            raise ValueError("groups must not contain an empty tuple")
+        if any(isinstance(index, bool) or not isinstance(index, int) for index in group):
+            raise ValueError("every index must be a non-boolean integer")
+        if group[0] < 0:
+            raise ValueError("every index must be non-negative")
+        if any(former >= latter for former, latter in zip(group, group[1:])):
+            raise ValueError("every group's indices must be strictly increasing and unique")
+
+    labels = ("checkpoint", "group", "total", "steps")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    checkpoint_limit, group_limit, total_limit, steps_limit = limits
+
+    required_leaves = max([capacity, *(group[-1] + 1 for group in groups)])
+    feasible = []
+    for w in (4, 8):
+        for height in range(1, 9):
+            storage = merkle_storage_profile(w, height)
+            if storage.leaf_count < required_leaves:
+                continue
+            if checkpoint_limit is not None and storage.checkpoint_bytes > checkpoint_limit:
+                continue
+            modes = []
+            sizes = []
+            for group in groups:
+                _node_count, batch_bytes, multi_bytes = merkle_transport_profile(
+                    w, height, group
+                )
+                if multi_bytes <= batch_bytes:
+                    mode, size = "multiproof", multi_bytes
+                else:
+                    mode, size = "batch", batch_bytes
+                modes.append(mode)
+                sizes.append(size)
+            if group_limit is not None and any(size > group_limit for size in sizes):
+                continue
+            total = sum(sizes)
+            if total_limit is not None and total > total_limit:
+                continue
+            steps = profile("merkle", w=w, height=height).steps
+            if steps_limit is not None and steps > steps_limit:
+                continue
+            feasible.append(
+                (
+                    MerkleTransportWorkloadProfile(
+                        config=storage, modes=tuple(modes), sizes=tuple(sizes), total=total
+                    ),
+                    steps,
+                )
+            )
+    if not feasible:
+        raise ValueError("no Merkle configuration fits the requested capacity, groups and budgets")
+
+    frontier = []
+    for candidate, steps in feasible:
+        checkpoint = candidate.config.checkpoint_bytes
+        dominated = any(
+            other is not candidate
+            and other.config.checkpoint_bytes <= checkpoint
+            and other.total <= candidate.total
+            and other_steps <= steps
+            and (
+                other.config.checkpoint_bytes < checkpoint
+                or other.total < candidate.total
+                or other_steps < steps
+            )
+            for other, other_steps in feasible
+        )
+        if not dominated:
+            frontier.append((candidate, steps))
+
+    frontier.sort(
+        key=lambda entry: (
+            entry[1],
+            entry[0].total,
+            entry[0].config.checkpoint_bytes,
+            entry[0].config.leaf_count,
+            entry[0].config.w,
+            entry[0].config.height,
+        )
+    )
+    profiles = []
+    seen = set()
+    for candidate, _steps in frontier:
+        if candidate not in seen:
+            seen.add(candidate)
+            profiles.append(candidate)
+    return tuple(profiles)

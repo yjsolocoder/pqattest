@@ -585,6 +585,7 @@ class MerkleSigner:
     only by a successful :meth:`sign`, :meth:`sign_batch`,
     :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_multiproof_with_checkpoint`,
+    :meth:`sign_proof_with_checkpoint`,
     :meth:`sign_batch_proof_with_checkpoint`,
     :meth:`sign_with_auth_state`, :meth:`sign_batch_with_auth_state`,
     :meth:`sign_multiproof_with_auth_state`,
@@ -1082,6 +1083,62 @@ class MerkleSigner:
             proof = multiproof_encode(self._public_key, signatures)
             self._next_index = base + len(signatures)
             return proof, self._checkpoint_bytes()
+
+    def sign_proof_with_checkpoint(self, message: Any) -> tuple[bytes, bytes]:
+        """Sign one ``message`` and return an independent proof plus a checkpoint.
+
+        Combines :meth:`sign`, :class:`MerkleProof` serialisation and
+        :meth:`checkpoint` in one atomic call. Returns the fixed pair
+        ``(proof, checkpoint)``, both ``bytes`` and in that order: ``proof``
+        is byte-for-byte identical to
+        ``MerkleProof(public_key=self.public_key, signature=signature).to_bytes()``
+        for the :class:`MerkleSignature` produced with the current lowest
+        unused leaf under the existing signing rules — the same bytes
+        :meth:`MerkleProof.from_bytes` parses back into a proof whose
+        :meth:`MerkleProof.verify` accepts exactly the signed message — and
+        ``checkpoint`` is byte-for-byte the v1 :meth:`checkpoint` data for
+        the state after ``next_index`` has advanced by exactly one leaf,
+        holding the new index and every private key. A signer restored from
+        it keeps the same public key, resumes signing at the first
+        unconsumed index and verifies signatures as usual. Pairing the two
+        halves in one call keeps the proof and the state it advanced to
+        together, so a caller can never match a proof against a checkpoint
+        taken at the wrong point under concurrency.
+
+        ``message`` accepts ``bytes``/``bytearray``/``str`` exactly like
+        :meth:`sign`; a ``str`` is encoded as UTF-8. The message is
+        validated before the remaining-leaf capacity check, so a wrong
+        message type raises ``TypeError`` even on an exhausted signer. The
+        signature, the proof encoding and the candidate checkpoint are all
+        built under the same lock as :meth:`sign`, :meth:`sign_batch`,
+        :meth:`advance_to`, the index properties and :meth:`checkpoint`,
+        and no randomness is drawn; ``next_index`` stays unchanged until
+        both outputs have been built successfully and is then committed in
+        one step, so the whole call linearises as one operation and no
+        concurrent observer ever sees an intermediate state. An exhausted
+        signer raises :class:`KeyExhaustedError`; a proof encoding or
+        checkpoint failure likewise leaves the state unchanged and returns
+        no partial result, and every failure happens without spending a
+        leaf. The returned checkpoint still carries every private key in
+        the clear and offers no authentication, encryption or atomic
+        persistence — confidentiality, durable storage and rollback
+        protection remain the caller's responsibility.
+        """
+        _as_bytes(message)
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            index = self._next_index
+            signature = self._signature_at(index, message)
+            # Build both outputs before advancing: any failure must consume
+            # no leaf, and no observer must ever see the advanced state
+            # without the finished proof and checkpoint.
+            proof = MerkleProof(
+                public_key=self._public_key, signature=signature
+            ).to_bytes()
+            checkpoint = self._checkpoint_bytes(index + 1)
+            self._next_index = index + 1
+            return proof, checkpoint
 
     def sign_with_auth_state(
         self, message: Any, *, key: Any, generation: Any

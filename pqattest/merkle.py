@@ -585,6 +585,7 @@ class MerkleSigner:
     only by a successful :meth:`sign`, :meth:`sign_batch`,
     :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_multiproof_with_checkpoint`,
+    :meth:`sign_proof_with_checkpoint`,
     :meth:`sign_batch_proof_with_checkpoint`,
     :meth:`sign_with_auth_state`, :meth:`sign_batch_with_auth_state`,
     :meth:`sign_multiproof_with_auth_state`,
@@ -1341,6 +1342,65 @@ class MerkleSigner:
             )
             self._next_index = index + 1
             return proof, envelope
+
+    def sign_proof_with_checkpoint(self, message: Any) -> tuple[bytes, bytes]:
+        """Sign ``message`` and return the self-contained proof plus a checkpoint.
+
+        Combines :meth:`sign`, :class:`MerkleProof` serialisation and
+        :meth:`checkpoint` in one atomic call. Returns ``(proof,
+        checkpoint)``, both ``bytes``, in that fixed order: ``proof`` is
+        byte-for-byte identical to
+        ``MerkleProof(self.public_key, signature).to_bytes()`` for the
+        :class:`MerkleSignature` this call produces — the same bytes
+        :meth:`MerkleProof.from_bytes` parses back into a proof whose
+        :meth:`MerkleProof.verify` accepts exactly the signed message — and
+        ``checkpoint`` is the ``bytes`` that :meth:`checkpoint` returns once
+        the leaf has been consumed, byte-for-byte the same v1 encoding
+        holding the new ``next_index`` and every private key; a signer
+        restored from it keeps the same public key and resumes signing at
+        the first unconsumed index. Pairing the two halves in one call keeps
+        the proof and the state it advanced to together, so a caller can
+        never match a proof against a checkpoint taken at the wrong point
+        under concurrency.
+
+        ``message`` accepts ``bytes``/``bytearray``/``str`` exactly like
+        :meth:`sign` (a ``str`` is encoded as UTF-8); any other type raises
+        ``TypeError`` without spending a leaf, and the message is validated
+        before the remaining-leaf capacity check, so an illegal message
+        raises ``TypeError`` even on an exhausted signer.
+
+        The signature spends the current lowest unused leaf. The signature,
+        the proof and the candidate checkpoint are all built under the same
+        lock as :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to`, the
+        index properties and :meth:`checkpoint`, and no randomness is drawn;
+        ``next_index`` is committed — advanced by exactly one — only after
+        both outputs have been built successfully, so the whole call
+        linearises as one operation and a concurrent observer never sees a
+        half-consumed leaf or an advanced state without the finished proof
+        and checkpoint. An exhausted signer raises
+        :class:`KeyExhaustedError`; a proof encoding or checkpoint failure
+        likewise leaves the state unchanged, and every failure happens
+        without spending a leaf and returns no partial result. The returned
+        checkpoint still carries every private key in the clear and offers
+        no authentication, encryption or atomic persistence —
+        confidentiality, durable storage and rollback protection remain the
+        caller's responsibility.
+        """
+        _as_bytes(message)
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            index = self._next_index
+            signature = self._signature_at(index, message)
+            # Build both outputs before advancing: any failure must consume
+            # no leaf, and no observer must ever see the advanced state
+            # without the finished proof and checkpoint.
+            proof = MerkleProof(
+                public_key=self._public_key, signature=signature
+            ).to_bytes()
+            checkpoint = self._checkpoint_bytes(index + 1)
+            self._next_index = index + 1
+            return proof, checkpoint
 
     def sign_batch_proof_with_auth_state(
         self, messages: Any, *, key: Any, generation: Any

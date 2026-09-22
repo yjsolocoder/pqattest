@@ -33,7 +33,11 @@ monotonic claim callback exactly once; restore_ots_pair restores a
 same-generation Lamport/W-OTS pair and claims both sides with a single
 callback, so a claim can never succeed for only one side;
 restore_merkle_claimed does the same one-step authenticated restore and
-claim for a Merkle signer v2 envelope.
+claim for a Merkle signer v2 envelope. sign_ots_pair is the signing-side
+counterpart of restore_ots_pair: it signs one message with a Lamport and
+a W-OTS signer under both locks and returns the two signatures together
+with the v2 envelopes of the two advanced states, so neither key is
+spent unless both are.
 Both envelopes authenticate but do not encrypt and give no replay
 protection on their own.
 """
@@ -156,6 +160,7 @@ __all__ = [
     "recommend_merkle_transport_workload",
     "recommend_merkle_mode_deployment",
     "sign",
+    "sign_ots_pair",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
     "toy_lattice_keygen",
@@ -671,6 +676,77 @@ def restore_ots_pair(
         restore_a=OneTimeSigner.from_checkpoint,
         restore_b=WOTSOneTimeSigner.from_checkpoint,
     )
+
+
+def sign_ots_pair(
+    lamport: Any, wots: Any, message: Any, *, key: Any, generation: Any
+) -> tuple[tuple[tuple[bytes, ...], tuple[bytes, ...]], tuple[bytes, bytes]]:
+    """Sign one message with a Lamport/W-OTS pair and wrap both new states.
+
+    Paired counterpart of :meth:`OneTimeSigner.sign_with_auth_state` and
+    :meth:`WOTSOneTimeSigner.sign_with_auth_state` for callers that keep the
+    two one-time keys in lockstep: ``lamport`` must be a
+    :class:`OneTimeSigner` and ``wots`` a :class:`WOTSOneTimeSigner`, and the
+    single ``message`` is signed by both under one critical section, so
+    neither key is spent unless both are. No new wire format, randomness or
+    library state is involved. ``key`` and ``generation`` are keyword-only.
+    Returns ``((lamport_signature, wots_signature), (lamport_state,
+    wots_state))``: the two signatures are the ordinary immutable signature
+    tuples that ``lamport.sign(message)`` and ``wots.sign(message)`` return,
+    and the two states are the :func:`auth_state_wrap` v2 envelopes
+    (``bytes``) over the v1 ``checkpoint`` bytes of each post-sign
+    ``used=True`` state with ``scheme="lamport"``/``"wots"`` and the given
+    ``key`` and ``generation`` — byte-for-byte identical to signing each
+    side and then wrapping an explicit checkpoint of it.
+
+    Every argument is validated before either key is spent: ``message``
+    follows the usual ``bytes``/``bytearray``/``str`` rules; ``key`` must be
+    a non-empty ``bytes``/``bytearray`` shared secret; ``generation`` must
+    be a non-boolean integer in ``0 .. 2**64 - 1``. A wrong signer, message
+    or key type raises ``TypeError``; an empty key or an out-of-range
+    generation raises ``ValueError``; an already used signer on either side
+    raises :class:`KeyExhaustedError`. Every failure leaves both ``used``
+    flags untouched and returns no partial result. Both signing locks are
+    held for the whole call, always acquired Lamport first and W-OTS second,
+    so the pair of signatures, the two ``used`` flips, both snapshots and
+    both wrappings linearise as one step against any concurrent
+    :meth:`~OneTimeSigner.sign`/:meth:`~OneTimeSigner.checkpoint` on either
+    signer, and no randomness is drawn. The envelopes are plaintext and
+    authenticated only; they provide neither encryption nor protection
+    against replay or rollback on their own.
+    """
+    if not isinstance(lamport, OneTimeSigner):
+        raise TypeError("lamport must be a OneTimeSigner")
+    if not isinstance(wots, WOTSOneTimeSigner):
+        raise TypeError("wots must be a WOTSOneTimeSigner")
+    message = _as_bytes(message)
+    key_bytes = _validate_key(key)
+    generation_value = _validate_generation(generation, "generation")
+    # Lock Lamport first, W-OTS second — one fixed order, so two concurrent
+    # pair calls (or a pair call racing a single-signer call) cannot deadlock.
+    with lamport._lock:
+        with wots._lock:
+            if lamport._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            if wots._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            lamport_signature = sign(message, lamport._private_key)
+            wots_signature = wots_sign(message, wots._private_key)
+            lamport._used = True
+            wots._used = True
+            lamport_envelope = auth_state_wrap(
+                lamport._checkpoint_bytes(),
+                scheme="lamport",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            wots_envelope = auth_state_wrap(
+                wots._checkpoint_bytes(),
+                scheme="wots",
+                key=key_bytes,
+                generation=generation_value,
+            )
+            return (lamport_signature, wots_signature), (lamport_envelope, wots_envelope)
 
 
 def restore_merkle_claimed(

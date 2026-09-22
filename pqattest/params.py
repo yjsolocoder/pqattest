@@ -31,7 +31,12 @@ the same leaf set, returning a :class:`MerkleVerifyProfile`.
 :func:`merkle_verify_workload_profile` extends that comparison to several
 independent leaf-index groups, each carried in its own ``"batch"`` or
 ``"multiproof"`` transport, and totals the per-group SHA-256 work in a
-:class:`MerkleVerifyWorkloadProfile`. All fourteen
+:class:`MerkleVerifyWorkloadProfile`. :func:`merkle_verify_mode_frontier`
+joins the two: it enumerates every per-group mode combination of every
+candidate config under checkpoint, per-group peak, aggregate transport,
+verifier-step, carried-node and verifier-hash budgets, returning the
+feasible, non-dominated choices as frozen :class:`MerkleModeCost` tuples.
+All fifteen
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -50,6 +55,7 @@ __all__ = [
     "MerkleStorageProfile",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
+    "MerkleModeCost",
     "MerkleVerifyProfile",
     "MerkleVerifyWorkloadProfile",
     "profile",
@@ -61,6 +67,7 @@ __all__ = [
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
     "merkle_mode_frontier",
+    "merkle_verify_mode_frontier",
     "recommend_merkle_mode_deployment",
     "merkle_storage_profile",
     "merkle_transport_profile",
@@ -1643,3 +1650,277 @@ def recommend_merkle_mode_deployment(
         return (steps, workload.total, peak, nodes) + tail
 
     return min(frontier, key=ranking)
+
+
+def _validate_verify_mode_budgets(budgets: Any) -> tuple[int | None, ...]:
+    """Validate the six-tuple of verify-mode-frontier budget limits."""
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 6-tuple of budget limits")
+    if len(budgets) != 6:
+        raise ValueError("budgets must contain exactly six entries")
+    labels = ("checkpoint", "group", "total", "steps", "nodes", "hashes")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    return tuple(limits)
+
+
+@dataclass(frozen=True)
+class MerkleModeCost:
+    """Frozen per-group mode choice together with its verify hash costs.
+
+    Pairs the transport plan of :func:`merkle_mode_frontier` with the
+    verifier-side SHA-256 work of :func:`merkle_verify_workload_profile` for
+    the same config and per-group mode assignment. Fields, in positional
+    order:
+
+    - ``plan``: the chosen :class:`MerkleTransportWorkloadProfile` — its
+      ``config``, per-group ``modes``, per-group transport wire ``sizes`` and
+      aggregate ``total``;
+    - ``cost``: the :class:`MerkleVerifyWorkloadProfile` for the same
+      ``w``/``height``, groups and ``modes``;
+    - ``nodes``: the total carried multi-proof node count, accumulating the
+      canonical node count of every group carried as a multi-proof and
+      counting ``0`` for every group carried as a batch proof.
+
+    Instances are frozen, support positional construction and compare (and
+    hash) by value; no key material or randomness is involved.
+    """
+
+    plan: MerkleTransportWorkloadProfile
+    cost: MerkleVerifyWorkloadProfile
+    nodes: int
+
+
+def merkle_verify_mode_frontier(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+) -> tuple[MerkleModeCost, ...]:
+    """Return every feasible, non-dominated mode/verify-cost choice as a tuple.
+
+    Joins :func:`merkle_mode_frontier` with
+    :func:`merkle_verify_workload_profile`: it enumerates every Merkle
+    candidate — ``w`` in ``(4, 8)`` times ``height`` from 1 to 8 — whose leaf
+    count covers ``capacity`` and every group's largest index, and every
+    ``2 ** len(groups)`` combination of per-group ``"batch"``/
+    ``"multiproof"`` assignments, reusing :func:`merkle_storage_profile`,
+    :func:`merkle_transport_profile`, :func:`profile` and
+    :func:`merkle_verify_workload_profile` for every size, node count, step
+    count and verifier hash count, and keeps the whole Pareto frontier of
+    the feasible choices so a caller can inspect the trade-off between
+    checkpoint size, per-group peak, aggregate transport, verifier steps,
+    carried multi-proof nodes and verifier SHA-256 hashes.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``groups``
+    must be a non-empty tuple; each member must itself be a non-empty tuple
+    of strictly increasing, non-negative, non-boolean integers (the same
+    group rules as :func:`merkle_mode_frontier`). ``budgets`` must be a
+    six-tuple, in order: an upper bound on the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), on any single group's
+    chosen transport (the peak of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), on the aggregate
+    transport bytes (:attr:`MerkleTransportWorkloadProfile.total`), on the
+    per-signature verifier hash-chain step count
+    (``profile("merkle", ...)``'s ``steps``), on the total carried
+    multi-proof node count (the canonical node count of every multi-proof
+    group, ``0`` for every batch group) and on the total verifier SHA-256
+    hash count (:attr:`MerkleVerifyWorkloadProfile.total`). Each entry is
+    either ``None`` (no bound) or a positive, non-boolean integer, and at
+    least one entry must be set; every bound is inclusive.
+
+    Each survivor is returned as a :class:`MerkleModeCost`: ``plan`` saves
+    the config, modes, per-group sizes and aggregate total exactly as
+    :func:`merkle_mode_frontier` does, ``cost`` is the
+    :func:`merkle_verify_workload_profile` for the same parameters and
+    ``nodes`` accumulates the canonical node count of the multi-proof
+    groups only.
+
+    A feasible choice *A* dominates another feasible choice *B* when ``A``
+    is no greater than ``B`` on all six costs — checkpoint bytes,
+    per-group peak, aggregate transport bytes, verifier steps, carried node
+    total and verifier hash total — and strictly smaller on at least one;
+    every dominated choice is dropped and the survivors are deduplicated by
+    value. No preference is applied, so a mode combination trading one
+    cost for another is never discarded ahead of the dominance test. The
+    returned tuple is sorted stably and ascending by verifier steps,
+    verifier hash total, aggregate transport bytes, per-group peak, carried
+    node total, checkpoint bytes, leaf count, ``w``, ``height`` and the
+    ``modes`` tuple in lexicographic order.
+
+    A non-tuple ``groups`` or ``budgets`` (a group that is not itself a
+    tuple included) raises ``TypeError``; an out-of-range ``capacity``, an
+    empty group tuple or group, a non-integer, boolean, negative or
+    non-strictly-increasing group member, a wrong-length or otherwise
+    illegal ``budgets`` tuple, or the absence of any feasible candidate
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state.
+    """
+    required_leaves = _validate_workload_groups(capacity, groups)
+    limits = _validate_verify_mode_budgets(budgets)
+    (
+        checkpoint_limit,
+        group_limit,
+        total_limit,
+        steps_limit,
+        nodes_limit,
+        hashes_limit,
+    ) = limits
+
+    candidates: list[
+        tuple[
+            MerkleStorageProfile,
+            tuple[str, ...],
+            tuple[int, ...],
+            int,
+            int,
+            int,
+            int,
+            int,
+            MerkleVerifyWorkloadProfile,
+        ]
+    ] = []
+    for w in (4, 8):
+        for height in range(1, 9):
+            storage = merkle_storage_profile(w, height)
+            if storage.leaf_count < required_leaves:
+                continue
+            if checkpoint_limit is not None and storage.checkpoint_bytes > checkpoint_limit:
+                continue
+            steps = profile("merkle", w=w, height=height).steps
+            if steps_limit is not None and steps > steps_limit:
+                continue
+            transports = [
+                merkle_transport_profile(w, height, group) for group in groups
+            ]
+            for choices in product((0, 1), repeat=len(groups)):
+                modes = []
+                sizes = []
+                nodes = 0
+                for choice, (node_count, batch_bytes, multi_bytes) in zip(
+                    choices, transports
+                ):
+                    if choice:
+                        modes.append("multiproof")
+                        sizes.append(multi_bytes)
+                        nodes += node_count
+                    else:
+                        modes.append("batch")
+                        sizes.append(batch_bytes)
+                modes_tuple = tuple(modes)
+                peak = max(sizes)
+                if group_limit is not None and peak > group_limit:
+                    continue
+                total = sum(sizes)
+                if total_limit is not None and total > total_limit:
+                    continue
+                if nodes_limit is not None and nodes > nodes_limit:
+                    continue
+                verify = merkle_verify_workload_profile(
+                    w, height, groups, modes_tuple
+                )
+                if hashes_limit is not None and verify.total > hashes_limit:
+                    continue
+                candidates.append(
+                    (
+                        storage,
+                        modes_tuple,
+                        tuple(sizes),
+                        total,
+                        steps,
+                        peak,
+                        nodes,
+                        verify.total,
+                        verify,
+                    )
+                )
+    if not candidates:
+        raise ValueError(
+            "no Merkle configuration fits the requested capacity, groups and budgets"
+        )
+
+    def costs(
+        candidate: tuple[
+            MerkleStorageProfile,
+            tuple[str, ...],
+            tuple[int, ...],
+            int,
+            int,
+            int,
+            int,
+            int,
+            MerkleVerifyWorkloadProfile,
+        ],
+    ) -> tuple[int, int, int, int, int, int]:
+        (
+            storage,
+            _modes,
+            _sizes,
+            total,
+            steps,
+            peak,
+            nodes,
+            hashes,
+            _verify,
+        ) = candidate
+        return (storage.checkpoint_bytes, peak, total, steps, nodes, hashes)
+
+    def dominates(a: tuple, b: tuple) -> bool:
+        a_costs = costs(a)
+        b_costs = costs(b)
+        return all(a_cost <= b_cost for a_cost, b_cost in zip(a_costs, b_costs)) and any(
+            a_cost < b_cost for a_cost, b_cost in zip(a_costs, b_costs)
+        )
+
+    non_dominated = [
+        candidate
+        for candidate in candidates
+        if not any(dominates(other, candidate) for other in candidates)
+    ]
+
+    unique: list[tuple] = []
+    seen: set[MerkleModeCost] = set()
+    for candidate in non_dominated:
+        storage, modes, sizes, total, _steps, _peak, nodes, _hashes, verify = candidate
+        mode_cost = MerkleModeCost(
+            plan=MerkleTransportWorkloadProfile(
+                config=storage, modes=modes, sizes=sizes, total=total
+            ),
+            cost=verify,
+            nodes=nodes,
+        )
+        if mode_cost not in seen:
+            seen.add(mode_cost)
+            unique.append(candidate)
+
+    unique.sort(
+        key=lambda candidate: (
+            candidate[4],
+            candidate[7],
+            candidate[3],
+            candidate[5],
+            candidate[6],
+            candidate[0].checkpoint_bytes,
+            candidate[0].leaf_count,
+            candidate[0].w,
+            candidate[0].height,
+            candidate[1],
+        )
+    )
+    return tuple(
+        MerkleModeCost(
+            plan=MerkleTransportWorkloadProfile(
+                config=storage, modes=modes, sizes=sizes, total=total
+            ),
+            cost=verify,
+            nodes=nodes,
+        )
+        for storage, modes, sizes, total, _steps, _peak, nodes, _hashes, verify in unique
+    )

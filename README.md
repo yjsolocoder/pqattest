@@ -513,6 +513,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `merkle_verify_profile(w, height, indices)` — 纯函数：比较同一叶集合的批次证明与多证明**验签哈希成本**，返回 `MerkleVerifyProfile`，不生成密钥、不取随机数、不修改状态。`w` 仅为 4 或 8，`height` 仅为 1..8 的非布尔整数；`indices` 须为非空、严格递增且落在 `0 .. 2**height-1` 内的非布尔整数元组。令 `k = len(indices)`：`wots` 链步上界为 `k*67*15`（`w=4`）或 `k*34*255`（`w=8`），`leaf = k`，这些 SHA-256 次数均按每叶计算，不因认证路径去重而减少；`batch = k*height`（每份证明重复完整路径），`multi = Σ(l=1..height)|{i>>l : i∈indices}|`（每层每个不同父节点仅执行一次内部节点 SHA-256）。`indices` 容器或非整数成员错型抛 `TypeError`；空元组、布尔成员、越界、重复或乱序，以及非法 `w` 或 `height` 均抛 `ValueError`
 - `MerkleVerifyWorkloadProfile` — 冻结的多组验签哈希成本汇总值对象，四个字段按位置依次为 `w, height, costs, total`，类型依次为 `int`、`int`、五元组元组 `tuple[tuple[str,int,int,int,int], ...]`、`int`；冻结、可位置构造、按值相等（可哈希）。`costs` 与输入各组同序，每项依次为模式名（`"batch"` 或 `"multiproof"`）、该组 W-OTS 链步、叶哈希数、内部节点哈希数及该组三项哈希总数；`total` 为各组总数之和，重复组分别计费
 - `merkle_verify_workload_profile(w, height, groups, modes)` — 纯函数：把 `merkle_verify_profile` 的成本比较推广到**多个独立叶索引组**，每组各自携带一份批次证明或多证明但共用同一棵 Merkle 树，按组比较 batch 与 multiproof 混合方案的 SHA-256 工作量并给出全局合计，返回 `MerkleVerifyWorkloadProfile`，不生成密钥、不取随机数、不修改状态，旧接口与线格式不变。`w` 仅为 4 或 8，`height` 仅为 1..8 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增且落在 `0 .. 2**height-1` 内的非布尔整数元组（各组沿用 `merkle_verify_profile` 的单组规则）；`modes` 为与 `groups` 等长的元组，每项仅为 `"batch"` 或 `"multiproof"`。每组复用 `merkle_verify_profile(w, height, group)`：模式 `batch` 取其 `batch`、`multiproof` 取其 `multi` 作为内部节点哈希数；五元组依次为模式名、W-OTS 链步、叶哈希、内部节点哈希、该组三项哈希总数，`total` 为各组总数之和，重复组也分别计费。`groups`/`modes`（含成员组本身）容器错型或模式成员非字符串抛 `TypeError`；`groups` 为空、单组违反单组规则（空元组、布尔或非整数成员、越界、重复或乱序）、`modes` 长度与 `groups` 不符、出现未知模式，以及非法 `w` 或 `height` 均抛 `ValueError`
+- `MerkleModeCost` — 冻结的模式选择与验签哈希成本配对值对象，三个字段按位置依次为 `plan, cost, nodes`，类型依次为 `MerkleTransportWorkloadProfile`、`MerkleVerifyWorkloadProfile`、`int`：传输方案（配置、逐组模式、逐组尺寸、总量）、同参数的验签 SHA-256 工作量及仅累计 multiproof 组的规范节点总数（batch 组计 0）；冻结、可位置构造、按值相等（可哈希）
+- `merkle_verify_mode_frontier(capacity, groups, budgets)` — 与 `merkle_mode_frontier` 同一工作负载与逐组模式枚举，但在五项传输/链步预算之外**再加一项验签 SHA-256 总量预算**，返回全部可行且非支配的选择，类型为 `tuple[MerkleModeCost, ...]`，不改变旧接口与任何线格式。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity`、`groups` 完全沿用 `merkle_mode_frontier` 的类型、范围与异常规则；`budgets` 必须为**六元组**，预算成员规则（各项为 `None` 或正的非布尔整数、至少一项非空、含边界、非元组抛 `TypeError`、长度或成员非法抛 `ValueError`）也沿用之，按顺序分别限制检查点字节、单组峰值、总传输字节、单签验签步数、multiproof 节点总数及**验签 SHA-256 总数**（`MerkleVerifyWorkloadProfile.total`）。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 与各组最大索引的全部候选，以及每组两种模式的全部 `2**len(groups)` 组合；`plan` 按现有公式保存配置、模式、逐组尺寸与总量，`cost` 取同参数 `merkle_verify_workload_profile(w, height, groups, modes)` 的结果，`nodes` 仅累计 multiproof 组的规范节点。支配判定：A 在六项成本（检查点、单组峰值、总量、单签步数、节点总数、验签哈希总数）上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按单签步数、验签哈希总量、总传输字节、单组峰值、节点总数、检查点字节、叶数、`w`、`height`、`modes` 字典序稳定升序排列；无可行项抛 `ValueError`
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -531,6 +533,8 @@ from pqattest import (
     recommend_merkle_mode_deployment,
     merkle_verify_profile,
     merkle_verify_workload_profile,
+    MerkleModeCost,
+    merkle_verify_mode_frontier,
 )
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
@@ -619,6 +623,16 @@ merkle_verify_workload_profile(
 #            ("multiproof", 3*67*15, 3, 5, 3*67*15 + 3 + 5),
 #            ("multiproof", 67*15, 1, 3, 67*15 + 1 + 3)),
 #     total=各组三项哈希总数之和)
+
+# 模式 + 验签哈希联合前沿：逐组枚举全部 batch/multiproof 组合，预算顺序为
+# (检查点, 单组峰值, 总传输, 单签步数, multiproof 节点总数, 验签 SHA-256 总数)；
+# 每项为 MerkleModeCost(plan, cost, nodes)，按步数、验签总量、传输总量、峰值、
+# 节点、检查点、叶数、w、height、modes 字典序升序；无可行项时抛 ValueError
+merkle_verify_mode_frontier(
+    16, ((0, 1), (3, 5)), (None, 5000, 12000, None, 8, None)
+)
+# (MerkleModeCost(plan=MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...),
+#                 cost=MerkleVerifyWorkloadProfile(...), nodes=...), ...)
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

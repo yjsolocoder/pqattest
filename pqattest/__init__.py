@@ -24,6 +24,7 @@ merkle_transport_deployment_frontier /
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
 merkle_transport_workload_frontier / merkle_mode_frontier /
 recommend_merkle_mode_deployment, MerkleVerifyProfile / merkle_verify_profile,
+MerkleVerifyWorkloadProfile / merkle_verify_workload_profile,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -119,6 +120,7 @@ from .params import (
     MerkleTransportDeploymentProfile,
     MerkleTransportWorkloadProfile,
     MerkleVerifyProfile,
+    MerkleVerifyWorkloadProfile,
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
@@ -126,6 +128,7 @@ from .params import (
     merkle_transport_workload_frontier,
     merkle_mode_frontier,
     merkle_verify_profile,
+    merkle_verify_workload_profile,
     profile,
     recommend,
     recommend_merkle_deployment,
@@ -168,6 +171,7 @@ __all__ = [
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
     "MerkleVerifyProfile",
+    "MerkleVerifyWorkloadProfile",
     "OneTimeSigner",
     "Params",
     "PrivateKey",
@@ -197,6 +201,7 @@ __all__ = [
     "merkle_transport_workload_frontier",
     "merkle_mode_frontier",
     "merkle_verify_profile",
+    "merkle_verify_workload_profile",
     "message_bits",
     "message_digest",
     "multiproof_encode",

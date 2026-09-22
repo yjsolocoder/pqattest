@@ -29,7 +29,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ._errors import KeyExhaustedError
-from .auth import _validate_generation, _validate_key, auth_state_wrap
+from .auth import (
+    _validate_generation,
+    _validate_key,
+    auth_state_unwrap,
+    auth_state_wrap,
+)
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -765,6 +770,47 @@ class MerkleSigner:
         if signer._public_key.root != root:
             raise ValueError("Merkle root rebuilt from the private keys does not match")
         return signer
+
+    @classmethod
+    def from_auth_state(
+        cls, data: Any, *, key: Any, min_generation: Any = None
+    ) -> tuple["MerkleSigner", int]:
+        """Restore a signer from a v2 :func:`auth_state_wrap` envelope.
+
+        Combines v2 verification, the generation floor and the v1 checkpoint
+        restore in one call without drawing randomness. Only an envelope
+        produced by :func:`auth_state_wrap` is accepted — no new format is
+        introduced — and ``key``/``min_generation`` are keyword-only. Returns
+        ``(signer, generation)``: the restored :class:`MerkleSigner` and the
+        non-negative uint64 generation carried in the envelope. The restored
+        signer has the same public key, ``next_index`` and exhaustion
+        semantics as :meth:`from_checkpoint` would give for the embedded
+        checkpoint; the floor is not stored in the envelope and remains the
+        caller's responsibility in trusted storage.
+
+        ``data`` must be ``bytes`` or ``bytearray``; ``key`` must be a
+        non-empty ``bytes``/``bytearray`` shared secret; ``min_generation``
+        must be ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``. A
+        wrong type (including a boolean floor) raises ``TypeError``. The v2
+        HMAC tag is verified first with :func:`hmac.compare_digest`, the
+        envelope scheme is then fixed to ``"merkle"`` and the generation
+        floor applied, and only afterwards is the untouched payload handed to
+        :meth:`from_checkpoint`; an empty key, a bad tag or envelope, a
+        non-merkle scheme (including a v1 envelope), a generation below the
+        floor, or an invalid checkpoint raises ``ValueError`` and no instance
+        is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data must be bytes or bytearray")
+        key_bytes = _validate_key(key)
+        if min_generation is not None:
+            _validate_generation(min_generation, "min_generation")
+        _, generation_value, checkpoint = auth_state_unwrap(
+            data, key=key_bytes, expect="merkle",
+            min_generation=min_generation,
+        )
+        signer = cls.from_checkpoint(checkpoint)
+        return signer, generation_value
 
     def advance_to(self, next_index: Any) -> tuple[int, int]:
         """Void leaves by advancing ``next_index`` to ``next_index``.

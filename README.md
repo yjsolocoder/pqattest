@@ -152,6 +152,7 @@ Merkle 聚合（有限次签名）：
 - `MerkleSigner.advance_to_with_auth_state(next_index, *, key, generation) -> ((int, int), bytes)` — 在一次原子调用内完成作废与认证封装：返回 `((before, after), envelope)`，内层二元组与同目标下 `advance_to` 的返回相同，`envelope` 为对推进后 v1 `checkpoint()` 逐字节相同的检查点调用 `auth_state_wrap(scheme="merkle", key=key, generation=generation)` 得到的 v2 封装（既有字段顺序与 HMAC-SHA-256 标签）。等值目标成功且状态不变时仍返回认证该状态的封装。`next_index` 须为非布尔整数且在 `[当前 next_index, public_key.leaf_count]` 闭区间；`key` 须为非空 `bytes`/`bytearray`，`generation` 须为 `0..2**64-1` 的非布尔整数（均仅限关键字）。全部参数在推进前验证：类型错抛 `TypeError`，空 key、代次越界、倒退或超出叶总数抛 `ValueError`，失败不改状态且无部分返回。推进、快照与封装在与所有其他状态操作共用的锁内一次线性化完成，全程不取随机数、不改变公私钥；封装仅认证不加密，本身不防重放/回滚
 - `MerkleSigner.checkpoint()` — 把完整签名状态（含**全部私钥**）序列化为 `bytes`；与 `sign`/`advance_to` 共用同一把锁，并发快照只会落在某次操作之前或之后，不会落在操作中途
 - `MerkleSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；公钥与原签名器相同，下一次 `sign` 从保存的 `next_index` 继续，用尽状态恢复后仍抛 `KeyExhaustedError`。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、长度、`w`、树高、`next_index` 越界（允许 `0 <= next_index <= 2**height`）、元素数量、校验值非法，或由私钥重建的 Merkle 根不符，均抛 `ValueError` 且不返回实例
+- `MerkleSigner.from_auth_state(data, *, key, min_generation=None) -> (signer, generation)` — 认证恢复入口：把 v2 验签、代次下限与 v1 检查点恢复合并为一次调用，全程不取随机数、不新增格式，仅接受既定 `auth_state_wrap` v2 封装。`key` 与 `min_generation` 仅限关键字；`data` 为封装字节，`key` 为非空 `bytes`/`bytearray`，`min_generation` 为 `None` 或 `0..2**64-1` 的非布尔整数（下限仍由外部可信存储维护，封装不携带）。返回的 `signer` 公钥、索引及用尽语义与把封装载荷交给 `from_checkpoint` 完全一致，`generation` 为封装内的非负整数。字段顺序、HMAC-SHA-256 标签与 v2 封装格式逐字节不变；恢复时**先按现有 v2 规则用 `hmac.compare_digest` 验证 HMAC**，再固定要求方案为 `merkle` 并检查代次下限，**最后**才把原样载荷交给 `from_checkpoint`，仅全部成功后构造实例。`data`/`key` 非 `bytes`/`bytearray`、下限非整数或为布尔抛 `TypeError`；空密钥、越界参数、HMAC/魔数/版本/方案非法（v1 或其他方案封装同样拒绝）、代次低于下限或检查点非法一律抛 `ValueError` 且不返回实例
 - `merkle_verify(message, signature, public_key)` — 由签名恢复 W-OTS 公钥、算出叶哈希，再按 `index` 的各位把认证路径逐层折回根并比对；公钥类型错误抛 `TypeError`，其余畸形、越界或不匹配一律返回 `False`（包括绕过冻结构造器造成的字段缺失、类型/范围错误或元素、路径畸形）
 - `MerkleProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `MerklePublicKey` 与 `MerkleSignature`（字段类型错误抛 `TypeError`，签名参数/计数与公钥不一致抛 `ValueError`）；把一把公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密
 - `MerkleProof.to_bytes()` / `MerkleProof.from_bytes(data)` — 证明包的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束签名；魔数、版本、长度越界或与内容不符、截断、尾随数据、嵌套编码非法或公钥与签名交叉不一致均抛 `ValueError`，不返回半有效对象
@@ -300,7 +301,13 @@ scheme, generation, checkpoint = auth_state_unwrap(
 assert scheme == "merkle" and generation == 7
 restored = MerkleSigner.from_checkpoint(checkpoint)
 
+# 等价的一步认证恢复：v2 验签 + merkle 方案 + 代次下限 + v1 检查点恢复
+restored, generation = MerkleSigner.from_auth_state(
+    blob, key=b"shared-secret", min_generation=7
+)
+
 auth_state_unwrap(blob, key=b"shared-secret", min_generation=8)  # ValueError：回滚
+MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # 同上
 ```
 
 **代次安全边界**：下限 `min_generation` **不由封装携带**，必须保存在调用方的外部可信存储中（随每次接受的新一代次原子推进），并与封装/检查点分开保管。代次只对「检查点回滚、但可信下限没有一并回退」的情形有效：攻击者若能把检查点和可信下限**一起**回滚，或者在**同一代次内**重放一份合法封装，HMAC 依然有效、无从检测。与 v1 相同，v2 封装**不加密**，载荷是明文，也不防复制；须把封装连同明文检查点一起当秘密保管。

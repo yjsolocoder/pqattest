@@ -27,8 +27,14 @@ ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
 in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; a v2
 envelope with auth_state_wrap / auth_state_unwrap additionally binds a
 uint64 generation so an externally tracked floor can detect rollback.
-Both envelopes authenticate but do not encrypt and give no replay
-protection on their own.
+The Lamport and W-OTS one-time signers add from_auth_state classmethods
+that verify a v2 envelope, restore the checkpoint and make one external
+monotonic claim callback ("lamport"/"wots", generation) only after the
+restore succeeds and only when the callback returns exactly True;
+restore_ots_pair restores same-generation lamport and wots envelopes
+together and claims both in one paired callback so a side can never be
+claimed alone. Both envelopes authenticate but do not encrypt and give
+no replay protection on their own.
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ from typing import Any, Callable, Sequence
 
 from ._errors import KeyExhaustedError
 from .auth import (
+    _run_claim,
+    _validate_claim,
     _validate_generation,
     _validate_key,
     auth_state_unwrap,
@@ -144,6 +152,7 @@ __all__ = [
     "recommend_merkle_transport_deployment",
     "recommend_merkle_transport_workload",
     "recommend_merkle_mode_deployment",
+    "restore_ots_pair",
     "sign",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
@@ -399,7 +408,10 @@ class OneTimeSigner:
     :meth:`checkpoint` and restored in another process with
     :meth:`from_checkpoint`; the checkpoint contains the private key in the
     clear and is protected only by a SHA-256 checksum against accidental
-    corruption, so callers must store it securely.
+    corruption, so callers must store it securely. :meth:`from_auth_state`
+    restores from a keyed v2 :func:`auth_state_wrap` envelope instead,
+    verifying the tag, fixing the scheme to lamport, applying the generation
+    floor and driving the caller's external monotonic claim in one call.
     """
 
     __slots__ = ("_lock", "_private_key", "_public_key", "_used")
@@ -570,6 +582,54 @@ class OneTimeSigner:
         signer._restore_state(private_key, public_key_from(private_key), bool(used_byte))
         return signer
 
+    @classmethod
+    def from_auth_state(
+        cls, data: Any, *, key: Any, min_generation: Any = None, claim: Any
+    ) -> tuple["OneTimeSigner", int]:
+        """Restore a signer from a v2 :func:`auth_state_wrap` envelope and claim it.
+
+        Combines v2 verification, the generation floor, the v1 checkpoint
+        restore and an external monotonic claim in one call without drawing
+        randomness and without any new wire format: only an envelope produced
+        by :func:`auth_state_wrap` with ``scheme="lamport"`` is accepted.
+        ``key``, ``min_generation`` and ``claim`` are keyword-only. Returns
+        ``(signer, generation)``: the restored :class:`OneTimeSigner` and the
+        non-negative uint64 generation carried in the envelope; the restored
+        signer has the same public key and ``used`` semantics as
+        :meth:`from_checkpoint` would give for the embedded checkpoint.
+
+        ``data`` must be ``bytes`` or ``bytearray``; ``key`` must be a
+        non-empty ``bytes``/``bytearray`` shared secret; ``min_generation``
+        must be ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``;
+        ``claim`` must be callable. A wrong type (including a boolean floor or
+        a non-callable claim) raises ``TypeError``. The v2 HMAC tag is
+        verified first with :func:`hmac.compare_digest`; the envelope scheme
+        is then fixed to ``"lamport"`` and the generation floor applied; only
+        afterwards is the untouched payload handed to
+        :meth:`from_checkpoint`. Only once every check has passed and the
+        signer is restored is ``claim`` called exactly once with the single
+        token ``("lamport", generation)``; the restore succeeds only when that
+        call returns exactly ``True`` (a truthy non-bool such as ``1`` is
+        rejected), and anything it raises propagates unchanged. An empty key,
+        a bad tag or envelope, a non-lamport scheme (including a v1
+        envelope), a generation below the floor, an invalid checkpoint or a
+        claim that is not exactly ``True`` raises ``ValueError`` and leaves no
+        instance behind; on every such failure ``claim`` is never called.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data must be bytes or bytearray")
+        key_bytes = _validate_key(key)
+        if min_generation is not None:
+            _validate_generation(min_generation, "min_generation")
+        _validate_claim(claim)
+        _, generation_value, checkpoint = auth_state_unwrap(
+            data, key=key_bytes, expect="lamport",
+            min_generation=min_generation,
+        )
+        signer = cls.from_checkpoint(checkpoint)
+        _run_claim(claim, ("lamport", generation_value))
+        return signer, generation_value
+
 
 def lamport_signature_to_bytes(signature: Any, *, bits: int) -> bytes:
     """Serialise a stateless Lamport signature to the versioned v1 wire format.
@@ -612,3 +672,71 @@ def lamport_signature_from_bytes(data: Any) -> tuple[int, tuple[bytes, ...]]:
     ``bytes`` in their original order, ready for :func:`verify`.
     """
     return _decode_v1(data, _SIGNATURE_MAGIC, "signature", is_key=False)
+
+
+def restore_ots_pair(
+    a: Any, b: Any, *, key: Any, floor: Any = None, claim: Any
+) -> tuple[tuple["OneTimeSigner", "WOTSOneTimeSigner"], int]:
+    """Restore a same-generation Lamport/W-OTS signer pair and claim both.
+
+    ``a`` must be a v2 :func:`auth_state_wrap` envelope carrying a
+    ``"lamport"`` signer checkpoint and ``b`` one carrying a ``"wots"``
+    signer checkpoint; the two must authenticate under the same ``key`` and
+    carry the same generation. ``key``, ``floor`` and ``claim`` are
+    keyword-only. On success returns ``((lamport_signer, wots_signer),
+    generation)``: a restored :class:`OneTimeSigner`, a restored
+    :class:`WOTSOneTimeSigner` and their common non-negative uint64
+    generation. Both signers restore exactly as their
+    :meth:`OneTimeSigner.from_checkpoint` /
+    :meth:`WOTSOneTimeSigner.from_checkpoint` classmethods would give for the
+    embedded checkpoints; no randomness is drawn and no wire format, random
+    value or in-library state is introduced.
+
+    ``a`` and ``b`` must each be ``bytes`` or ``bytearray``; ``key`` must be
+    a non-empty ``bytes``/``bytearray`` shared secret; ``floor`` must be
+    ``None`` or a non-boolean integer in ``0 .. 2**64 - 1`` and is applied to
+    both envelopes; ``claim`` must be callable. A wrong type (including a
+    boolean floor, a non-callable claim or a wrong-slot envelope such as a
+    wots blob in ``a``) raises ``TypeError`` where an argument has the wrong
+    type and ``ValueError`` otherwise. Each envelope follows the existing v2
+    rules: its HMAC is verified first with :func:`hmac.compare_digest` before
+    any field is trusted, then the fixed scheme (``a`` lamport, ``b`` wots),
+    the payload magic and the floor are checked, and only afterwards is the
+    checkpoint restored; the two generations must be equal. Only once both
+    envelopes authenticate, both checkpoints restore and the generations
+    match is ``claim`` called exactly once with the paired token
+    ``(("lamport", generation), ("wots", generation))``; the restore
+    succeeds only when that call returns exactly ``True`` (a truthy non-bool
+    such as ``1`` is rejected), so a single side can never be claimed alone,
+    and anything the callback raises propagates unchanged. An empty key, a
+    bad tag or envelope, a wrong or swapped scheme (including a v1
+    envelope), a generation below the floor, differing generations, an
+    invalid checkpoint or a claim that is not exactly ``True`` raises
+    ``ValueError`` with no signers returned; on every such failure
+    ``claim`` is never called.
+    """
+    for label, envelope in (("a", a), ("b", b)):
+        if not isinstance(envelope, (bytes, bytearray)):
+            raise TypeError(f"{label} must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if floor is not None:
+        _validate_generation(floor, "floor")
+    _validate_claim(claim)
+    _, generation_a, checkpoint_a = auth_state_unwrap(
+        a, key=key_bytes, expect="lamport", min_generation=floor
+    )
+    _, generation_b, checkpoint_b = auth_state_unwrap(
+        b, key=key_bytes, expect="wots", min_generation=floor
+    )
+    if generation_a != generation_b:
+        raise ValueError(
+            f"lamport generation {generation_a} does not match wots generation {generation_b}"
+        )
+    lamport_signer = OneTimeSigner.from_checkpoint(checkpoint_a)
+    wots_signer = WOTSOneTimeSigner.from_checkpoint(checkpoint_b)
+    generation = generation_a
+    _run_claim(
+        claim,
+        (("lamport", generation), ("wots", generation)),
+    )
+    return (lamport_signer, wots_signer), generation

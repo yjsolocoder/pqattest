@@ -94,6 +94,24 @@ def _validate_expect(expect: Any) -> None:
         raise ValueError(f"unknown expected scheme: {expect!r}")
 
 
+def _validate_claim(claim: Any) -> None:
+    """Check that the external monotonic-claim callback is callable."""
+    if not callable(claim):
+        raise TypeError("claim must be callable")
+
+
+def _run_claim(claim: Any, token: Any) -> None:
+    """Invoke an external claim once and accept only an exact ``True``.
+
+    The token has already been authenticated and the checkpoint restored by
+    the time this runs. Any exception raised by ``claim`` propagates
+    unchanged; a return value other than the singleton ``True`` (including
+    ``1`` or a truthy non-bool) raises ``ValueError``.
+    """
+    if claim(token) is not True:
+        raise ValueError("claim callback did not return True")
+
+
 def _check_payload_magic(payload: bytes, payload_magic: bytes, scheme: str) -> None:
     if len(payload) < len(payload_magic) or payload[: len(payload_magic)] != payload_magic:
         raise ValueError("payload magic does not match the envelope scheme")

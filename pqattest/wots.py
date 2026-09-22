@@ -13,7 +13,11 @@ private-key encoding contains the secret in the clear, so callers must store
 it securely. :class:`WOTSOneTimeSigner` state can be persisted with a
 versioned binary checkpoint (``checkpoint`` / ``from_checkpoint``); the blob
 holds the private key in the clear and is integrity-protected only by a
-SHA-256 checksum, so callers must store it securely.
+SHA-256 checksum, so callers must store it securely. A keyed v2
+``auth_state_wrap`` envelope can be restored in one authenticated step with
+:meth:`WOTSOneTimeSigner.from_auth_state`, which also drives an external
+monotonic claim; :func:`pqattest.restore_ots_pair` restores a same-generation
+Lamport/W-OTS pair with a single paired claim.
 """
 
 from __future__ import annotations
@@ -25,7 +29,14 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 from ._errors import KeyExhaustedError
-from .auth import _validate_generation, _validate_key, auth_state_wrap
+from .auth import (
+    _run_claim,
+    _validate_claim,
+    _validate_generation,
+    _validate_key,
+    auth_state_unwrap,
+    auth_state_wrap,
+)
 
 __all__ = [
     "ELEMENT_BYTES",
@@ -280,7 +291,10 @@ class WOTSOneTimeSigner:
     responsibility. State can be persisted with :meth:`checkpoint` and
     restored in another process with :meth:`from_checkpoint`; the checkpoint
     contains the private key in the clear and is protected only by a SHA-256
-    checksum against accidental corruption, so callers must store it securely.
+    checksum against accidental corruption, so callers must store it
+    securely. :meth:`from_auth_state` restores from a keyed v2
+    :func:`auth_state_wrap` envelope instead, applying the generation floor
+    and driving the caller's external monotonic claim in one call.
     """
 
     __slots__ = ("_lock", "_private_key", "_public_key", "_used")
@@ -467,6 +481,54 @@ class WOTSOneTimeSigner:
             private_key, cls._public_key_from(private_key), bool(used_byte)
         )
         return signer
+
+    @classmethod
+    def from_auth_state(
+        cls, data: Any, *, key: Any, min_generation: Any = None, claim: Any
+    ) -> tuple["WOTSOneTimeSigner", int]:
+        """Restore a signer from a v2 :func:`auth_state_wrap` envelope and claim it.
+
+        Combines v2 verification, the generation floor, the v1 checkpoint
+        restore and an external monotonic claim in one call without drawing
+        randomness and without any new wire format: only an envelope produced
+        by :func:`auth_state_wrap` with ``scheme="wots"`` is accepted.
+        ``key``, ``min_generation`` and ``claim`` are keyword-only. Returns
+        ``(signer, generation)``: the restored :class:`WOTSOneTimeSigner` and
+        the non-negative uint64 generation carried in the envelope; the
+        restored signer has the same public key and ``used`` semantics as
+        :meth:`from_checkpoint` would give for the embedded checkpoint.
+
+        ``data`` must be ``bytes`` or ``bytearray``; ``key`` must be a
+        non-empty ``bytes``/``bytearray`` shared secret; ``min_generation``
+        must be ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``;
+        ``claim`` must be callable. A wrong type (including a boolean floor or
+        a non-callable claim) raises ``TypeError``. The v2 HMAC tag is
+        verified first with :func:`hmac.compare_digest`; the envelope scheme
+        is then fixed to ``"wots"`` and the generation floor applied; only
+        afterwards is the untouched payload handed to
+        :meth:`from_checkpoint`. Only once every check has passed and the
+        signer is restored is ``claim`` called exactly once with the single
+        token ``("wots", generation)``; the restore succeeds only when that
+        call returns exactly ``True`` (a truthy non-bool such as ``1`` is
+        rejected), and anything it raises propagates unchanged. An empty key,
+        a bad tag or envelope, a non-wots scheme (including a v1 envelope), a
+        generation below the floor, an invalid checkpoint or a claim that is
+        not exactly ``True`` raises ``ValueError`` and leaves no instance
+        behind; on every such failure ``claim`` is never called.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data must be bytes or bytearray")
+        key_bytes = _validate_key(key)
+        if min_generation is not None:
+            _validate_generation(min_generation, "min_generation")
+        _validate_claim(claim)
+        _, generation_value, checkpoint = auth_state_unwrap(
+            data, key=key_bytes, expect="wots",
+            min_generation=min_generation,
+        )
+        signer = cls.from_checkpoint(checkpoint)
+        _run_claim(claim, ("wots", generation_value))
+        return signer, generation_value
 
 
 def wots_keygen(

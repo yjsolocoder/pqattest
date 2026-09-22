@@ -98,6 +98,7 @@ Lamport：
 - `OneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `sign(message, private_key)` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `OneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
 - `OneTimeSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；按既有 Lamport 规则原序重建私钥及公钥，公钥与原实例相等，`used` 状态也一致（未用恢复后仍只允许一签，已用恢复后任何 `sign` 都抛 `KeyExhaustedError`）。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；坏魔数、未知版本、`used` 非 0/1、私钥长度字段不符、嵌套私钥编码非法、截断、尾随数据或校验值不符，均抛 `ValueError` 且不返回实例
+- `OneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim) -> (signer, generation)` — 带**外部单调认领**的认证恢复：在一次调用内完成 v2 验签、方案固定（必须是 `lamport`）、代次下限核对、v1 检查点恢复与外部认领，全程不取随机数、不新增线格式/随机数/库内状态，仅接受既定 `auth_state_wrap` v2 封装。`key`、`min_generation`、`claim` 仅限关键字；`data` 为封装字节（`bytes`/`bytearray`），`key` 为非空 `bytes`/`bytearray`，`min_generation` 为 `None` 或 `0..2**64-1` 的非布尔整数，`claim` 必须可调用。恢复时**先用 `hmac.compare_digest` 验证 HMAC**，再核对固定方案、载荷魔数与代次下限，**最后**恢复检查点；仅全部成功后才调用 `claim(("lamport", generation))` **恰好一次**且返回值必须**恰为 `True`**（`1` 等真值非 `True` 一律拒绝），然后返回 `(signer, generation)`。任何验证失败都不调用 `claim`；回调抛出的异常原样透传。`data`/`key` 类型错、`claim` 不可调用、下限类型错（含布尔）抛 `TypeError`；空 key、下限越界、HMAC/魔数/版本/方案非法（v1 或其他方案封装拒绝）、代次低于下限、检查点非法或认领未恰为 `True` 抛 `ValueError`
 - `KeyExhaustedError` — 已用签名器再次签名时抛出（继承 `RuntimeError`）
 
 ```python
@@ -137,6 +138,7 @@ Winternitz（W-OTS）：
 - `WOTSOneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `wots_sign` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `WOTSOneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
 - `WOTSOneTimeSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；按既有 W-OTS 规则原序重建私钥及公钥，公钥与原实例相等，`used` 状态也一致（未用恢复后仍只允许一签，已用恢复后任何 `sign` 都抛 `KeyExhaustedError`）。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、`w`、`used`（仅 0/1）、元素计数（须严格等于 `w` 对应的链数）、长度、截断、尾随数据或校验值非法，均抛 `ValueError` 且不返回实例
+- `WOTSOneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim) -> (signer, generation)` — 带**外部单调认领**的认证恢复：在一次调用内完成 v2 验签、方案固定（必须是 `wots`）、代次下限核对、v1 检查点恢复与外部认领，全程不取随机数、不新增线格式/随机数/库内状态，仅接受既定 `auth_state_wrap` v2 封装。参数与异常规则与 `OneTimeSigner.from_auth_state` 完全一致，区别仅在于封装方案必须为 `wots`、成功后调用 `claim(("wots", generation))` 恰好一次且返回值必须恰为 `True`；任何验证失败都不调用 `claim`，回调异常原样透传
 
 构造细节（域串 `b"pqattest/wots/v1"`）：令 `B = 2**w`，SHA-256 摘要按大端拆成 `256/w` 个基 `B` 数字；校验和为 `sum(B-1-d)`，取满足 `B**l2 > (256/w)*(B-1)` 的最小 `l2`（w=4 时 l2=3，w=8 时 l2=2），并编码为固定 `l2` 位的大端基 `B` 数字（保留前导零）。每条链始于一个随机值，链步为 `H(x) = SHA256(b"pqattest/wots/v1" + x)`；签名依次给出消息数字与校验和数字对应的第 `d` 步值（w=4 共 67 个元素、2144 字节；w=8 共 34 个元素、1088 字节），公钥保存第 `B-1` 步端点；验证时补足剩余步数并逐条比对端点。无效 `w`、令牌长度错误或元素数量/长度错误抛 `ValueError`。
 
@@ -311,6 +313,48 @@ MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # �
 ```
 
 **代次安全边界**：下限 `min_generation` **不由封装携带**，必须保存在调用方的外部可信存储中（随每次接受的新一代次原子推进），并与封装/检查点分开保管。代次只对「检查点回滚、但可信下限没有一并回退」的情形有效：攻击者若能把检查点和可信下限**一起**回滚，或者在**同一代次内**重放一份合法封装，HMAC 依然有效、无从检测。与 v1 相同，v2 封装**不加密**，载荷是明文，也不防复制；须把封装连同明文检查点一起当秘密保管。
+
+#### 外部单调认领的认证恢复
+
+`auth_state_unwrap` 只验证封装；接受一个封装通常还要在外部单调存储里**认领（claim）**新一代次，而 Lamport 与 W-OTS 是两把一次性签名器，恢复时必须同代成对认领，避免只推进了一侧。为此两个一次性签名器各提供一个类方法，并另有一个成对恢复入口：
+
+- `OneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim)` / `WOTSOneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim)` — 返回 `(signer, generation)`；除既有 v2 验签、固定方案（`lamport`/`wots`）、代次下限与 v1 检查点恢复外，仅在**全部检查通过、签名器已恢复之后**调用一次外部回调 `claim`：Lamport 传 `("lamport", generation)`，W-OTS 传 `("wots", generation)`。回调必须返回**恰为 `True`**（`1`、`"yes"` 等真值不算）才算认领成功；回调抛出的任何异常原样透传。任何验证失败都不会调用 `claim`，因此不会出现「认领了却没恢复」或「恢复了却没认领」。`data`/`key` 须为 `bytes`/`bytearray` 且 key 非空，`min_generation` 为 `None` 或非布尔 uint64，`claim` 须可调用（其余参数均仅限关键字）；类型错抛 `TypeError`，空 key、越界、坏封装/标签/方案/代次/检查点或认领未恰为 `True` 抛 `ValueError`
+- `restore_ots_pair(a, b, *, key, floor=None, claim)` — 成对恢复，返回 `((lamport_signer, wots_signer), generation)`：`a` 必须是 `lamport` 封装、`b` 必须是 `wots` 封装（槽位交换即拒绝），两者在同一 `key` 下通过 v2 验签、载荷魔数核对、`floor` 代次下限检查与 v1 检查点恢复后，**代次必须严格相等**。仅当两侧全部成功且同代时，才调用 `claim((("lamport", generation), ("wots", generation)))` **恰好一次**且返回值恰为 `True`；单侧失败、代次不同或任何检查不过都不调用 `claim`，回调异常原样透传。`a`/`b`/`key` 须为 `bytes`/`bytearray` 且 key 非空，`floor` 为 `None` 或非布尔 uint64（对两侧同时生效），`claim` 须可调用（均仅限关键字）；类型错抛 `TypeError`，其余拒绝（含槽位方案不符、v1 封装、坏标签、代次不等、低于下限、检查点非法、认领未恰为 `True`）抛 `ValueError`
+
+三个入口都沿用既有 `auth_state_wrap` v2 格式，**不新增线格式、随机数或库内状态**，恢复全程不取随机数；单调高水位仍完全由调用方的外部存储与 `claim` 回调负责。
+
+```python
+from pqattest import (
+    OneTimeSigner, WOTSOneTimeSigner, restore_ots_pair,
+    auth_state_wrap, keygen, wots_keygen,
+)
+
+key = b"shared-secret"
+lamport = OneTimeSigner(keygen()[0])
+wots = WOTSOneTimeSigner(wots_keygen()[0])
+generation = 7
+blob_l = auth_state_wrap(lamport.checkpoint(), scheme="lamport", key=key, generation=generation)
+blob_w = auth_state_wrap(wots.checkpoint(), scheme="wots", key=key, generation=generation)
+
+# 外部单调存储：只有代次严格推进时才认领成功
+state = {"high_water": 6}
+def claim(token):
+    # 单项: ("lamport", g) / ("wots", g)；成对: (("lamport", g), ("wots", g))
+    if isinstance(token[0], tuple):
+        gl, gw = token[0][1], token[1][1]
+        if gl != gw or gl <= state["high_water"]:
+            return False
+        state["high_water"] = gl
+    else:
+        if token[1] <= state["high_water"]:
+            return False
+        state["high_water"] = token[1]
+    return True
+
+(l, w), g = restore_ots_pair(blob_l, blob_w, key=key, floor=state["high_water"], claim=claim)
+assert g == 7 and isinstance(l, OneTimeSigner) and isinstance(w, WOTSOneTimeSigner)
+restore_ots_pair(blob_l, blob_w, key=key, claim=claim)  # ValueError：同代重放，claim 不再恰为 True
+```
 
 
 

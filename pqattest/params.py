@@ -25,8 +25,10 @@ business preference — ``"compact"``, ``"nodes"`` or ``"speed"`` — and
 returns one profile.
 :func:`merkle_deployment_frontier` likewise returns the whole Pareto frontier
 of ordinary Merkle deployments under checkpoint, signature, proof and
-verifier-step budgets. All twelve are pure functions: no randomness, no
-state, no I/O, no keys are generated.
+verifier-step budgets. :func:`merkle_verify_profile` finally counts the
+verifier SHA-256 invocations a batch proof and a multi-proof cost over the
+same leaf set, without generating any keys. All thirteen are pure
+functions: no randomness, no state, no I/O, no keys are generated.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ __all__ = [
     "MerkleStorageProfile",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
+    "MerkleVerifyProfile",
     "profile",
     "recommend",
     "recommend_merkle_deployment",
@@ -55,6 +58,7 @@ __all__ = [
     "recommend_merkle_mode_deployment",
     "merkle_storage_profile",
     "merkle_transport_profile",
+    "merkle_verify_profile",
 ]
 
 _SCHEMES = ("lamport", "wots", "merkle")
@@ -537,6 +541,99 @@ def merkle_transport_profile(
     batch_bytes = 58 + k * (4 + signature_wire_bytes)
     multiproof_bytes = 60 + k * (4 + ELEMENT_BYTES * n) + 35 * node_count
     return node_count, batch_bytes, multiproof_bytes
+
+
+@dataclass(frozen=True)
+class MerkleVerifyProfile:
+    """Frozen SHA-256 verification hash counts for one leaf set.
+
+    Fields, in positional order, all of them ``int``:
+
+    - ``w`` / ``height`` echo the validated tree parameters;
+    - ``k`` is the number of leaf indices, ``len(indices)``;
+    - ``wots`` is the upper bound on W-OTS hash-chain steps a verifier
+      performs across the whole set: ``k * 67 * 15`` for ``w=4`` and
+      ``k * 34 * 255`` for ``w=8`` — counted per leaf, never deduplicated
+      along shared authentication paths;
+    - ``leaf`` is the number of leaf hashes, one per leaf (``k``);
+    - ``batch`` is the number of inner-node hashes a batch proof costs:
+      each signature repeats its complete path, so ``k * height``;
+    - ``multi`` is the number of inner-node hashes a multi-proof costs:
+      at each level every distinct parent node is hashed exactly once,
+      i.e. ``sum(len({i >> l for i in indices}) for l in 1..height)``.
+
+    Every value counts SHA-256 invocations on the verifier side; no key
+    material or randomness is involved. Instances are frozen, support
+    positional construction and compare (and hash) by value.
+    """
+
+    w: int
+    height: int
+    k: int
+    wots: int
+    leaf: int
+    batch: int
+    multi: int
+
+
+def merkle_verify_profile(w: Any, height: Any, indices: Any) -> MerkleVerifyProfile:
+    """Return the frozen :class:`MerkleVerifyProfile` verification hash counts.
+
+    Compares the verifier SHA-256 cost of a batch proof and a multi-proof
+    over the same leaf set. ``w`` must be 4 or 8 and ``height`` a
+    non-boolean integer from 1 to 8; ``indices`` must be a non-empty tuple
+    of strictly increasing, non-boolean integers, each in
+    ``0 .. 2 ** height - 1``.
+
+    With ``k = len(indices)`` the fields are:
+
+    - ``wots``: the W-OTS chain-step upper bound ``k * 67 * 15`` (``w=4``)
+      or ``k * 34 * 255`` (``w=8``);
+    - ``leaf``: ``k`` leaf hashes;
+    - ``batch``: ``k * height`` inner-node hashes — a batch proof repeats
+      every signature's complete path;
+    - ``multi``: ``sum(len({i >> l for i in indices}) for l in 1..height)``
+      inner-node hashes — a multi-proof hashes each distinct parent at each
+      level exactly once.
+
+    The W-OTS and leaf counts are per leaf and are never reduced by path
+    deduplication. ``w``, ``height`` and ``k`` echo the validated
+    parameters; every field is an ``int``.
+
+    A non-tuple ``indices`` or a member that is not an ``int`` raises
+    ``TypeError``; an empty set, a boolean member, an out-of-range,
+    duplicate or descending index, or an illegal ``w`` or ``height`` raises
+    ``ValueError``. The estimate is pure: no keys are generated, no
+    randomness is drawn and no state is changed.
+    """
+    w = _validate_w(w)
+    height = _validate_height(height)
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of leaf indices")
+    if not indices:
+        raise ValueError("indices must not be empty")
+    if any(isinstance(index, bool) for index in indices):
+        raise ValueError("index members must not be booleans")
+    if any(not isinstance(index, int) for index in indices):
+        raise TypeError("every index must be an integer")
+    leaf_count = 1 << height
+    if any(index < 0 or index >= leaf_count for index in indices):
+        raise ValueError("every index must be within the tree's leaf range")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+
+    b, l1, l2 = _params(w)
+    n = l1 + l2
+    k = len(indices)
+    wots = k * n * (b - 1)
+    leaf = k
+    batch = k * height
+    multi = sum(
+        len({index >> level for index in indices}) for level in range(1, height + 1)
+    )
+    return MerkleVerifyProfile(
+        w=w, height=height, k=k, wots=wots, leaf=leaf, batch=batch, multi=multi
+    )
 
 
 @dataclass(frozen=True)

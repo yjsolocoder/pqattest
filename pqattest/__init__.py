@@ -19,6 +19,7 @@ optionally, an explicit leaf-index selection), static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
 merkle_deployment_frontier /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
+MerkleVerifyProfile / merkle_verify_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 merkle_transport_deployment_frontier /
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
@@ -117,9 +118,11 @@ from .params import (
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
     MerkleTransportWorkloadProfile,
+    MerkleVerifyProfile,
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
+    merkle_verify_profile,
     merkle_transport_deployment_frontier,
     merkle_transport_workload_frontier,
     merkle_mode_frontier,
@@ -164,6 +167,7 @@ __all__ = [
     "MerkleStorageProfile",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
+    "MerkleVerifyProfile",
     "OneTimeSigner",
     "Params",
     "PrivateKey",
@@ -189,6 +193,7 @@ __all__ = [
     "merkle_deployment_frontier",
     "merkle_storage_profile",
     "merkle_transport_profile",
+    "merkle_verify_profile",
     "merkle_transport_deployment_frontier",
     "merkle_transport_workload_frontier",
     "merkle_mode_frontier",

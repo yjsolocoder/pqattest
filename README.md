@@ -501,6 +501,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `MerkleStorageProfile` — 冻结的 Merkle 线长估算值对象，八个字段均为 `int` 且按位置依次为 `w, height, leaf_count, signature_wire_bytes, proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes`；冻结、可位置构造、按值相等（可哈希）
 - `merkle_storage_profile(w, height)` — 纯函数：返回 `(w, height)` 对应的 `MerkleStorageProfile`，不生成密钥、不取随机数。`w` 限 4/8，`height` 限 1 至 8 非布尔整数，非法抛 `ValueError`。令 `n = 67/34`（对应 `w = 4/8`）、`L = 2**height`、`S = 16 + 32*(n+height)`、`C = 81 + 32*L*n`：前四字段为 `w, height, L, S`，后四字段 `proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes` 依次为 `S+60, C, C+46, C+54`，分别对应 `MerkleProof` 线长、明文检查点、v1 封装、v2 封装
 - `merkle_transport_profile(w, height, indices)` — 纯函数：为同一叶集合估算批量证明与多证明线长，返回三元组 `(m, 58+k*(4+S), 60+k*(4+32*n)+35*m)`，分别为多证明携带的节点数 `m`、批量证明线长、多证明线长，其中 `k = len(indices)`，`m` 按既有多证明规范计入集合外兄弟并逐级右移去重。`indices` 必须为非空、严格递增的整数元组，成员均在 `0 .. 2**height-1`；容器或成员类型错抛 `TypeError`，空元组、布尔成员、越界或非严格递增抛 `ValueError`；`w`/`height` 非法同样抛 `ValueError`
+- `MerkleVerifyProfile` — 冻结的验签 SHA-256 次数值对象，七个字段依次均为 `int` 且按位置依次为 `w, height, k, wots, leaf, batch, multi`；冻结、可位置构造、按值相等（可哈希）
+- `merkle_verify_profile(w, height, indices)` — 纯函数：比较同一叶集合的批次证明与多证明在验证端的 SHA-256 哈希成本，不生成密钥、不取随机数、不修改状态，返回 `MerkleVerifyProfile`。`k = len(indices)`；`wots` 为整组 W-OTS 链步上界，按每叶计算且不因认证路径去重减少（`w=4` 为 `k*67*15`，`w=8` 为 `k*34*255`），`leaf = k`；`batch = k*height`（批次证明重复每份完整路径），`multi = Σ(l=1..height)|{i>>l:i∈indices}|`（多证明每层每个不同父节点仅做一次内部节点哈希）。`w` 仅为 4 或 8，`height` 仅为 1..8 的非布尔整数；`indices` 必须为非空、严格递增且落在 `0..2**height-1` 内的非布尔整数元组；`w`/`height`/`k` 原样回显校验后的参数。`indices` 容器或非整数成员错型抛 `TypeError`；空元组、布尔成员、越界、重复或乱序，以及非法 `w` 或 `height` 均抛 `ValueError`
 - `recommend_merkle_transport_deployment(capacity, indices, budgets, prefer="multiproof")` — 在预算内**联合**选择树参数与传输方案，返回 `MerkleTransportDeploymentProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`indices` 必须为非空、严格递增的非布尔整数元组，最大成员须小于候选树叶数；`budgets` 必须为四元组，按顺序分别为检查点字节、批次证明字节、多证明字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须同时覆盖 `capacity` 与 `indices`，尺寸与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。`prefer` 取 `"multiproof"`/`"batch"`/`"speed"`：主排序键分别为多证明字节、批次字节、步数；前两者次键取另一传输线长（multiproof 先多证明后批次，batch 反之），speed 依次再多证明字节、批次字节；三种偏好末段均按检查点字节、叶数、`w`、`height` 升序取首项。`indices`/`budgets` 容器类型错抛 `TypeError`，其余非法输入（含非整数或布尔索引成员）或无可行候选抛 `ValueError`
 - `MerkleTransportDeploymentProfile` — 冻结的联合部署选择值对象，四个字段按位置依次为 `config, nodes, batch, multi`，类型依次为 `MerkleStorageProfile, int, int, int`：所选配置、多证明节点数、批次证明字节数、多证明字节数；冻结、可位置构造、按值相等（可哈希）
 - `merkle_transport_deployment_frontier(capacity, indices, budgets)` — 与 `recommend_merkle_transport_deployment` 同一组候选与预算，但**不排序取首项**，而是返回全部可行且非支配的联合部署，类型为 `tuple[MerkleTransportDeploymentProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`indices` 必须为非空、严格递增的非负非布尔整数元组，候选树叶数须同时覆盖 `capacity` 与最大索引加一；`budgets` 必须为四元组，按顺序分别为检查点字节、批次证明字节、多证明字节及单签验签步数（`profile("merkle", ...).steps`）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，配置取 `merkle_storage_profile`、批次/多证明与节点数取 `merkle_transport_profile`、步数取 `profile`。支配判定固定为：A 在检查点字节、批次证明字节、多证明字节、单签步数四项上均不大于 B 且至少一项严格更小，则 A 支配 B（节点数仅作输出，不参与支配）；删除全部被支配候选并按值去重，不因偏好预先舍弃速度与传输尺寸形成取舍的配置。结果按单签步数、多证明字节、批次证明字节、检查点字节、叶数、`w`、`height` 稳定升序排列。`indices`/`budgets` 非元组抛 `TypeError`；其余非法输入或无可行候选抛 `ValueError`
@@ -519,6 +521,8 @@ from pqattest import (
     merkle_deployment_frontier,
     merkle_storage_profile,
     merkle_transport_profile,
+    MerkleVerifyProfile,
+    merkle_verify_profile,
     recommend_merkle_transport_deployment,
     merkle_transport_deployment_frontier,
     recommend_merkle_transport_workload,
@@ -536,6 +540,9 @@ merkle_storage_profile(8, 7)
 #                      proof_wire_bytes=1388, checkpoint_bytes=139345,
 #                      auth_v1_bytes=139391, auth_v2_bytes=139399)
 merkle_transport_profile(8, 7, (3, 11, 70))   # (节点数, 批量线长, 多证明线长)
+merkle_verify_profile(8, 7, (3, 11, 70))
+# MerkleVerifyProfile(w=8, height=7, k=3, wots=26010, leaf=3, batch=21, multi=...)
+# multi 只在每层每个不同父节点上做一次内部节点哈希，batch 则每份签名重复完整路径
 
 # 覆盖 16 条且单签线长 <= 1.3 KB；顺序为 (检查点, 签名, 证明, 步数)，不限的项传 None
 recommend_merkle_deployment(16, (None, 1300, None, None))

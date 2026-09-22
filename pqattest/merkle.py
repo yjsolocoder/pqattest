@@ -586,6 +586,82 @@ class MerkleBatchProof:
             for message, signature in zip(messages, self.signatures)
         )
 
+    def verify_bound(
+        self, messages: Any, *, public_key: Any, indices: Any = None
+    ) -> bool:
+        """Verify like :meth:`verify` and bind to an expected key and leaves.
+
+        Runs the exact per-item verification of :meth:`verify` — every
+        message delegates to :func:`merkle_verify` in tuple order, the
+        signature order matching the message order one to one — and
+        additionally requires the embedded public key to equal
+        ``public_key`` value by value (``w``, ``height`` and ``root``).
+        No new wire format is introduced, no keys are generated, no
+        randomness is drawn and no state is kept.
+
+        ``public_key`` must be a :class:`MerklePublicKey`; any other type
+        raises ``TypeError``. ``indices=None`` imposes no extra
+        constraint on the leaf selection. An explicit ``indices`` must be
+        a tuple — any other container type raises ``TypeError``, as does
+        any member that is not an integer — with exactly as many members
+        as ``messages``; every member must be a non-boolean integer, the
+        values must be strictly increasing, in range for the embedded
+        key's tree and identical to the signatures' leaf indices item by
+        item. A boolean member, a duplicate, an out-of-order or
+        out-of-range value, a wrong count, a wrong ``messages`` type, and
+        any structural, message, signature or public-key-value mismatch
+        all return ``False``.
+        """
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        if indices is not None:
+            if not isinstance(indices, tuple):
+                raise TypeError("indices must be a tuple of integers")
+            for index in indices:
+                if not isinstance(index, int):
+                    raise TypeError("every index must be an integer")
+        if not isinstance(messages, tuple):
+            return False
+        if len(messages) != len(self.signatures):
+            return False
+        bound_key = self.public_key
+        if not isinstance(bound_key, MerklePublicKey):
+            return False
+        try:
+            if (
+                public_key.w != bound_key.w
+                or public_key.height != bound_key.height
+                or public_key.root != bound_key.root
+            ):
+                return False
+        except AttributeError:
+            return False
+        if indices is not None:
+            if len(indices) != len(messages):
+                return False
+            if any(isinstance(index, bool) for index in indices):
+                return False
+            if any(former >= latter for former, latter in zip(indices, indices[1:])):
+                return False
+            try:
+                leaf_count = 1 << _validate_height(bound_key.height)
+            except ValueError:
+                return False
+            if any(index < 0 or index >= leaf_count for index in indices):
+                return False
+            try:
+                if any(
+                    signature.index != index
+                    for signature, index in zip(self.signatures, indices)
+                ):
+                    return False
+            except AttributeError:
+                return False
+        return all(
+            merkle_verify(message, signature, bound_key)
+            for message, signature in zip(messages, self.signatures)
+        )
+
 
 class MerkleSigner:
     """Thread-safe, in-process few-times signer over a Merkle tree of W-OTS keys.

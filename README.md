@@ -312,6 +312,58 @@ MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # �
 
 **代次安全边界**：下限 `min_generation` **不由封装携带**，必须保存在调用方的外部可信存储中（随每次接受的新一代次原子推进），并与封装/检查点分开保管。代次只对「检查点回滚、但可信下限没有一并回退」的情形有效：攻击者若能把检查点和可信下限**一起**回滚，或者在**同一代次内**重放一份合法封装，HMAC 依然有效、无从检测。与 v1 相同，v2 封装**不加密**，载荷是明文，也不防复制；须把封装连同明文检查点一起当秘密保管。
 
+### 带外部单调认领的认证恢复
+
+可信高水位（代次下限）通常由外部单调计数器/认领存储负责推进；为了让「恢复签名器」与「认领代次」不可分割，Lamport 与 W-OTS 两类一次性签名器各自提供带认领的一步恢复，成对同代恢复则用 `restore_ots_pair`——认证与检查点恢复全部成功后才**恰好调用一次**认领回调，失败路径绝不调用，因而不会只认领一侧：
+
+- `OneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim)` / `WOTSOneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim)` — 参数规则与 `MerkleSigner.from_auth_state` 相同（`data`/`key` 仅收非空 `bytes`/`bytearray`，`min_generation` 为 `None` 或非布尔 uint64），额外的必给关键字参数 `claim` **必须可调用**（否则 `TypeError`）。封装方案分别固定为 `"lamport"`/`"wots"`。返回 `(signer, generation)`：恢复出的签名器与封装代次。全部校验通过、检查点恢复完成后，`claim` 被**恰好调用一次**，入参单项分别为 `("lamport", g)` 与 `("wots", g)`；仅当回调返回值**按身份 `is True`** 时成功（`1`、非空串等真值不算，抛 `ValueError`）；回调自身抛出的任何异常原样透传
+- `restore_ots_pair(a, b, *, key, floor=None, claim)` — 成对恢复。`a` 必须是 `"lamport"` 封装、`b` 必须是 `"wots"` 封装（位置固定，互换即方案不符），两者**必须同代**，`floor` 给定时两侧代次都不得低于它。返回 `((l, w), g)`：`l` 为 Lamport `OneTimeSigner`、`w` 为 `WOTSOneTimeSigner`、`g` 为共同代次。两侧 HMAC、方案、载荷魔数、同代与下限检查、两个检查点恢复**全部成功后**，`claim` 才被恰好调用一次，入参为成对令牌 `(("lamport", g), ("wots", g))`；成功条件与异常语义同单项
+
+处理顺序固定：先以 `hmac.compare_digest` 验两侧 HMAC，再核对固定方案标识、载荷魔数与（成对的）同代/代次下限，最后恢复 v1 检查点；只有这一切都成功才调用一次 `claim` 并返回。因此任何 `ValueError`（空 `key`、坏标签/坏封装、v1 封装、方案不符、载荷魔数不符、代次低于下限、成对代次不一致、检查点非法，或认领未返回 `True`）发生时，回调**从未被调用**，调用方不可能认领一个没有成功恢复的状态（也不可能只认领成对中的一侧）。错型（非字节数据/密钥、非可调用 `claim`、布尔或非整数下限）抛 `TypeError`；不新增线格式、不使用随机数、不引入任何库内状态。
+
+```python
+from pqattest import (
+    OneTimeSigner, WOTSOneTimeSigner, restore_ots_pair,
+    keygen, wots_keygen, auth_state_wrap,
+)
+
+key = b"shared-secret"
+state = {"high_water": 6}  # 由外部可信单调存储维护
+
+def claim_single(token):
+    scheme, generation = token           # 如 ("lamport", 7)
+    if generation < state["high_water"]:
+        return False                     # 过期代次：拒绝，恢复抛 ValueError
+    state["high_water"] = generation + 1  # 仅在此时原子推进
+    return True
+
+lamport = OneTimeSigner(keygen()[0])
+blob = auth_state_wrap(lamport.checkpoint(), scheme="lamport",
+                       key=key, generation=7)
+restored, generation = OneTimeSigner.from_auth_state(
+    blob, key=key, min_generation=state["high_water"], claim=claim_single
+)
+
+# 两类一次性密钥同代成对恢复：claim 只会被调用一次，且只在两侧都恢复成功后
+l = OneTimeSigner(keygen()[0])
+w = WOTSOneTimeSigner(wots_keygen()[0])
+blob_a = auth_state_wrap(l.checkpoint(), scheme="lamport", key=key, generation=7)
+blob_b = auth_state_wrap(w.checkpoint(), scheme="wots", key=key, generation=7)
+
+def claim_pair(token):
+    (lamport_claim, wots_claim) = token     # (("lamport", 7), ("wots", 7))
+    if lamport_claim[1] != wots_claim[1]:   # 同代（恢复时已强制，此处再确认）
+        return False
+    if lamport_claim[1] < state["high_water"]:
+        return False                        # 回滚：拒绝，恢复抛 ValueError
+    state["high_water"] = lamport_claim[1] + 1  # 仅在此时原子推进一次
+    return True
+
+(lamport_signer, wots_signer), generation = restore_ots_pair(
+    blob_a, blob_b, key=key, floor=state["high_water"], claim=claim_pair,
+)
+```
+
 
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：

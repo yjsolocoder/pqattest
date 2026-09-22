@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from typing import Any
+from typing import Any, Callable
 
 __all__ = [
     "auth_wrap",
@@ -312,3 +312,82 @@ def auth_state_unwrap(
             f"checkpoint generation {generation} is below the minimum {min_generation}"
         )
     return scheme, generation, bytes(payload)
+
+
+def _validate_claim(claim: Any) -> Callable[..., Any]:
+    if not callable(claim):
+        raise TypeError("claim must be callable")
+    return claim
+
+
+def _restore_auth_state(scheme: str, data: Any, *, key: Any, min_generation: Any,
+                        claim: Any, restore: Callable[[bytes], Any]) -> tuple[Any, int]:
+    """Validate, authenticate and restore one v2 envelope, then claim it once.
+
+    Shared implementation behind the one-time signers' ``from_auth_state``.
+    Argument types are checked first, the v2 HMAC tag is verified with
+    :func:`hmac.compare_digest`, the envelope is fixed to ``scheme`` and the
+    generation floor applied, and only then is the untouched payload handed to
+    ``restore``; the ``claim`` callback is invoked exactly once, after the
+    restore has fully succeeded, and its return value is accepted only when it
+    ``is True``. Any exception raised by ``claim`` propagates untouched.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+    _, generation_value, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect=scheme,
+        min_generation=min_generation,
+    )
+    signer = restore(checkpoint)
+    result = claim_callable((scheme, generation_value))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return signer, generation_value
+
+
+def _restore_auth_state_pair(data_a: Any, data_b: Any, *, key: Any, floor: Any,
+                             claim: Any,
+                             restore_a: Callable[[bytes], Any],
+                             restore_b: Callable[[bytes], Any]
+                             ) -> tuple[tuple[Any, Any], int]:
+    """Authenticate and restore two same-generation envelopes, then claim both.
+
+    Both blobs must verify under ``key``, the first must be a ``"lamport"``
+    envelope and the second a ``"wots"`` envelope, their generations must be
+    equal and — when ``floor`` is given — at least that high. Both checkpoints
+    are restored before the single paired claim, so a caller can never
+    successfully claim only one side. ``claim`` is invoked exactly once with
+    ``(("lamport", g), ("wots", g))`` after every restore has succeeded, and
+    its return value is accepted only when it ``is True``; any exception it
+    raises propagates untouched.
+    """
+    if not isinstance(data_a, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    if not isinstance(data_b, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if floor is not None:
+        _validate_generation(floor, "floor")
+    claim_callable = _validate_claim(claim)
+    _, generation_a, checkpoint_a = auth_state_unwrap(
+        data_a, key=key_bytes, expect="lamport", min_generation=floor
+    )
+    _, generation_b, checkpoint_b = auth_state_unwrap(
+        data_b, key=key_bytes, expect="wots", min_generation=floor
+    )
+    if generation_a != generation_b:
+        raise ValueError(
+            f"lamport generation {generation_a} does not match wots generation {generation_b}"
+        )
+    signer_a = restore_a(checkpoint_a)
+    signer_b = restore_b(checkpoint_b)
+    result = claim_callable((("lamport", generation_a), ("wots", generation_b)))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return (signer_a, signer_b), generation_a

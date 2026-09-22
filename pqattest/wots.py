@@ -25,7 +25,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
 from ._errors import KeyExhaustedError
-from .auth import _validate_generation, _validate_key, auth_state_wrap
+from .auth import (
+    _restore_auth_state,
+    _validate_generation,
+    _validate_key,
+    auth_state_wrap,
+)
 
 __all__ = [
     "ELEMENT_BYTES",
@@ -467,6 +472,49 @@ class WOTSOneTimeSigner:
             private_key, cls._public_key_from(private_key), bool(used_byte)
         )
         return signer
+
+    @classmethod
+    def from_auth_state(
+        cls, data: Any, *, key: Any, min_generation: Any = None, claim: Any
+    ) -> tuple["WOTSOneTimeSigner", int]:
+        """Restore a signer from a v2 ``"wots"`` envelope and claim it once.
+
+        Combines v2 verification, the generation floor and the v1 checkpoint
+        restore in one call without drawing randomness, and — only once
+        everything has succeeded — performs the external monotonic claim so a
+        caller can never accept a restored key without also claiming its
+        generation. Only an envelope produced by :func:`auth_state_wrap` with
+        ``scheme="wots"`` is accepted; no new format is introduced.
+        ``key``, ``min_generation`` and ``claim`` are keyword-only. Returns
+        ``(signer, generation)``: the restored :class:`WOTSOneTimeSigner`
+        (equal to :meth:`from_checkpoint` on the embedded payload) and the
+        non-negative uint64 generation carried in the envelope.
+
+        ``data`` must be ``bytes`` or ``bytearray``; ``key`` must be a
+        non-empty ``bytes``/``bytearray`` shared secret; ``min_generation``
+        must be ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``;
+        ``claim`` must be callable. A wrong type (including a boolean floor or
+        a non-callable claim) raises ``TypeError``. The v2 HMAC tag is
+        verified first with :func:`hmac.compare_digest`; the envelope scheme
+        is then fixed to ``"wots"``, the payload magic checked and the
+        generation floor applied; only afterwards is the untouched payload
+        handed to :meth:`from_checkpoint`. Once the checkpoint is restored,
+        ``claim`` is called exactly once with the single token
+        ``("wots", generation)``; the restore succeeds only when that call
+        returns ``True`` (compared by identity), and any exception it raises
+        propagates untouched. An empty key, a bad tag or envelope, a non-wots
+        scheme (including a v1 envelope), a generation below the floor, an
+        invalid checkpoint, or a claim that is not ``True`` raises
+        ``ValueError`` and the callback is never invoked on such a failure.
+        """
+        return _restore_auth_state(
+            "wots",
+            data,
+            key=key,
+            min_generation=min_generation,
+            claim=claim,
+            restore=cls.from_checkpoint,
+        )
 
 
 def wots_keygen(

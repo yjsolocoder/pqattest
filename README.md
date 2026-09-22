@@ -319,6 +319,7 @@ MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # �
 - `OneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim)` / `WOTSOneTimeSigner.from_auth_state(data, *, key, min_generation=None, claim)` — 参数规则与 `MerkleSigner.from_auth_state` 相同（`data`/`key` 仅收非空 `bytes`/`bytearray`，`min_generation` 为 `None` 或非布尔 uint64），额外的必给关键字参数 `claim` **必须可调用**（否则 `TypeError`）。封装方案分别固定为 `"lamport"`/`"wots"`。返回 `(signer, generation)`：恢复出的签名器与封装代次。全部校验通过、检查点恢复完成后，`claim` 被**恰好调用一次**，入参单项分别为 `("lamport", g)` 与 `("wots", g)`；仅当回调返回值**按身份 `is True`** 时成功（`1`、非空串等真值不算，抛 `ValueError`）；回调自身抛出的任何异常原样透传
 - `restore_ots_pair(a, b, *, key, floor=None, claim)` — 成对恢复。`a` 必须是 `"lamport"` 封装、`b` 必须是 `"wots"` 封装（位置固定，互换即方案不符），两者**必须同代**，`floor` 给定时两侧代次都不得低于它。返回 `((l, w), g)`：`l` 为 Lamport `OneTimeSigner`、`w` 为 `WOTSOneTimeSigner`、`g` 为共同代次。两侧 HMAC、方案、载荷魔数、同代与下限检查、两个检查点恢复**全部成功后**，`claim` 才被恰好调用一次，入参为成对令牌 `(("lamport", g), ("wots", g))`；成功条件与异常语义同单项
 - `sign_merkle_auth_state(data, message, *, key, min_generation=None, claim) -> (signature, envelope, generation)` — **无隐藏状态**的「认证恢复 + 单条签名 + 下一代封装」转换：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再用恢复签名器的**当前最小叶**对 `message`（沿用 `bytes`/`bytearray`/`str` 规则）签一条，最后把推进后（`next_index` 加一）的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。返回的 `signature` 与同状态下 `MerkleSigner.sign` 逐值相同；`envelope` 与对推进后检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一封装重复调用得到逐字节相同的结果（叶子是否真正作废由调用方在认领后只保存新封装来保证）。入参 `g` 必须小于 `2**64-1`，否则抛 `ValueError`；恢复出的签名器无叶可用时抛 `KeyExhaustedError`。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；封装失败、认证失败、代次低于下限、代次触顶、叶子用尽或认领拒绝等任何先前失败都**不调用** `claim` 且无部分返回。错型（`data`/`key` 非 `bytes`/`bytearray`、`min_generation` 为布尔或非整数、`claim` 不可调用）抛 `TypeError`，空 key 等抛 `ValueError`
+- `sign_merkle_auth_state_batch(data, messages, *, key, min_generation=None, claim) -> (signatures, envelope, generation)` — **无隐藏状态**的「认证恢复 + 连续批量签名 + 下一代封装」转换，合并 v2 恢复与 `sign_batch` 语义：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再按 `MerkleSigner.sign_batch` 的既有规则从恢复签名器的**当前最小叶**起对 `messages` **连续**签名（一次临界区、叶索引严格递增），最后把推进后（`next_index` 加批长）的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。`messages` 必须是**非空元组**，成员沿用 `bytes`/`bytearray`/`str`（UTF-8）规则；`data`/`key` 仅收 `bytes`/`bytearray` 且 `key` 非空；`min_generation` 为 `None` 或非布尔 uint64；`claim` 须可调用。返回 `(signatures, envelope, generation)`：`signatures` 为每消息一份 `MerkleSignature` 的元组（同序、索引连续，与同状态下 `sign_batch` 逐值相同），`envelope` 与对批签后检查点直接调用 `auth_state_wrap` **逐字节相同**，`generation` 为 `g+1`。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。整批容量不足时抛 `KeyExhaustedError`；入参 `g` 必须小于 `2**64-1`（否则 `ValueError`）。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（含空批、空 key、认证失败、代次低于下限、代次触顶、容量不足、认领拒绝）都**不调用** `claim`、不推进且无部分返回。错型抛 `TypeError`，空批、空 key 或其他库内拒绝抛 `ValueError`
 
 处理顺序固定：先以 `hmac.compare_digest` 验两侧 HMAC，再核对固定方案标识、载荷魔数与（成对的）同代/代次下限，最后恢复 v1 检查点；只有这一切都成功才调用一次 `claim` 并返回。因此任何 `ValueError`（空 `key`、坏标签/坏封装、v1 封装、方案不符、载荷魔数不符、代次低于下限、成对代次不一致、检查点非法，或认领未返回 `True`）发生时，回调**从未被调用**，调用方不可能认领一个没有成功恢复的状态（也不可能只认领成对中的一侧）。错型（非字节数据/密钥、非可调用 `claim`、布尔或非整数下限）抛 `TypeError`；不新增线格式、不使用随机数、不引入任何库内状态。
 
@@ -389,6 +390,21 @@ signature, next_blob, generation = sign_merkle_auth_state(
 )
 assert generation == 8                    # 新封装绑定的代次
 assert merkle_verify(b"position claim", signature, signer.public_key)
+```
+
+一次转换整批消息则用 `sign_merkle_auth_state_batch`：叶子从当前最小叶起**连续**分配，状态只推进一代（`g -> g+1`，与批长无关），认领令牌同样是一对 `(g, g+1)`，整批容量不足时不签名、不认领：
+
+```python
+from pqattest import sign_merkle_auth_state_batch
+
+signatures, next_blob, generation = sign_merkle_auth_state_batch(
+    blob, (b"claim 0", b"claim 1", b"claim 2"), key=key,
+    min_generation=state["high_water"], claim=claim_transition,
+)
+assert tuple(sig.index for sig in signatures) == (0, 1, 2)
+assert generation == 8
+for message, signature in zip(("claim 0", "claim 1", "claim 2"), signatures):
+    assert merkle_verify(message, signature, signer.public_key)
 ```
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：

@@ -12,7 +12,10 @@ bundles one public key and one signature for independent transport, and a
 public key. The top-level :func:`multiproof_encode` /
 :func:`multiproof_verify` pair compresses several signatures of the same
 public key further into one deterministic proof whose shared authentication
-nodes are deduplicated into a canonical node set. Signer
+nodes are deduplicated into a canonical node set;
+:func:`multiproof_verify_bound` additionally binds such a proof to the
+receiver's expected public key and, optionally, an explicit leaf-index
+selection. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -56,6 +59,7 @@ __all__ = [
     "merkle_verify",
     "multiproof_encode",
     "multiproof_verify",
+    "multiproof_verify_bound",
 ]
 
 _LEAF_DOMAIN = b"pqattest/leaf"
@@ -1774,47 +1778,41 @@ def multiproof_encode(public_key: Any, signatures: Any) -> bytes:
     return b"".join(parts)
 
 
-def multiproof_verify(messages: Any, data: Any) -> bool:
-    """Verify a :func:`multiproof_encode` proof against one message per leaf.
+def _multiproof_verify(
+    messages: Any, data: Any
+) -> tuple[MerklePublicKey, tuple[int, ...]] | None:
+    """Verify a v1 multiproof, returning the proven key and leaf indices.
 
-    ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple with
-    exactly as many members as the proof has leaves; each member follows the
-    usual message rules (``bytes``/``bytearray``/``str``). Every W-OTS public
-    key is recovered from its message, hashed with the existing leaf rule and
-    merged level by level with the existing internal-node rule, consuming each
-    proof node exactly once. Verification returns ``True`` only when the merge
-    reaches the public-key root and every carried node was used; any other
-    outcome — a wrong argument type or count, an illegal message member, a bad
-    magic/version/length/count field, truncation, trailing data, a
-    non-canonical node coordinate, a missing, extra, duplicated or unordered
-    node, or a mismatched message — returns ``False``.
+    Runs the exact parse-and-verify rule of :func:`multiproof_verify`; on
+    success the embedded public key and the leaf indices (in proof order,
+    strictly increasing) are returned, on any failure ``None``.
     """
     if not isinstance(data, (bytes, bytearray)):
-        return False
+        return None
     if not isinstance(messages, tuple):
-        return False
+        return None
     data = bytes(data)
     if len(data) < _MULTIPROOF_HEADER_BYTES:
-        return False
+        return None
     if data[:8] != _MULTIPROOF_MAGIC:
-        return False
+        return None
     if data[8] != _MULTIPROOF_VERSION:
-        return False
+        return None
     key_length = int.from_bytes(data[9:13], "big")
     leaf_count = int.from_bytes(data[13:15], "big")
     node_count = int.from_bytes(data[15:17], "big")
     if key_length == 0 or leaf_count == 0:
-        return False
+        return None
     if len(messages) != leaf_count:
-        return False
+        return None
     offset = _MULTIPROOF_HEADER_BYTES
     key_end = offset + key_length
     if key_end > len(data):
-        return False
+        return None
     try:
         public_key = MerklePublicKey.from_bytes(data[offset:key_end])
     except (TypeError, ValueError):
-        return False
+        return None
     w = public_key.w
     height = public_key.height
     root = public_key.root
@@ -1826,18 +1824,18 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
     previous_index = -1
     for _ in range(leaf_count):
         if offset + 4 > len(data):
-            return False
+            return None
         index = int.from_bytes(data[offset : offset + 2], "big")
         element_count = int.from_bytes(data[offset + 2 : offset + 4], "big")
         offset += 4
         if index >= (1 << height) or index <= previous_index:
-            return False
+            return None
         previous_index = index
         if element_count != chains:
-            return False
+            return None
         end = offset + element_count * ELEMENT_BYTES
         if end > len(data):
-            return False
+            return None
         wots_signature = tuple(
             data[offset + i * ELEMENT_BYTES : offset + (i + 1) * ELEMENT_BYTES]
             for i in range(element_count)
@@ -1846,7 +1844,7 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
         try:
             digits = _signing_digits(messages[len(leaves)], w)
         except TypeError:
-            return False
+            return None
         recovered = tuple(
             _chain_walk(element, b - 1 - digit)
             for element, digit in zip(wots_signature, digits)
@@ -1858,23 +1856,23 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
     for _ in range(node_count):
         end = offset + _MULTIPROOF_NODE_BYTES
         if end > len(data):
-            return False
+            return None
         level = data[offset]
         index = int.from_bytes(data[offset + 1 : offset + 3], "big")
         node = data[offset + 3 : end]
         offset = end
         if level >= height:
-            return False
+            return None
         coordinate = (level, index)
         if previous_coordinate is not None and coordinate <= previous_coordinate:
-            return False
+            return None
         previous_coordinate = coordinate
         proof_nodes[coordinate] = node
     if offset < len(data):
-        return False
+        return None
     indices = tuple(sorted(leaves))
     if set(proof_nodes) != set(_canonical_multiproof_nodes(indices, height)):
-        return False
+        return None
 
     current = dict(leaves)
     for level in range(height):
@@ -1890,11 +1888,89 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
                 continue
             proof_node = proof_nodes.pop((level, index ^ 1), None)
             if proof_node is None:
-                return False
+                return None
             if index & 1:
                 parents[index >> 1] = _node_hash(proof_node, node)
             else:
                 parents[index >> 1] = _node_hash(node, proof_node)
             i += 1
         current = parents
-    return len(current) == 1 and current.get(0) == root and not proof_nodes
+    if not (len(current) == 1 and current.get(0) == root and not proof_nodes):
+        return None
+    return public_key, indices
+
+
+def multiproof_verify(messages: Any, data: Any) -> bool:
+    """Verify a :func:`multiproof_encode` proof against one message per leaf.
+
+    ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple with
+    exactly as many members as the proof has leaves; each member follows the
+    usual message rules (``bytes``/``bytearray``/``str``). Every W-OTS public
+    key is recovered from its message, hashed with the existing leaf rule and
+    merged level by level with the existing internal-node rule, consuming each
+    proof node exactly once. Verification returns ``True`` only when the merge
+    reaches the public-key root and every carried node was used; any other
+    outcome — a wrong argument type or count, an illegal message member, a bad
+    magic/version/length/count field, truncation, trailing data, a
+    non-canonical node coordinate, a missing, extra, duplicated or unordered
+    node, or a mismatched message — returns ``False``.
+    """
+    return _multiproof_verify(messages, data) is not None
+
+
+def multiproof_verify_bound(
+    messages: Any, data: Any, *, public_key: Any, indices: Any = None
+) -> bool:
+    """Verify a multiproof and bind it to an expected key and leaf selection.
+
+    Runs the exact verification of :func:`multiproof_verify` on ``messages``
+    and ``data`` — the same v1 magic, field order, big-endian widths,
+    canonical node order, W-OTS recovery, leaf and internal-node hashing and
+    use-each-node-once rule — and additionally requires the public key
+    embedded in the proof to equal ``public_key`` value by value (``w``,
+    ``height`` and ``root``). No new wire format is introduced, no randomness
+    is drawn and no state is kept.
+
+    ``public_key`` must be a :class:`MerklePublicKey`; any other type raises
+    ``TypeError``. ``indices=None`` imposes no extra constraint on the leaf
+    selection. An explicit ``indices`` must be a tuple — any other container
+    type raises ``TypeError``, as does any member that is not an integer —
+    with exactly as many members as ``messages``; every member must be a
+    non-boolean integer, the values must be strictly increasing, in range for
+    the proof's tree and identical to the proof's leaf indices item by item.
+    A boolean member, a duplicate, an out-of-order or out-of-range value, a
+    wrong count, a wrong ``data`` or ``messages`` type, and any structural,
+    message, root or public-key-value mismatch all return ``False``.
+    """
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    if indices is not None:
+        if not isinstance(indices, tuple):
+            raise TypeError("indices must be a tuple of integers")
+        for index in indices:
+            if not isinstance(index, int):
+                raise TypeError("every index must be an integer")
+    result = _multiproof_verify(messages, data)
+    if result is None:
+        return False
+    proof_key, proof_indices = result
+    try:
+        if (
+            public_key.w != proof_key.w
+            or public_key.height != proof_key.height
+            or public_key.root != proof_key.root
+        ):
+            return False
+    except AttributeError:
+        return False
+    if indices is None:
+        return True
+    if len(indices) != len(messages):
+        return False
+    if any(isinstance(index, bool) for index in indices):
+        return False
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        return False
+    if any(index < 0 or index >= (1 << proof_key.height) for index in indices):
+        return False
+    return indices == proof_indices

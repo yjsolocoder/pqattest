@@ -26,6 +26,8 @@ merkle_transport_workload_frontier / merkle_mode_frontier /
 recommend_merkle_mode_deployment, MerkleVerifyProfile / merkle_verify_profile,
 MerkleVerifyWorkloadProfile / merkle_verify_workload_profile,
 MerkleModeCost / merkle_verify_mode_frontier,
+merkle_cardinality_frontier for the worst-case-position cardinality
+frontier,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -130,6 +132,7 @@ from .params import (
     merkle_transport_workload_frontier,
     merkle_mode_frontier,
     merkle_verify_mode_frontier,
+    merkle_cardinality_frontier,
     merkle_verify_profile,
     merkle_verify_workload_profile,
     profile,
@@ -205,6 +208,7 @@ __all__ = [
     "merkle_transport_workload_frontier",
     "merkle_mode_frontier",
     "merkle_verify_mode_frontier",
+    "merkle_cardinality_frontier",
     "merkle_verify_profile",
     "merkle_verify_workload_profile",
     "message_bits",

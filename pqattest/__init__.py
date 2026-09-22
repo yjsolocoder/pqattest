@@ -47,6 +47,11 @@ no old interface or wire byte. sign_merkle_auth_state_batch is the batch
 counterpart: it restores the same way, signs a non-empty tuple of messages
 with consecutive leaves in a single sign_batch run, and returns the
 signature tuple together with the envelope and generation g+1.
+sign_multiproof_merkle_auth_state is its multiproof counterpart: it
+restores the same way, signs the batch on consecutive leaves from the
+current index (or on an explicit strictly increasing indices selection,
+voiding the gaps), and returns the deduplicated multiproof_encode proof
+bytes over the batch together with the envelope and generation g+1.
 advance_merkle_auth_state is the stateless authenticated counterpart of
 MerkleSigner.advance_to_with_auth_state: it restores the same way, advances
 the next-leaf index with advance_to semantics (an equal target is legal and
@@ -199,6 +204,7 @@ __all__ = [
     "sign",
     "sign_merkle_auth_state",
     "sign_merkle_auth_state_batch",
+    "sign_multiproof_merkle_auth_state",
     "sign_ots_pair",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
@@ -1019,6 +1025,143 @@ def sign_merkle_auth_state_batch(
     if result is not True:
         raise ValueError("claim callback did not return True")
     return signatures, envelope, next_generation
+
+
+def sign_multiproof_merkle_auth_state(
+    data: Any, messages: Any, *, indices: Any = None, key: Any,
+    min_generation: Any = None, claim: Any,
+) -> tuple[bytes, bytes, int]:
+    """Restore a Merkle v2 envelope, sign leaves, and wrap a multiproof.
+
+    The multiproof counterpart of :func:`sign_merkle_auth_state_batch`:
+    combines authenticated v2 restore, one batch of signatures, a
+    deduplicated :func:`multiproof_encode` proof over them and wrapping of
+    the next v1 checkpoint in a single call without mutating any object,
+    keeping any library state or introducing a new wire format. The envelope
+    in ``data`` is authenticated and restored exactly like
+    :meth:`MerkleSigner.from_auth_state`; the restored signer then signs
+    every message in ``messages`` exactly like
+    :func:`sign_merkle_auth_state_batch`, except that the leaves are chosen
+    by ``indices``. ``indices``, ``key``, ``min_generation`` and ``claim``
+    are keyword-only; only ``indices`` and ``min_generation`` have a default
+    (``None``). Returns ``(proof, envelope, generation)``: ``proof`` is the
+    ``bytes`` produced by calling :func:`multiproof_encode` on the restored
+    public key and this call's signatures — byte-for-byte identical to
+    encoding the same signatures on a signer restored from the same state,
+    and ``multiproof_verify(messages, proof)`` returns ``True`` — the
+    :func:`auth_state_wrap` v2 envelope (``bytes``) over the advanced v1
+    :meth:`MerkleSigner.checkpoint` bytes with ``scheme="merkle"``, the
+    original ``key`` and generation ``g + 1`` — byte-for-byte identical to
+    calling :func:`auth_state_wrap` on the checkpoint a signer with the
+    advanced ``next_index`` returns from :meth:`checkpoint` — and the new
+    generation ``g + 1``.
+
+    With ``indices=None`` the leaves are allocated consecutively from the
+    restored signer's current lowest unused leaf, exactly like
+    :func:`sign_merkle_auth_state_batch`. An explicit ``indices`` must be a
+    ``tuple`` of the same length as ``messages``, strictly increasing, whose
+    members are non-boolean integers between the restored current
+    ``next_index`` and the last leaf; the gaps between selected leaves are
+    voided and the post-call ``next_index`` is the last selected index plus
+    one. A non-tuple ``indices`` or a non-integer member raises
+    ``TypeError``; a wrong length, a boolean member, a non-strictly-
+    increasing sequence or an out-of-range member raises ``ValueError``.
+
+    Every other input, exception and claim rule is exactly the one of
+    :func:`sign_merkle_auth_state_batch`: ``data`` must be ``bytes`` or
+    ``bytearray`` holding a v2 envelope; ``key`` must be a non-empty
+    ``bytes``/``bytearray`` shared secret; ``messages`` must be a
+    **non-empty** ``tuple`` whose members each follow the usual
+    ``bytes``/``bytearray``/``str`` (UTF-8) message rules;
+    ``min_generation`` must be ``None`` or a non-boolean integer in
+    ``0 .. 2**64 - 1``; ``claim`` must be callable. A wrong type raises
+    ``TypeError``; an empty batch or key, a bad envelope or an input
+    generation ``g`` at the uint64 ceiling (it must be strictly below
+    ``2**64 - 1`` so ``g + 1`` fits) raises ``ValueError``. With
+    ``indices=None`` a restored signer without enough leaves left for the
+    whole batch raises :class:`KeyExhaustedError`. The v2 HMAC tag is
+    verified first with :func:`hmac.compare_digest`, the envelope is fixed
+    to ``"merkle"`` and the generation floor applied, the v1 checkpoint is
+    restored, all signatures and the candidate advanced checkpoint are
+    built in one critical section, and only once every output exists is
+    ``claim`` called exactly once with the paired token
+    ``(("merkle", g), ("merkle", g + 1))``; the call succeeds only when that
+    return value ``is True``, and any exception ``claim`` raises propagates
+    untouched. No earlier failure invokes the callback, advances any state
+    or returns a partial result. The same inputs always produce
+    byte-identical outputs and no randomness is drawn. The envelope is
+    plaintext and authenticated only; it provides neither encryption nor
+    protection against replay or rollback on its own.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    if not messages:
+        raise ValueError("messages must not be empty")
+    batch_messages = tuple(_as_bytes(message) for message in messages)
+    if indices is not None:
+        if not isinstance(indices, tuple):
+            raise TypeError("indices must be a tuple of leaf indices")
+        if len(indices) != len(batch_messages):
+            raise ValueError("indices must have the same length as messages")
+        if any(isinstance(index, bool) for index in indices):
+            raise ValueError("index members must not be booleans")
+        if any(not isinstance(index, int) for index in indices):
+            raise TypeError("every index must be an integer")
+        if any(former >= latter for former, latter in zip(indices, indices[1:])):
+            raise ValueError("indices must be strictly increasing and unique")
+
+    # Authenticate first: no field (including the generation) is trusted
+    # until the HMAC tag over the whole body checks out.
+    _, generation, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect="merkle",
+        min_generation=min_generation,
+    )
+    if generation >= 2**64 - 1:
+        raise ValueError("generation must be below 2**64-1 so it can advance by one")
+    next_generation = generation + 1
+    signer = MerkleSigner.from_checkpoint(checkpoint)
+    # Build every output before the claim: an out-of-range selection, an
+    # under-capacity state or any failure here must leave no partial result
+    # and must not call claim.
+    with signer._lock:
+        base = signer._next_index
+        leaf_count = len(signer._private_keys)
+        if indices is None:
+            if len(batch_messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the multiproof"
+                )
+            selected = tuple(range(base, base + len(batch_messages)))
+        else:
+            if indices[0] < base or indices[-1] > leaf_count - 1:
+                raise ValueError(
+                    "indices must be between the current index and the last leaf"
+                )
+            selected = indices
+        signatures = tuple(
+            signer._signature_at(index, message)
+            for index, message in zip(selected, batch_messages)
+        )
+        advanced_checkpoint = signer._checkpoint_bytes(selected[-1] + 1)
+    proof = multiproof_encode(signer.public_key, signatures)
+    envelope = auth_state_wrap(
+        advanced_checkpoint,
+        scheme="merkle",
+        key=key_bytes,
+        generation=next_generation,
+    )
+    result = claim_callable((("merkle", generation), ("merkle", next_generation)))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return proof, envelope, next_generation
 
 
 def advance_merkle_auth_state(

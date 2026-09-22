@@ -674,6 +674,77 @@ class BatchVerifyBoundTest(unittest.TestCase):
             )
         )
 
+    def test_malformed_batch_boundary_variants_are_false(self):
+        signer, batch = make_batch(messages=("m0", "m1"))
+        valid_key = batch.public_key
+
+        # Missing fields altogether.
+        missing = object.__new__(MerkleBatchProof)
+        self.assertFalse(missing.verify_bound(("m0",), public_key=valid_key))
+
+        # Empty signature tuple is structurally invalid.
+        empty = object.__new__(MerkleBatchProof)
+        object.__setattr__(empty, "public_key", valid_key)
+        object.__setattr__(empty, "signatures", ())
+        self.assertFalse(empty.verify_bound((), public_key=valid_key))
+
+        # A non-MerkleSignature member (including None) is rejected.
+        for bogus in ("x", None, 42, valid_key):
+            with self.subTest(bogus=type(bogus).__name__):
+                rogue = object.__new__(MerkleBatchProof)
+                object.__setattr__(rogue, "public_key", valid_key)
+                object.__setattr__(rogue, "signatures", (bogus,))
+                self.assertFalse(
+                    rogue.verify_bound(("m0",), public_key=valid_key)
+                )
+
+        # Wrong embedded key type even though signatures look fine.
+        rogue_key = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue_key, "public_key", "not-a-key")
+        object.__setattr__(rogue_key, "signatures", batch.signatures)
+        self.assertFalse(
+            rogue_key.verify_bound(
+                ("m0", "m1"), public_key=valid_key, indices=(0, 1)
+            )
+        )
+
+        # A bypass-corrupted embedded key (bad w field) compares as a
+        # mismatch and never raises.
+        corrupted_key = object.__new__(MerklePublicKey)
+        object.__setattr__(corrupted_key, "w", 999)
+        object.__setattr__(corrupted_key, "height", valid_key.height)
+        object.__setattr__(corrupted_key, "root", valid_key.root)
+        corrupted = object.__new__(MerkleBatchProof)
+        object.__setattr__(corrupted, "public_key", corrupted_key)
+        object.__setattr__(corrupted, "signatures", batch.signatures)
+        self.assertFalse(
+            corrupted.verify_bound(("m0", "m1"), public_key=valid_key)
+        )
+
+    def test_external_type_errors_survive_malformed_batch(self):
+        signer, batch = make_batch()
+        rogue = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue, "public_key", "not-a-key")
+        object.__setattr__(rogue, "signatures", "not-a-tuple")
+        # External argument type errors keep their old raising contract even
+        # when the bundle itself is malformed.
+        with self.assertRaises(TypeError):
+            rogue.verify_bound(
+                ("m0", "m1", "m2"), public_key="not-a-key"
+            )
+        with self.assertRaises(TypeError):
+            rogue.verify_bound(
+                ("m0", "m1", "m2"),
+                public_key=signer.public_key,
+                indices=[0, 1, 2],
+            )
+        with self.assertRaises(TypeError):
+            rogue.verify_bound(
+                ("m0", "m1", "m2"),
+                public_key=signer.public_key,
+                indices=(0, 1.0, 2),
+            )
+
     def test_round_tripped_batch_still_verifies_bound(self):
         messages = ("m0", "m1", "m2")
         signer, batch = make_batch(messages=messages)

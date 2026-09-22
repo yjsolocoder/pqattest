@@ -20,10 +20,13 @@ non-dominated choice of the same workload as a tuple instead of ranking one.
 ``batch``/``multiproof`` mode combination of the workload under checkpoint,
 per-group, aggregate, verifier-step and carried-node budgets, returning the
 feasible, non-dominated mode choices as a tuple.
+:func:`recommend_merkle_mode_deployment` ranks that mode frontier by a
+business preference (aggregate size, carried nodes or verifier speed) and
+returns one combination.
 :func:`merkle_deployment_frontier` likewise returns the whole Pareto frontier
 of ordinary Merkle deployments under checkpoint, signature, proof and
-verifier-step budgets. All eleven are pure functions: no randomness, no state,
-no I/O, no keys are generated.
+verifier-step budgets. All twelve are pure functions: no randomness, no
+state, no I/O, no keys are generated.
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ __all__ = [
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
     "merkle_mode_frontier",
+    "recommend_merkle_mode_deployment",
     "merkle_storage_profile",
     "merkle_transport_profile",
 ]
@@ -1381,3 +1385,73 @@ def merkle_mode_frontier(
         )
         for storage, modes, sizes, total, _steps, _peak, _nodes in unique
     )
+
+
+def recommend_merkle_mode_deployment(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+    prefer: str = "compact",
+) -> MerkleTransportWorkloadProfile:
+    """Rank :func:`merkle_mode_frontier`'s results by business preference.
+
+    Computes the feasible, non-dominated per-group mode combinations with
+    :func:`merkle_mode_frontier` — ``capacity``, ``groups`` and the
+    five-tuple ``budgets`` follow exactly that function's types, ranges,
+    budget and exception rules — and returns one of them, a
+    :class:`MerkleTransportWorkloadProfile`, ranked by ``prefer`` instead of
+    exposing the whole frontier:
+
+    - ``"compact"`` (the default) ranks by aggregate transport bytes
+      (:attr:`MerkleTransportWorkloadProfile.total`), then per-group peak
+      (the maximum of :attr:`MerkleTransportWorkloadProfile.sizes`), carried
+      multi-proof node total and verifier steps;
+    - ``"nodes"`` ranks by carried node total first, then aggregate
+      transport bytes, per-group peak and verifier steps;
+    - ``"speed"`` ranks by per-signature verifier hash-chain steps first,
+      then aggregate transport bytes, per-group peak and carried node total.
+
+    The carried node total uses exactly the frontier's node definition: it
+    accumulates the canonical node count of every group carried as a
+    multi-proof and counts ``0`` for every group carried as a batch proof.
+
+    All three rankings finish with the same tie-break in ascending order —
+    checkpoint bytes, leaf count, ``w``, ``height`` and the ``modes`` tuple
+    in lexicographic order — and the first entry after sorting is returned.
+    An unknown ``prefer`` value raises ``ValueError``; the absence of any
+    feasible candidate raises whatever :func:`merkle_mode_frontier` raises.
+    The function is pure: it draws no randomness, generates no keys and
+    changes no state.
+    """
+    frontier = merkle_mode_frontier(capacity, groups, budgets)
+    if prefer not in ("compact", "nodes", "speed"):
+        raise ValueError('prefer must be "compact", "nodes" or "speed"')
+
+    def ranking(
+        workload: MerkleTransportWorkloadProfile,
+    ) -> tuple[int, ...]:
+        steps = profile(
+            "merkle", w=workload.config.w, height=workload.config.height
+        ).steps
+        peak = max(workload.sizes)
+        nodes = sum(
+            merkle_transport_profile(
+                workload.config.w, workload.config.height, group
+            )[0]
+            for mode, group in zip(workload.modes, groups)
+            if mode == "multiproof"
+        )
+        tail = (
+            workload.config.checkpoint_bytes,
+            workload.config.leaf_count,
+            workload.config.w,
+            workload.config.height,
+            workload.modes,
+        )
+        if prefer == "compact":
+            return (workload.total, peak, nodes, steps) + tail
+        if prefer == "nodes":
+            return (nodes, workload.total, peak, steps) + tail
+        return (steps, workload.total, peak, nodes) + tail
+
+    return sorted(frontier, key=ranking)[0]

@@ -12,7 +12,10 @@ bundles one public key and one signature for independent transport, and a
 public key. The top-level :func:`multiproof_encode` /
 :func:`multiproof_verify` pair compresses several signatures of the same
 public key further into one deterministic proof whose shared authentication
-nodes are deduplicated into a canonical node set. Signer
+nodes are deduplicated into a canonical node set;
+:func:`multiproof_verify_bound` verifies the same v1 proof additionally
+bound to the receiver's expected public key and, optionally, leaf indices.
+Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -56,6 +59,7 @@ __all__ = [
     "merkle_verify",
     "multiproof_encode",
     "multiproof_verify",
+    "multiproof_verify_bound",
 ]
 
 _LEAF_DOMAIN = b"pqattest/leaf"
@@ -1789,10 +1793,86 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
     non-canonical node coordinate, a missing, extra, duplicated or unordered
     node, or a mismatched message — returns ``False``.
     """
+    return _multiproof_verify(messages, data, None, None)
+
+
+def multiproof_verify_bound(
+    messages: Any,
+    data: Any,
+    *,
+    public_key: Any,
+    indices: Any = None,
+) -> bool:
+    """Verify a multiproof bound to an expected public key and leaf indices.
+
+    Bound counterpart of :func:`multiproof_verify`: it parses only the
+    existing v1 :func:`multiproof_encode` bytes and performs exactly the same
+    verification — same magic, field order, big-endian widths, canonical node
+    ordering, W-OTS recovery, leaf/internal hashing and node-used-once rule —
+    but additionally binds the proof to the receiver's expectations, so a
+    proof valid under a different key or a different leaf selection is
+    rejected. No new wire format, randomness or library state is involved.
+
+    ``public_key`` is keyword-only and must be a :class:`MerklePublicKey`; a
+    wrong type raises ``TypeError``. The public key embedded in the proof must
+    be equal to it value-for-value (``w``, ``height`` and root); otherwise the
+    result is ``False``. ``indices`` is keyword-only and defaults to ``None``:
+    with ``None`` the leaf selection is not further restricted; an explicit
+    value must be a tuple with exactly as many members as ``messages`` (and
+    hence as the proof has leaves), each a non-boolean integer, strictly
+    increasing, and equal item by item to the proof's leaf indices in their
+    encoded order. A non-tuple ``indices`` container or a non-integer member
+    raises ``TypeError``; a boolean member, a duplicate, a value out of order
+    or out of the tree's range, a length mismatch, or an index that does not
+    equal the proof's leaf indices returns ``False``.
+
+    ``messages`` must be a non-empty tuple whose members follow the usual
+    message rules (``bytes``/``bytearray``/``str``; a ``str`` is encoded as
+    UTF-8) and ``data`` must be ``bytes`` or ``bytearray``; a wrong
+    ``messages`` or ``data`` type, an empty tuple, an illegal message member,
+    or any structural, message, root, public-key-value or index mismatch
+    returns ``False``.
+    """
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    if indices is not None:
+        if not isinstance(indices, tuple):
+            raise TypeError("indices must be a tuple of leaf indices")
+        # Booleans pass this (bool is an int subclass); they are a value
+        # violation and therefore rejected with False inside the core.
+        if any(not isinstance(index, int) for index in indices):
+            raise TypeError("every index must be a non-boolean integer")
+    return _multiproof_verify(messages, data, public_key, indices)
+
+
+def _multiproof_verify(
+    messages: Any,
+    data: Any,
+    expected_key: MerklePublicKey | None,
+    expected_indices: tuple[int, ...] | None,
+) -> bool:
+    """Shared non-raising verification core.
+
+    ``expected_key`` is ``None`` for :func:`multiproof_verify` or the required
+    :class:`MerklePublicKey` for :func:`multiproof_verify_bound`;
+    ``expected_indices`` is ``None`` when the leaf selection is unrestricted
+    or a tuple that must equal the proof's leaf indices item by item. Every
+    non-type failure returns ``False``.
+    """
     if not isinstance(data, (bytes, bytearray)):
         return False
-    if not isinstance(messages, tuple):
+    if not isinstance(messages, tuple) or not messages:
         return False
+    if expected_indices is not None:
+        # Booleans are ints and ``True == 1``, so they must be rejected as a
+        # value violation before item-wise index comparison.
+        if any(isinstance(index, bool) for index in expected_indices):
+            return False
+        if len(expected_indices) != len(messages):
+            return False
+    for message in messages:
+        if not isinstance(message, (bytes, bytearray, str)):
+            return False
     data = bytes(data)
     if len(data) < _MULTIPROOF_HEADER_BYTES:
         return False
@@ -1815,6 +1895,8 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
         public_key = MerklePublicKey.from_bytes(data[offset:key_end])
     except (TypeError, ValueError):
         return False
+    if expected_key is not None and public_key != expected_key:
+        return False
     w = public_key.w
     height = public_key.height
     root = public_key.root
@@ -1824,13 +1906,18 @@ def multiproof_verify(messages: Any, data: Any) -> bool:
     leaves: dict[int, bytes] = {}
     offset = key_end
     previous_index = -1
-    for _ in range(leaf_count):
+    for leaf_position in range(leaf_count):
         if offset + 4 > len(data):
             return False
         index = int.from_bytes(data[offset : offset + 2], "big")
         element_count = int.from_bytes(data[offset + 2 : offset + 4], "big")
         offset += 4
         if index >= (1 << height) or index <= previous_index:
+            return False
+        if (
+            expected_indices is not None
+            and index != expected_indices[leaf_position]
+        ):
             return False
         previous_index = index
         if element_count != chains:

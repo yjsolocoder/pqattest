@@ -12,7 +12,8 @@ construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
-merkle_verify / multiproof_encode / multiproof_verify, static
+merkle_verify / multiproof_encode / multiproof_verify /
+multiproof_verify_bound, static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
 merkle_deployment_frontier /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
@@ -108,6 +109,7 @@ from .merkle import (
     merkle_verify,
     multiproof_encode,
     multiproof_verify,
+    multiproof_verify_bound,
 )
 from .params import (
     MerkleStorageProfile,
@@ -192,6 +194,7 @@ __all__ = [
     "message_digest",
     "multiproof_encode",
     "multiproof_verify",
+    "multiproof_verify_bound",
     "profile",
     "public_key_from",
     "recommend",

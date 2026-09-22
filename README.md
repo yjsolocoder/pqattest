@@ -162,6 +162,7 @@ Merkle 聚合（有限次签名）：
 - `MerkleBatchProof.verify(messages)` — `messages` 须为与签名等长的元组，成员接受 `bytes`/`bytearray`/`str`；逐项等价于 `merkle_verify(message, signature, public_key)`，全部成功才返回 `True`；非元组、数量不符、非法消息成员或任一验签失败均返回 `False`
 - `multiproof_encode(public_key, signatures)` — 顶层函数，把同一 `MerklePublicKey` 的多份 `MerkleSignature` 压成一份去重认证路径的确定性证明 `bytes`；不引入新对象、不改动任何旧接口与格式。`public_key` 须为 `MerklePublicKey`，`signatures` 须为非空的 `MerkleSignature` 元组（类型错抛 `TypeError`）；空集合、索引非严格递增、签名不被公钥约束（`w`/树高/索引越界/W-OTS 元素数或路径数不符、元素畸形）或同一坐标节点冲突抛 `ValueError`
 - `multiproof_verify(messages, data)` — 顶层验证；`data` 只接受 `bytes`/`bytearray`，`messages` 须为与叶数等长的元组，成员沿用现有消息规则（`bytes`/`bytearray`/`str`）。按各消息恢复 W-OTS 公钥，沿用现有叶哈希与内部节点字节规则逐层合并，必须得到包内公钥根、且每个证明节点恰好使用一次；消息不符，或 `data`/`messages` 类型或数量错、魔数/版本/长度/计数错、截断、尾随、叶块乱序或重复、节点缺失/多余/重复/乱序/坐标非规范，一律返回 `False`
+- `multiproof_verify_bound(messages, data, *, public_key, indices=None) -> bool` — 顶层绑定验证：只解析既有 `multiproof_encode` 的 v1 字节，验签规则与 `multiproof_verify` 完全一致（同样的魔数、字段顺序、大端宽度、规范节点顺序、W-OTS 恢复、叶与内部节点哈希及节点仅用一次），不新增线格式、不取随机数、不保存状态，另外把证明绑定到接收方预期的公钥与可选叶索引。`messages` 须为**非空**元组，成员接受 `bytes`/`bytearray`/`str`（字符串按 UTF-8 编码）；`public_key` 仅限关键字且必须为 `MerklePublicKey`（错型抛 `TypeError`），并须与证明包内公钥逐值相等（`w`、`height`、根），否则返回 `False`。`indices` 仅限关键字、默认为 `None`：`None` 时不额外限制叶选择；显式值须为与 `messages` 等长的元组，成员是非布尔整数、严格递增且与证明叶索引（按编码顺序）逐项相同——容器非元组或成员非整数抛 `TypeError`；布尔成员、重复、乱序、越界或数量不符、与证明叶索引不符均返回 `False`。`data`/`messages` 错型，以及任何结构、消息、根、公钥值或索引不符一律返回 `False`
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 
@@ -218,6 +219,14 @@ signatures = tuple(signer.sign(message) for message in messages)
 blob = multiproof_encode(signer.public_key, signatures)   # 共享兄弟节点只存一次
 assert multiproof_verify(messages, blob)
 assert not multiproof_verify((b"claim 0", b"claim 1", b"other"), blob)
+
+from pqattest import multiproof_verify_bound
+
+assert multiproof_verify_bound(
+    messages, blob, public_key=signer.public_key, indices=(0, 1, 2)
+)
+# 绑定其他公钥、索引不符均返回 False；public_key 错型或 indices 容器/成员错型抛 TypeError
+assert not multiproof_verify_bound(messages, blob, public_key=other_public_key)
 ```
 
 **编解码须知**：三种编码（公钥、签名、证明包）都是纯序列化——只含结构校验（魔数、版本、计数、长度），**不提供认证或加密**，任何人都能改写字节；需要完整性或来源保证时须由调用方在传输/存储层自行解决（公钥与签名本身公开，通常只需防篡改）。证明包只做参数与计数层面的交叉约束：参数一致的异源公钥/签名组合在结构上合法，必须靠 `verify(message)` 才能识别——证明包不存消息，无从自行判断签名是否出自该公钥。未来格式变更会启用新的版本号（证明包与内层两种编码各自独立版本化），解析器对未知版本一律抛 `ValueError`，不会静默按 v1 解释；新版本若改变内层编码，须在证明包新的版本号下整体规定其组合方式，v1 解析器永远只接受 v1 内层编码。

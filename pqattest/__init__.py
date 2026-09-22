@@ -19,7 +19,8 @@ MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 merkle_transport_deployment_frontier /
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
-merkle_transport_workload_frontier / merkle_mode_frontier, and
+merkle_transport_workload_frontier / merkle_mode_frontier /
+recommend_merkle_mode_deployment, and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
 ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
@@ -71,6 +72,7 @@ from .params import (
     recommend,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
+    recommend_merkle_mode_deployment,
     recommend_merkle_transport_deployment,
     recommend_merkle_transport_workload,
 )
@@ -141,6 +143,7 @@ __all__ = [
     "recommend_merkle_deployment",
     "recommend_merkle_transport_deployment",
     "recommend_merkle_transport_workload",
+    "recommend_merkle_mode_deployment",
     "sign",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",

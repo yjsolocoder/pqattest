@@ -59,6 +59,12 @@ itself is not legal — the target leaf must remain signable), signs one
 message with that target leaf, and returns the (before, target) index pair,
 the signature, the envelope and generation g+1, again under a single
 (g, g+1) claim that runs only after every output exists.
+advance_and_sign_merkle_auth_state_batch is its batch counterpart: it
+restores the same way, advances to a caller-chosen still-signable target and
+then signs a non-empty tuple of messages on the consecutive leaves from
+that target in a single sign_batch run, returning the (before, target)
+index pair, the signature tuple, the envelope and generation g+1, all under
+the same single (g, g+1) claim.
 Both envelopes authenticate but do not encrypt and give no replay
 protection on their own.
 """
@@ -155,6 +161,7 @@ __all__ = [
     "WOTSPrivateKey",
     "WOTSPublicKey",
     "advance_and_sign_merkle_auth_state",
+    "advance_and_sign_merkle_auth_state_batch",
     "advance_merkle_auth_state",
     "auth_state_unwrap",
     "auth_state_wrap",
@@ -1206,6 +1213,133 @@ def advance_and_sign_merkle_auth_state(
     if result is not True:
         raise ValueError("claim callback did not return True")
     return (before, next_index), signature, envelope, next_generation
+
+
+def advance_and_sign_merkle_auth_state_batch(
+    data: Any, next_index: Any, messages: Any, *, key: Any,
+    min_generation: Any = None, claim: Any,
+) -> tuple[tuple[int, int], tuple[MerkleSignature, ...], bytes, int]:
+    """Restore, void leaves to ``next_index``, then sign a batch from there.
+
+    The batch counterpart of :func:`advance_and_sign_merkle_auth_state` and
+    the jump-first counterpart of :func:`sign_merkle_auth_state_batch`:
+    combines authenticated v2 restore, an :meth:`MerkleSigner.advance_to`
+    -semantics jump to ``next_index``, one contiguous
+    :meth:`MerkleSigner.sign_batch` run from that target and wrapping of the
+    advanced v1 checkpoint in a single call without mutating any object,
+    keeping any library state or introducing a new wire format. The envelope
+    in ``data`` is authenticated and restored exactly like
+    :meth:`MerkleSigner.from_auth_state`; the restored signer then advances
+    its next-leaf index to ``next_index`` exactly like
+    :meth:`MerkleSigner.advance_to` and signs every message in ``messages``
+    on the consecutive leaves starting at that target, exactly like
+    :meth:`MerkleSigner.sign_batch` would from the advanced state. ``key``,
+    ``min_generation`` and ``claim`` are keyword-only; only
+    ``min_generation`` has a default (``None``, no floor). Returns
+    ``((before, target), signatures, envelope, generation)``: the inner
+    tuple is the next-leaf index before and after the jump, exactly what
+    :meth:`MerkleSigner.advance_to` returns for the same target (an equal
+    target is legal and returns the same value twice); ``signatures`` is the
+    tuple of one :class:`MerkleSignature` per message (in order, with
+    strictly increasing indices beginning at ``target``), value-for-value
+    identical to ``advance_to(target)`` followed by
+    ``sign_batch(messages)`` on a signer restored from the same state;
+    ``envelope`` is the :func:`auth_state_wrap` v2 envelope (``bytes``) over
+    the v1 :meth:`MerkleSigner.checkpoint` bytes with
+    ``next_index == target + len(messages)``, ``scheme="merkle"``, the
+    original ``key`` and generation ``g + 1`` — byte-for-byte identical to
+    calling :func:`auth_state_wrap` on the checkpoint a signer advanced to
+    ``target`` and then batch-signed returns from :meth:`checkpoint` — and
+    ``generation`` is the new generation ``g + 1``.
+
+    ``data`` must be ``bytes`` or ``bytearray`` holding a v2 envelope;
+    ``next_index`` must be a non-boolean integer in the closed interval
+    ``[current next_index, leaf count - 1]`` — as in
+    :func:`advance_and_sign_merkle_auth_state`, the leaf count itself is not
+    a legal target because the target leaf must still be signable;
+    ``messages`` must be a **non-empty** ``tuple`` whose members each follow
+    the usual ``bytes``/``bytearray``/``str`` (UTF-8) message rules;
+    ``key`` must be a non-empty ``bytes``/``bytearray`` shared secret;
+    ``min_generation`` must be ``None`` or a non-boolean integer in
+    ``0 .. 2**64 - 1``; ``claim`` must be callable. A wrong type (including
+    a non-tuple ``messages``, a bad message member, a boolean target or
+    floor, or a non-callable claim) raises ``TypeError``. The v2 HMAC tag is
+    verified first with :func:`hmac.compare_digest`, the envelope is fixed
+    to ``"merkle"`` and the generation floor applied, the v1 checkpoint is
+    restored untouched, and the target is range-checked against the restored
+    state — a target below the restored current index or above the last leaf,
+    an empty batch, or an input generation ``g`` at the uint64 ceiling (it
+    must be strictly below ``2**64 - 1`` so ``g + 1`` fits) raises
+    ``ValueError``. A restored state without enough leaves left for the jump
+    plus the whole batch raises :class:`KeyExhaustedError`; the target leaf
+    itself is guaranteed signable, so this only fires when the batch runs
+    past the last leaf. The jump, every signature and the candidate advanced
+    checkpoint/envelope are built in one critical section, and only once
+    every output exists is ``claim`` called exactly once with the paired
+    token ``(("merkle", g), ("merkle", g + 1))``; the call succeeds only
+    when that return value ``is True`` — otherwise it raises ``ValueError``
+    — and any exception ``claim`` raises propagates untouched. No earlier
+    failure invokes the callback, advances any state or returns a partial
+    result. No object is mutated, the same inputs always produce
+    byte-identical outputs and no randomness is drawn. The envelope is
+    plaintext and authenticated only; it provides neither encryption nor
+    protection against replay or rollback on its own.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    if isinstance(next_index, bool) or not isinstance(next_index, int):
+        raise TypeError("next_index must be a non-boolean integer")
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    if not messages:
+        raise ValueError("messages must not be empty")
+    batch_messages = tuple(_as_bytes(message) for message in messages)
+
+    # Authenticate first: no field (including the generation) is trusted
+    # until the HMAC tag over the whole body checks out.
+    _, generation, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect="merkle",
+        min_generation=min_generation,
+    )
+    if generation >= 2**64 - 1:
+        raise ValueError("generation must be below 2**64-1 so it can advance by one")
+    next_generation = generation + 1
+    signer = MerkleSigner.from_checkpoint(checkpoint)
+    # Build every output before the claim: an out-of-range target, an
+    # under-capacity state or any failure here must leave no partial result
+    # and must not call claim.
+    with signer._lock:
+        before = signer._next_index
+        leaf_count = len(signer._private_keys)
+        if next_index < before or next_index > leaf_count - 1:
+            raise ValueError(
+                "next_index must be between the current index and the last leaf"
+            )
+        if len(batch_messages) > leaf_count - next_index:
+            raise KeyExhaustedError("not enough Merkle leaves remain for the batch")
+        signatures = tuple(
+            signer._signature_at(next_index + offset, message)
+            for offset, message in enumerate(batch_messages)
+        )
+        advanced_checkpoint = signer._checkpoint_bytes(
+            next_index + len(signatures)
+        )
+    envelope = auth_state_wrap(
+        advanced_checkpoint,
+        scheme="merkle",
+        key=key_bytes,
+        generation=next_generation,
+    )
+    result = claim_callable((("merkle", generation), ("merkle", next_generation)))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return (before, next_index), signatures, envelope, next_generation
 
 
 def lamport_signature_to_bytes(signature: Any, *, bits: int) -> bytes:

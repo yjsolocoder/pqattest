@@ -606,6 +606,30 @@ class RestoreOtsPairTest(unittest.TestCase):
             restore_ots_pair(self.envelope_a, bad_wots, key=KEY, claim=claim)
         self.assertEqual(claim.calls, [])
 
+    def test_both_tags_verified_before_any_field_parsed(self):
+        # Side a authenticates but has a field-level problem (a wots envelope
+        # in the lamport position); side b's tag does not verify. The tag
+        # mismatch must win: both HMACs are checked before either envelope's
+        # fields are parsed.
+        wrong_scheme_a = wrap_wots(self.wots, generation=5)
+        forged_b = bytearray(self.envelope_b)
+        forged_b[-1] ^= 0x01
+        claim = RecordingClaim()
+        with self.assertRaisesRegex(ValueError, "tag mismatch"):
+            restore_ots_pair(
+                wrong_scheme_a, bytes(forged_b), key=KEY, claim=claim
+            )
+        self.assertEqual(claim.calls, [])
+        # And mirrored: a's fields are fine, b's fields are wrong, a's tag bad.
+        forged_a = bytearray(self.envelope_a)
+        forged_a[-1] ^= 0x01
+        wrong_scheme_b = wrap_lamport(self.lamport, generation=5)
+        with self.assertRaisesRegex(ValueError, "tag mismatch"):
+            restore_ots_pair(
+                bytes(forged_a), wrong_scheme_b, key=KEY, claim=claim
+            )
+        self.assertEqual(claim.calls, [])
+
     def test_floor_equal_passes_above_fails(self):
         claim = RecordingClaim()
         restore_ots_pair(

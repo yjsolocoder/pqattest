@@ -234,6 +234,61 @@ def auth_state_wrap(
     return body + hmac.new(key_bytes, body, hashlib.sha256).digest()
 
 
+def _auth_state_authenticate(blob: bytes, key_bytes: bytes) -> bytes:
+    """Verify the v2 HMAC tag and return the authenticated body.
+
+    Once at least the 32 tag bytes are present, the last 32 bytes are taken
+    as the tag and everything before them as the authenticated body; the tag
+    is verified with :func:`hmac.compare_digest` before any field is trusted.
+    """
+    if len(blob) < _AUTH_TAG_BYTES:
+        raise ValueError("authenticated checkpoint is truncated")
+    body, tag = blob[:-_AUTH_TAG_BYTES], blob[-_AUTH_TAG_BYTES:]
+    expected_tag = hmac.new(key_bytes, body, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_tag, tag):
+        raise ValueError("authenticated checkpoint tag mismatch")
+    return body
+
+
+def _auth_state_parse(
+    body: bytes, *, expect: Any, min_generation: Any
+) -> tuple[str, int, bytes]:
+    """Parse an authenticated v2 body into ``(scheme, generation, payload)``.
+
+    Only called on a body whose tag has already verified; checks the magic,
+    version, scheme identifier, length field, payload magic, ``expect`` and
+    the generation floor, in that order.
+    """
+    if len(body) < _AUTH_V2_HEADER_BYTES:
+        raise ValueError("authenticated checkpoint is truncated")
+    if body[:8] != _AUTH_MAGIC:
+        raise ValueError("bad authenticated checkpoint magic")
+    if body[8] != _AUTH_V2_VERSION:
+        raise ValueError(f"unsupported authenticated checkpoint version: {body[8]}")
+    identifier = body[9]
+    try:
+        scheme, payload_magic = _SCHEME_IDS[identifier]
+    except KeyError:
+        raise ValueError(f"unknown scheme identifier: {identifier}") from None
+    generation = int.from_bytes(body[10:18], "big")
+    payload_length = int.from_bytes(body[18:22], "big")
+    expected_length = _AUTH_V2_HEADER_BYTES + payload_length
+    if len(body) < expected_length:
+        raise ValueError("authenticated checkpoint is truncated")
+    if len(body) > expected_length:
+        raise ValueError("trailing data after the authenticated checkpoint")
+
+    payload = body[_AUTH_V2_HEADER_BYTES:expected_length]
+    _check_payload_magic(payload, payload_magic, scheme)
+    if expect is not None and scheme != expect:
+        raise ValueError(f"envelope scheme {scheme!r} does not match expected {expect!r}")
+    if min_generation is not None and generation < min_generation:
+        raise ValueError(
+            f"checkpoint generation {generation} is below the minimum {min_generation}"
+        )
+    return scheme, generation, bytes(payload)
+
+
 def auth_state_unwrap(
     data: Any, *, key: Any, expect: Any = None, min_generation: Any = None
 ) -> tuple[str, int, bytes]:
@@ -274,44 +329,10 @@ def auth_state_unwrap(
     if min_generation is not None:
         _validate_generation(min_generation, "min_generation")
 
-    if len(blob) < _AUTH_TAG_BYTES:
-        raise ValueError("authenticated checkpoint is truncated")
-
     # Authenticate first: no field (including the generation) is trusted
     # until this tag over the whole body checks out.
-    body, tag = blob[:-_AUTH_TAG_BYTES], blob[-_AUTH_TAG_BYTES:]
-    expected_tag = hmac.new(key_bytes, body, hashlib.sha256).digest()
-    if not hmac.compare_digest(expected_tag, tag):
-        raise ValueError("authenticated checkpoint tag mismatch")
-
-    if len(body) < _AUTH_V2_HEADER_BYTES:
-        raise ValueError("authenticated checkpoint is truncated")
-    if body[:8] != _AUTH_MAGIC:
-        raise ValueError("bad authenticated checkpoint magic")
-    if body[8] != _AUTH_V2_VERSION:
-        raise ValueError(f"unsupported authenticated checkpoint version: {body[8]}")
-    identifier = body[9]
-    try:
-        scheme, payload_magic = _SCHEME_IDS[identifier]
-    except KeyError:
-        raise ValueError(f"unknown scheme identifier: {identifier}") from None
-    generation = int.from_bytes(body[10:18], "big")
-    payload_length = int.from_bytes(body[18:22], "big")
-    expected_length = _AUTH_V2_HEADER_BYTES + payload_length
-    if len(body) < expected_length:
-        raise ValueError("authenticated checkpoint is truncated")
-    if len(body) > expected_length:
-        raise ValueError("trailing data after the authenticated checkpoint")
-
-    payload = body[_AUTH_V2_HEADER_BYTES:expected_length]
-    _check_payload_magic(payload, payload_magic, scheme)
-    if expect is not None and scheme != expect:
-        raise ValueError(f"envelope scheme {scheme!r} does not match expected {expect!r}")
-    if min_generation is not None and generation < min_generation:
-        raise ValueError(
-            f"checkpoint generation {generation} is below the minimum {min_generation}"
-        )
-    return scheme, generation, bytes(payload)
+    body = _auth_state_authenticate(blob, key_bytes)
+    return _auth_state_parse(body, expect=expect, min_generation=min_generation)
 
 
 def _validate_claim(claim: Any) -> Callable[..., Any]:
@@ -360,9 +381,11 @@ def _restore_auth_state_pair(data_a: Any, data_b: Any, *, key: Any, floor: Any,
 
     Both blobs must verify under ``key``, the first must be a ``"lamport"``
     envelope and the second a ``"wots"`` envelope, their generations must be
-    equal and — when ``floor`` is given — at least that high. Both checkpoints
-    are restored before the single paired claim, so a caller can never
-    successfully claim only one side. ``claim`` is invoked exactly once with
+    equal and — when ``floor`` is given — at least that high. Both HMAC tags
+    are verified with :func:`hmac.compare_digest` before a single field of
+    either envelope is parsed, and both checkpoints are restored before the
+    single paired claim, so a caller can never successfully claim only one
+    side. ``claim`` is invoked exactly once with
     ``(("lamport", g), ("wots", g))`` after every restore has succeeded, and
     its return value is accepted only when it ``is True``; any exception it
     raises propagates untouched.
@@ -375,11 +398,15 @@ def _restore_auth_state_pair(data_a: Any, data_b: Any, *, key: Any, floor: Any,
     if floor is not None:
         _validate_generation(floor, "floor")
     claim_callable = _validate_claim(claim)
-    _, generation_a, checkpoint_a = auth_state_unwrap(
-        data_a, key=key_bytes, expect="lamport", min_generation=floor
+    # Authenticate both sides first: no field of either envelope is trusted
+    # until both tags check out.
+    body_a = _auth_state_authenticate(bytes(data_a), key_bytes)
+    body_b = _auth_state_authenticate(bytes(data_b), key_bytes)
+    _, generation_a, checkpoint_a = _auth_state_parse(
+        body_a, expect="lamport", min_generation=floor
     )
-    _, generation_b, checkpoint_b = auth_state_unwrap(
-        data_b, key=key_bytes, expect="wots", min_generation=floor
+    _, generation_b, checkpoint_b = _auth_state_parse(
+        body_b, expect="wots", min_generation=floor
     )
     if generation_a != generation_b:
         raise ValueError(

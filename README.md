@@ -321,6 +321,7 @@ MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # �
 - `sign_merkle_auth_state(data, message, *, key, min_generation=None, claim) -> (signature, envelope, generation)` — **无隐藏状态**的「认证恢复 + 单条签名 + 下一代封装」转换：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再用恢复签名器的**当前最小叶**对 `message`（沿用 `bytes`/`bytearray`/`str` 规则）签一条，最后把推进后（`next_index` 加一）的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。返回的 `signature` 与同状态下 `MerkleSigner.sign` 逐值相同；`envelope` 与对推进后检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一封装重复调用得到逐字节相同的结果（叶子是否真正作废由调用方在认领后只保存新封装来保证）。入参 `g` 必须小于 `2**64-1`，否则抛 `ValueError`；恢复出的签名器无叶可用时抛 `KeyExhaustedError`。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；封装失败、认证失败、代次低于下限、代次触顶、叶子用尽或认领拒绝等任何先前失败都**不调用** `claim` 且无部分返回。错型（`data`/`key` 非 `bytes`/`bytearray`、`min_generation` 为布尔或非整数、`claim` 不可调用）抛 `TypeError`，空 key 等抛 `ValueError`
 - `sign_merkle_auth_state_batch(data, messages, *, key, min_generation=None, claim) -> (signatures, envelope, generation)` — **无隐藏状态**的「认证恢复 + 连续批量签名 + 下一代封装」转换，合并 v2 恢复与 `sign_batch` 语义：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再按 `MerkleSigner.sign_batch` 的既有规则从恢复签名器的**当前最小叶**起对 `messages` **连续**签名（一次临界区、叶索引严格递增），最后把推进后（`next_index` 加批长）的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。`messages` 必须是**非空元组**，成员沿用 `bytes`/`bytearray`/`str`（UTF-8）规则；`data`/`key` 仅收 `bytes`/`bytearray` 且 `key` 非空；`min_generation` 为 `None` 或非布尔 uint64；`claim` 须可调用。返回 `(signatures, envelope, generation)`：`signatures` 为每消息一份 `MerkleSignature` 的元组（同序、索引连续，与同状态下 `sign_batch` 逐值相同），`envelope` 与对批签后检查点直接调用 `auth_state_wrap` **逐字节相同**，`generation` 为 `g+1`。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。整批容量不足时抛 `KeyExhaustedError`；入参 `g` 必须小于 `2**64-1`（否则 `ValueError`）。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（含空批、空 key、认证失败、代次低于下限、代次触顶、容量不足、认领拒绝）都**不调用** `claim`、不推进且无部分返回。错型抛 `TypeError`，空批、空 key 或其他库内拒绝抛 `ValueError`
 - `advance_merkle_auth_state(data, next_index, *, key, min_generation=None, claim) -> ((before, after), envelope, generation)` — **无隐藏状态**的「认证恢复 + 作废叶子 + 下一代封装」转换，是 `MerkleSigner.advance_to_with_auth_state` 的无状态对应物：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再按 `MerkleSigner.advance_to` 的既有语义把恢复签名器的下一可用叶索引推进到 `next_index`（低于目标的叶子此后再不能签名），最后把推进后的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。返回 `((before, after), envelope, generation)`：内层二元组为推进前后的原索引与目标，与同目标下 `advance_to` 的返回相同；`envelope` 与对推进后检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`。**等值推进合法**（`(x, x)`），即便封装的状态不变，仍产出下一代封装。`next_index` 须为闭区间 `[恢复状态的当前 next_index, 叶总数]` 内的非布尔整数；`data`/`key` 仅收 `bytes`/`bytearray` 且 `key` 非空；`min_generation` 为 `None` 或非布尔 uint64；`claim` 须可调用。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。倒退或超出叶总数抛 `ValueError`，入参 `g` 必须小于 `2**64-1`（否则 `ValueError`）。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（认证失败、代次低于下限、代次触顶、目标越界、检查点非法、认领拒绝）都**不调用** `claim`、不推进且无部分返回。错型（`data`/`key` 非 `bytes`/`bytearray`、目标或下限为布尔/非整数、`claim` 不可调用）抛 `TypeError`，空 key 等抛 `ValueError`
+- `advance_and_sign_merkle_auth_state(data, next_index, message, *, key, min_generation=None, claim) -> ((before, target), signature, envelope, generation)` — **无隐藏状态**的「认证恢复 + 跳叶 + 目标叶单签 + 下一代封装」转换，在一次调用里合并 `advance_merkle_auth_state` 的跳叶与 `sign_merkle_auth_state` 的单签：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 顺序用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再按 `MerkleSigner.advance_to` 语义把下一可用叶索引推进到 `next_index` 并在**目标叶**上对 `message`（沿用 `bytes`/`bytearray`/`str` 规则）签一条，最后把签名后（`next_index` 加一）的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。返回 `((before, target), signature, envelope, generation)`：内层二元组为跳转前索引与目标叶索引；`signature` 为目标叶的 `MerkleSignature`（与在推进到该叶的签名器上 `sign` 逐值相同）；`envelope` 与对「推进到 `next_index` 再签名」后的检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`。**等值目标合法**（`(x, x)`，索引不必移动，但叶子仍被签名消耗、代次仍推进）。`next_index` 须为闭区间 **`[恢复状态的当前 next_index, 叶总数-1]`** 内的非布尔整数——上界比叶总数小一，因为目标叶必须仍可签、签名后下一索引为 `next_index+1`；除 `next_index` 外，参数类型、默认值与错误规则全部沿用 `sign_merkle_auth_state`。恢复状态已无叶可签抛 `KeyExhaustedError`；认证/下限失败、目标倒退或越过可签范围、入参 `g` 触顶（必须小于 `2**64-1`）抛 `ValueError`；错型（含布尔目标）抛 `TypeError`。跳转、签名与候选检查点/封装在一次临界区内完成，不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败都**不调用** `claim`、不签名、不推进且无部分返回
 
 处理顺序固定：先以 `hmac.compare_digest` 验两侧 HMAC，再核对固定方案标识、载荷魔数与（成对的）同代/代次下限，最后恢复 v1 检查点；只有这一切都成功才调用一次 `claim` 并返回。因此任何 `ValueError`（空 `key`、坏标签/坏封装、v1 封装、方案不符、载荷魔数不符、代次低于下限、成对代次不一致、检查点非法，或认领未返回 `True`）发生时，回调**从未被调用**，调用方不可能认领一个没有成功恢复的状态（也不可能只认领成对中的一侧）。错型（非字节数据/密钥、非可调用 `claim`、布尔或非整数下限）抛 `TypeError`；不新增线格式、不使用随机数、不引入任何库内状态。
 
@@ -406,6 +407,23 @@ assert tuple(sig.index for sig in signatures) == (0, 1, 2)
 assert generation == 8
 for message, signature in zip(("claim 0", "claim 1", "claim 2"), signatures):
     assert merkle_verify(message, signature, signer.public_key)
+```
+
+崩溃恢复时若想跳过可能已暴露的叶子并直接在指定叶上签名，用 `advance_and_sign_merkle_auth_state`：一次调用完成跳叶与目标叶单签，签名后状态推进到 `target+1`、代次推进一格，认领令牌仍是同一对 `(g, g+1)`；目标必须落在可签区间 `[当前 next_index, 叶总数-1]`，恢复状态已用尽或目标越过最后一片叶子时不签名、不认领：
+
+```python
+from pqattest import advance_and_sign_merkle_auth_state
+
+(before, target), signature, next_blob, generation = (
+    advance_and_sign_merkle_auth_state(
+        blob, 3, b"position claim", key=key,
+        min_generation=state["high_water"], claim=claim_transition,
+    )
+)
+assert (before, target) == (0, 3)       # 跳过 0..2，在叶 3 上签名
+assert signature.index == 3
+assert generation == 8
+assert merkle_verify(b"position claim", signature, signer.public_key)
 ```
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：

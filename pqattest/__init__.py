@@ -37,7 +37,11 @@ joint lock and returns both signatures together with the v2 envelopes of
 the two advanced states, so the pair either advances together or not at
 all;
 restore_merkle_claimed does the same one-step authenticated restore and
-claim for a Merkle signer v2 envelope.
+claim for a Merkle signer v2 envelope;
+sign_merkle_auth_state restores a Merkle signer v2 envelope, signs one
+message with the restored signer and wraps the advanced state at the next
+generation, claiming the generation pair with a single callback, so the
+whole restore-sign-rewrap transition keeps no hidden state.
 Both envelopes authenticate but do not encrypt and give no replay
 protection on their own.
 """
@@ -54,6 +58,7 @@ from ._errors import KeyExhaustedError
 from .auth import (
     _restore_auth_state,
     _restore_auth_state_pair,
+    _validate_claim,
     _validate_generation,
     _validate_key,
     auth_state_unwrap,
@@ -160,6 +165,7 @@ __all__ = [
     "recommend_merkle_transport_workload",
     "recommend_merkle_mode_deployment",
     "sign",
+    "sign_merkle_auth_state",
     "sign_ots_pair",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
@@ -796,6 +802,85 @@ def restore_merkle_claimed(
         claim=claim,
         restore=MerkleSigner.from_checkpoint,
     )
+
+
+def sign_merkle_auth_state(
+    data: Any, message: Any, *, key: Any, min_generation: Any = None, claim: Any
+) -> tuple[MerkleSignature, bytes, int]:
+    """Restore a Merkle signer, sign once and wrap the next generation.
+
+    The signing counterpart of :func:`restore_merkle_claimed`: combines v2
+    verification, the generation floor, the v1 checkpoint restore, a single
+    :meth:`MerkleSigner.sign` and the v2 re-wrap of the advanced state in
+    one call without drawing randomness or keeping hidden state, and — only
+    once every output has been produced — performs the external monotonic
+    claim for the generation transition, so a caller can never accept a
+    signed state without also claiming both generations. Only an envelope
+    produced by :func:`auth_state_wrap` with ``scheme="merkle"`` is
+    accepted; no new wire format or library state is introduced. ``key``,
+    ``min_generation`` and ``claim`` are keyword-only; only
+    ``min_generation`` has a default (``None``, no floor). Returns
+    ``(signature, envelope, generation)``: the :class:`MerkleSignature`
+    over ``message`` produced by the restored signer at its current lowest
+    unused leaf, the :func:`auth_state_wrap` v2 envelope (``bytes``) over
+    the post-sign v1 :meth:`MerkleSigner.checkpoint` bytes with
+    ``scheme="merkle"``, the original ``key`` and the advanced generation —
+    byte-for-byte identical to restoring, signing and then wrapping an
+    explicit checkpoint — and the advanced generation ``generation + 1``
+    itself.
+
+    ``data`` must be ``bytes`` or ``bytearray``; ``message`` follows the
+    usual ``bytes``/``bytearray``/``str`` rules; ``key`` must be a
+    non-empty ``bytes``/``bytearray`` shared secret; ``min_generation``
+    must be ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``;
+    ``claim`` must be callable. A wrong type (including a boolean floor or
+    a non-callable claim) raises ``TypeError``. The v2 HMAC tag is verified
+    first with :func:`hmac.compare_digest`; the envelope scheme is then
+    fixed to ``"merkle"``, the payload magic checked and the generation
+    floor applied; only afterwards is the untouched payload handed to
+    :meth:`MerkleSigner.from_checkpoint`. The envelope generation must be
+    below ``2**64 - 1`` so the advanced state can be wrapped at
+    ``generation + 1``. The restored signer signs ``message`` at its
+    current lowest unused leaf; an exhausted checkpoint raises
+    :class:`KeyExhaustedError`. Only after the signature and the new
+    envelope have both been produced is ``claim`` called exactly once with
+    the paired token ``(("merkle", generation), ("merkle", generation +
+    1))``; the call succeeds only when that callback returns ``True``
+    (compared by identity), and any exception it raises propagates
+    untouched. An empty key, a bad tag or envelope, a non-merkle scheme
+    (including a v1 envelope), a generation below the floor, a generation
+    of ``2**64 - 1``, an invalid checkpoint, or a claim that is not
+    ``True`` raises ``ValueError`` and the callback is never invoked on
+    such a failure; no partial result is returned either way.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    message = _as_bytes(message)
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+    _, generation_value, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect="merkle",
+        min_generation=min_generation,
+    )
+    signer = MerkleSigner.from_checkpoint(checkpoint)
+    next_generation = _validate_generation(generation_value + 1, "generation")
+    signature = signer.sign(message)
+    envelope = auth_state_wrap(
+        signer.checkpoint(),
+        scheme="merkle",
+        key=key_bytes,
+        generation=next_generation,
+    )
+    result = claim_callable(
+        (("merkle", generation_value), ("merkle", next_generation))
+    )
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return signature, envelope, next_generation
 
 
 def lamport_signature_to_bytes(signature: Any, *, bits: int) -> bytes:

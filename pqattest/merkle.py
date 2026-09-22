@@ -29,7 +29,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ._errors import KeyExhaustedError
-from .auth import _validate_generation, _validate_key, auth_state_wrap
+from .auth import (
+    _validate_generation,
+    _validate_key,
+    auth_state_unwrap,
+    auth_state_wrap,
+)
 from .wots import (
     ELEMENT_BYTES,
     WOTSPrivateKey,
@@ -765,6 +770,53 @@ class MerkleSigner:
         if signer._public_key.root != root:
             raise ValueError("Merkle root rebuilt from the private keys does not match")
         return signer
+
+    @classmethod
+    def from_auth_state(
+        cls, data: Any, *, key: Any, min_generation: Any = None
+    ) -> tuple["MerkleSigner", int]:
+        """Restore a signer from a v2 authenticated envelope without randomness.
+
+        Combines :func:`auth_state_unwrap` and :meth:`from_checkpoint` in one
+        recovery entry point. ``data`` must be ``bytes`` or ``bytearray``
+        holding the exact v2 envelope produced by
+        :func:`auth_state_wrap` with ``scheme="merkle"`` — the 8-byte magic
+        ``b"PQAAUTH\\0"``, the version byte (2), the scheme identifier (3),
+        the generation as 8 big-endian bytes, the payload length as 4
+        big-endian bytes, the original v1 :meth:`checkpoint` payload and the
+        trailing 32-byte ``HMAC-SHA-256`` tag; no other layout is accepted.
+        ``key`` is keyword-only and must be the non-empty
+        ``bytes``/``bytearray`` shared secret the envelope was wrapped with;
+        ``min_generation`` is keyword-only and is ``None`` (the default: no
+        floor) or a non-boolean integer in ``0 .. 2**64 - 1`` kept in the
+        caller's own trusted storage — the envelope never carries it.
+
+        Returns ``(signer, generation)``: the restored :class:`MerkleSigner`
+        and the envelope's generation as a non-negative ``int``. The restored
+        signer is exactly what :meth:`from_checkpoint` returns for the
+        wrapped payload — the same public key, the same ``next_index`` and
+        the same exhaustion semantics (a checkpoint taken after the last leaf
+        was spent restores a signer whose every :meth:`sign` raises
+        :class:`KeyExhaustedError`).
+
+        The checks run in a fixed order and no instance exists before all of
+        them pass: first the HMAC tag is verified under the existing v2 rules
+        (no field is trusted before it checks out), then the scheme is
+        required to be ``"merkle"`` and the generation floor is applied, and
+        only then is the unmodified payload handed to
+        :meth:`from_checkpoint`. A non-bytes ``data``/``key`` or a
+        ``min_generation`` that is neither ``None`` nor a non-boolean integer
+        raises ``TypeError``; an empty key, an out-of-range floor, a bad
+        magic/version/scheme identifier/length field, truncation, trailing
+        data, a tag mismatch, a payload whose magic is not the Merkle
+        checkpoint's, a generation below the floor, or any checkpoint-level
+        invalidity raises ``ValueError`` and no instance is returned. No
+        randomness is drawn anywhere in the call.
+        """
+        _scheme, generation, checkpoint = auth_state_unwrap(
+            data, key=key, expect="merkle", min_generation=min_generation
+        )
+        return cls.from_checkpoint(checkpoint), generation
 
     def advance_to(self, next_index: Any) -> tuple[int, int]:
         """Void leaves by advancing ``next_index`` to ``next_index``.

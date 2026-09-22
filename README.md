@@ -515,6 +515,7 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `merkle_verify_workload_profile(w, height, groups, modes)` — 纯函数：把 `merkle_verify_profile` 的成本比较推广到**多个独立叶索引组**，每组各自携带一份批次证明或多证明但共用同一棵 Merkle 树，按组比较 batch 与 multiproof 混合方案的 SHA-256 工作量并给出全局合计，返回 `MerkleVerifyWorkloadProfile`，不生成密钥、不取随机数、不修改状态，旧接口与线格式不变。`w` 仅为 4 或 8，`height` 仅为 1..8 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增且落在 `0 .. 2**height-1` 内的非布尔整数元组（各组沿用 `merkle_verify_profile` 的单组规则）；`modes` 为与 `groups` 等长的元组，每项仅为 `"batch"` 或 `"multiproof"`。每组复用 `merkle_verify_profile(w, height, group)`：模式 `batch` 取其 `batch`、`multiproof` 取其 `multi` 作为内部节点哈希数；五元组依次为模式名、W-OTS 链步、叶哈希、内部节点哈希、该组三项哈希总数，`total` 为各组总数之和，重复组也分别计费。`groups`/`modes`（含成员组本身）容器错型或模式成员非字符串抛 `TypeError`；`groups` 为空、单组违反单组规则（空元组、布尔或非整数成员、越界、重复或乱序）、`modes` 长度与 `groups` 不符、出现未知模式，以及非法 `w` 或 `height` 均抛 `ValueError`
 - `MerkleModeCost` — 冻结的模式选择与验签哈希成本配对值对象，三个字段按位置依次为 `plan, cost, nodes`，类型依次为 `MerkleTransportWorkloadProfile`、`MerkleVerifyWorkloadProfile`、`int`：传输方案（配置、逐组模式、逐组尺寸、总量）、同参数的验签 SHA-256 工作量及仅累计 multiproof 组的规范节点总数（batch 组计 0）；冻结、可位置构造、按值相等（可哈希）
 - `merkle_verify_mode_frontier(capacity, groups, budgets)` — 与 `merkle_mode_frontier` 同一工作负载与逐组模式枚举，但在五项传输/链步预算之外**再加一项验签 SHA-256 总量预算**，返回全部可行且非支配的选择，类型为 `tuple[MerkleModeCost, ...]`，不改变旧接口与任何线格式。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity`、`groups` 完全沿用 `merkle_mode_frontier` 的类型、范围与异常规则；`budgets` 必须为**六元组**，预算成员规则（各项为 `None` 或正的非布尔整数、至少一项非空、含边界、非元组抛 `TypeError`、长度或成员非法抛 `ValueError`）也沿用之，按顺序分别限制检查点字节、单组峰值、总传输字节、单签验签步数、multiproof 节点总数及**验签 SHA-256 总数**（`MerkleVerifyWorkloadProfile.total`）。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 与各组最大索引的全部候选，以及每组两种模式的全部 `2**len(groups)` 组合；`plan` 按现有公式保存配置、模式、逐组尺寸与总量，`cost` 取同参数 `merkle_verify_workload_profile(w, height, groups, modes)` 的结果，`nodes` 仅累计 multiproof 组的规范节点。支配判定：A 在六项成本（检查点、单组峰值、总量、单签步数、节点总数、验签哈希总数）上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按单签步数、验签哈希总量、总传输字节、单组峰值、节点总数、检查点字节、叶数、`w`、`height`、`modes` 字典序稳定升序排列；无可行项抛 `ValueError`
+- `merkle_cardinality_frontier(capacity, group_sizes, budgets)` — 面向**叶位置尚未确定**的多组传输规划：每组只给出叶数（`group_sizes`），其余沿用 `merkle_verify_mode_frontier` 的六元预算、六项成本 Pareto、去重与排序，返回 `tuple[MerkleModeCost, ...]`，旧接口不变。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`group_sizes` 必须为非空正整数元组，每项是一个独立索引组的叶数，重复项分别计费，且每项不得大于候选树叶数（否则无可行项）。枚举 `w=4/8` × `height=1..8` 中叶数同时覆盖 `capacity` 与各组叶数的全部候选，以及每组两种模式的全部 `2**len(group_sizes)` 组合。对 `k` 叶的组：`batch` 沿用固定公式——线长 `58 + k*(4+S)`、携带节点数 `0`、内部哈希数 `k*height`；`multiproof` 在该树**全部同规模严格递增索引子集**上分别取传输字节（`60 + k*(4+32*n) + 35*m`）、规范携带节点数 `m` 与内部哈希数的**最大值**。节点最坏值满足递归 `m(H,k) = max_j (2*j-k + m(H-1,j))`（`ceil(k/2) <= j <= min(k, 2**(H-1))`，`m(1,1)=1`、`m(1,2)=0`，全树 `k=2**H` 时 `m=0`）；k 叶多证明的内部节点合并对任意子集恒为 `k+m-1` 次哈希，故同一最坏子集同时取中三项最大值。`budgets` 完全沿用联合前沿的六元含边界上限（检查点、单组峰值、总传输、单签步数、节点总数、验签 SHA-256 总数；各项 `None` 或正的非布尔整数且至少一项非空）。结果中 `plan.sizes`、`plan.total`、`cost.costs`（逐组 `(模式, W-OTS 链步, 叶哈希, 内部哈希, 合计)`）、`cost.total` 与 `nodes` 均记录上述逐组最坏值或其和。`group_sizes`/`budgets` 非元组、前者含非整数成员抛 `TypeError`；空元组、布尔或非正成员、非法 `capacity`、非法预算、叶数超过全部候选树或无可行项抛 `ValueError`
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -535,6 +536,7 @@ from pqattest import (
     merkle_verify_workload_profile,
     MerkleModeCost,
     merkle_verify_mode_frontier,
+    merkle_cardinality_frontier,
 )
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
@@ -630,6 +632,14 @@ merkle_verify_workload_profile(
 # 节点、检查点、叶数、w、height、modes 字典序升序；无可行项时抛 ValueError
 merkle_verify_mode_frontier(
     16, ((0, 1), (3, 5)), (None, 5000, 12000, None, 8, None)
+)
+# (MerkleModeCost(plan=MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...),
+#                 cost=MerkleVerifyWorkloadProfile(...), nodes=...), ...)
+
+# 叶位置未定：只给每组叶数（如两组分别用 2 叶和 3 叶），multiproof 组按该树
+# 全部同规模索引子集中的最坏情况计费；预算六元组与上面的联合前沿完全一致
+merkle_cardinality_frontier(
+    16, (2, 3), (None, 5000, 12000, None, None, None)
 )
 # (MerkleModeCost(plan=MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...),
 #                 cost=MerkleVerifyWorkloadProfile(...), nodes=...), ...)

@@ -47,6 +47,12 @@ no old interface or wire byte. sign_merkle_auth_state_batch is the batch
 counterpart: it restores the same way, signs a non-empty tuple of messages
 with consecutive leaves in a single sign_batch run, and returns the
 signature tuple together with the envelope and generation g+1.
+advance_merkle_auth_state is the stateless restore-void-wrap conversion: it
+authenticates a Merkle v2 envelope and restores its v1 payload, advances
+the restored signer's next_index per advance_to semantics, wraps the
+advanced checkpoint at generation g+1 and, only once every output exists,
+performs one paired claim over the (g, g+1) transition — an equal target is
+legal and still yields the next-generation envelope.
 Both envelopes authenticate but do not encrypt and give no replay
 protection on their own.
 """
@@ -142,6 +148,7 @@ __all__ = [
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
     "WOTSPublicKey",
+    "advance_merkle_auth_state",
     "auth_state_unwrap",
     "auth_state_wrap",
     "auth_unwrap",
@@ -992,6 +999,102 @@ def sign_merkle_auth_state_batch(
     if result is not True:
         raise ValueError("claim callback did not return True")
     return signatures, envelope, next_generation
+
+
+def advance_merkle_auth_state(
+    data: Any, next_index: Any, *, key: Any, min_generation: Any = None, claim: Any
+) -> tuple[tuple[int, int], bytes, int]:
+    """Restore a Merkle v2 envelope, void leaves, and wrap the advanced state.
+
+    The stateless counterpart of
+    :meth:`MerkleSigner.advance_to_with_auth_state`: combines authenticated
+    v2 restore, one :meth:`MerkleSigner.advance_to`-style leaf voiding and
+    wrapping of the advanced v1 checkpoint in a single call without mutating
+    any object, keeping any library state or introducing a new wire format.
+    The envelope in ``data`` is authenticated and restored exactly like
+    :meth:`MerkleSigner.from_auth_state`; the restored signer's
+    ``next_index`` is then advanced to ``next_index`` under exactly the
+    :meth:`MerkleSigner.advance_to` rules. ``key``, ``min_generation`` and
+    ``claim`` are keyword-only; only ``min_generation`` has a default
+    (``None``, no floor). Returns ``((before, after), envelope, generation)``:
+    the inner tuple is the next-leaf index before and after the jump (the
+    original index and the target, exactly what
+    :meth:`MerkleSigner.advance_to` returns for the same target), the
+    :func:`auth_state_wrap` v2 envelope (``bytes``) over the advanced v1
+    :meth:`MerkleSigner.checkpoint` bytes with ``scheme="merkle"``, the
+    original ``key`` and generation ``g + 1`` — byte-for-byte identical to
+    calling :func:`auth_state_wrap` on the checkpoint a signer with the
+    advanced ``next_index`` returns from :meth:`checkpoint` — and the new
+    generation ``g + 1``. An equal target is legal: the state does not move,
+    but a next-generation envelope authenticating that state is still
+    produced.
+
+    ``data`` must be ``bytes`` or ``bytearray`` holding a v2 envelope;
+    ``next_index`` must be a non-boolean integer in the closed interval
+    ``[current value, leaf count]`` of the restored signer; ``key`` must be a
+    non-empty ``bytes``/``bytearray`` shared secret; ``min_generation`` must
+    be ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``; ``claim``
+    must be callable. A wrong type (including a boolean target or floor, or a
+    non-callable claim) raises ``TypeError``. An empty key, a bad envelope, a
+    target below the restored index or above the leaf count, or a generation
+    ``g`` at the uint64 ceiling (it must be strictly below ``2**64 - 1`` so
+    the advanced generation fits) raises ``ValueError``. The v2 HMAC tag is
+    verified first with :func:`hmac.compare_digest`, the envelope is then
+    fixed to ``"merkle"`` and the generation floor applied, only afterwards
+    is the untouched v1 payload restored via
+    :meth:`MerkleSigner.from_checkpoint` and advanced per
+    :meth:`MerkleSigner.advance_to` semantics, the candidate advanced
+    checkpoint/envelope are built, and only once every output exists is
+    ``claim`` called exactly once with the paired token
+    ``(("merkle", g), ("merkle", g + 1))``; the call succeeds only when that
+    return value ``is True`` — otherwise it raises ``ValueError`` — and any
+    exception ``claim`` raises propagates untouched. No earlier failure
+    invokes the callback or returns a partial result. No randomness is drawn,
+    no input is mutated, and the same inputs always produce byte-identical
+    outputs. The envelope is plaintext and authenticated only; it provides
+    neither encryption nor protection against replay or rollback on its own.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    if isinstance(next_index, bool) or not isinstance(next_index, int):
+        raise TypeError("next_index must be a non-boolean integer")
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+
+    # Authenticate first: no field (including the generation) is trusted
+    # until the HMAC tag over the whole body checks out.
+    _, generation, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect="merkle",
+        min_generation=min_generation,
+    )
+    if generation >= 2**64 - 1:
+        raise ValueError("generation must be below 2**64-1 so it can advance by one")
+    next_generation = generation + 1
+    signer = MerkleSigner.from_checkpoint(checkpoint)
+    # Build every output before the claim: an out-of-range target or any
+    # failure here must leave no partial result and must not call claim.
+    with signer._lock:
+        before = signer._next_index
+        leaf_count = len(signer._private_keys)
+        if next_index < before or next_index > leaf_count:
+            raise ValueError(
+                "next_index must be between the current index and the leaf count"
+            )
+        advanced_checkpoint = signer._checkpoint_bytes(next_index)
+    envelope = auth_state_wrap(
+        advanced_checkpoint,
+        scheme="merkle",
+        key=key_bytes,
+        generation=next_generation,
+    )
+    result = claim_callable((("merkle", generation), ("merkle", next_generation)))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return (before, next_index), envelope, next_generation
 
 
 def lamport_signature_to_bytes(signature: Any, *, bits: int) -> bytes:

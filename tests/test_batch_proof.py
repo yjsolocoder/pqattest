@@ -476,5 +476,224 @@ class BatchVerifyTest(unittest.TestCase):
         self.assertEqual(sorted(vars(batch).keys()), ["public_key", "signatures"])
 
 
+class BatchVerifyBoundTest(unittest.TestCase):
+    def test_bound_verifies_signed_messages(self):
+        signer, batch = make_batch(messages=("m0", "m1", "m2"))
+        self.assertTrue(batch.verify_bound(("m0", "m1", "m2"), public_key=signer.public_key))
+        indices = tuple(signature.index for signature in batch.signatures)
+        self.assertTrue(
+            batch.verify_bound(
+                ("m0", "m1", "m2"),
+                public_key=signer.public_key,
+                indices=indices,
+            )
+        )
+
+    def test_message_types_match_merkle_verify(self):
+        messages = ("claim", b"bytes claim", bytearray(b"array claim"))
+        signer = make_signer()
+        signatures = tuple(signer.sign(message) for message in messages)
+        batch = MerkleBatchProof(signer.public_key, signatures)
+        self.assertTrue(batch.verify_bound(messages, public_key=signer.public_key))
+
+    def test_value_equal_distinct_key_accepted(self):
+        signer, batch = make_batch()
+        other = MerklePublicKey(
+            w=signer.public_key.w,
+            height=signer.public_key.height,
+            root=signer.public_key.root,
+        )
+        self.assertIsNot(other, signer.public_key)
+        self.assertTrue(batch.verify_bound(("m0", "m1", "m2"), public_key=other))
+
+    def test_public_key_must_be_keyword(self):
+        _, batch = make_batch()
+        with self.assertRaises(TypeError):
+            batch.verify_bound(("m0", "m1", "m2"), make_signer().public_key)
+
+    def test_wrong_public_key_type_raises_type_error(self):
+        _, batch = make_batch()
+        for bad in (None, 42, 4.5, "key", b"key", object(), ()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    batch.verify_bound(("m0", "m1", "m2"), public_key=bad)
+
+    def test_public_key_value_mismatch_is_false(self):
+        _, batch = make_batch(messages=("m0",))
+        own = batch.public_key
+        foreign = make_signer(start=1000).public_key
+        cases = (
+            foreign,
+            MerklePublicKey(w=8, height=own.height, root=own.root),
+            MerklePublicKey(w=own.w, height=1, root=own.root),
+            MerklePublicKey(w=own.w, height=own.height, root=bytes(32)),
+        )
+        for bad_key in cases:
+            with self.subTest(bad_key=bad_key):
+                self.assertFalse(
+                    batch.verify_bound(("m0",), public_key=bad_key)
+                )
+
+    def test_verification_failure_is_false_even_with_matching_key(self):
+        _, batch = make_batch(messages=(b"a", b"b"))
+        for messages in ((b"a", b"x"), (b"x", b"b"), (b"b", b"a")):
+            with self.subTest(messages=messages):
+                self.assertFalse(
+                    batch.verify_bound(messages, public_key=batch.public_key)
+                )
+
+    def test_non_tuple_and_count_mismatch_and_bad_member_are_false(self):
+        _, batch = make_batch(messages=("m0", "m1", "m2"))
+        key = batch.public_key
+        for bad in (None, 42, 4.5, ["m0", "m1", "m2"], b"m0m1m2", object()):
+            with self.subTest(bad=type(bad).__name__):
+                self.assertFalse(batch.verify_bound(bad, public_key=key))
+        self.assertFalse(batch.verify_bound(("m0", "m1"), public_key=key))
+        self.assertFalse(batch.verify_bound(("m0", "m1", "m2", "m3"), public_key=key))
+        self.assertFalse(batch.verify_bound((), public_key=key))
+        self.assertFalse(
+            batch.verify_bound(("m0", None, "m2"), public_key=key)
+        )
+
+    def test_indices_none_imposes_no_leaf_restriction(self):
+        signer = make_signer(height=3)
+        signer.sign("gap0")
+        first = signer.sign("a")
+        signer.sign("gap2")
+        second = signer.sign("b")
+        batch = MerkleBatchProof(signer.public_key, (first, second))
+        self.assertTrue(batch.verify_bound(("a", "b"), public_key=signer.public_key))
+        self.assertTrue(
+            batch.verify_bound(
+                ("a", "b"), public_key=signer.public_key, indices=None
+            )
+        )
+
+    def test_explicit_indices_must_match_signatures_positionally(self):
+        signer = make_signer(height=3)
+        signer.sign("gap0")
+        first = signer.sign("a")
+        signer.sign("gap2")
+        second = signer.sign("b")
+        batch = MerkleBatchProof(signer.public_key, (first, second))
+        self.assertEqual((first.index, second.index), (1, 3))
+        self.assertTrue(
+            batch.verify_bound(
+                ("a", "b"), public_key=signer.public_key, indices=(1, 3)
+            )
+        )
+        for bad in ((1, 2), (0, 3), (3, 1), (1, 1), (1,), (1, 3, 5)):
+            with self.subTest(indices=bad):
+                self.assertFalse(
+                    batch.verify_bound(
+                        ("a", "b"), public_key=signer.public_key, indices=bad
+                    )
+                )
+
+    def test_non_tuple_indices_raises_type_error(self):
+        _, batch = make_batch()
+        for bad in (42, [0, 1, 2], b"\x00\x01\x02", {0, 1, 2}):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    batch.verify_bound(
+                        ("m0", "m1", "m2"),
+                        public_key=batch.public_key,
+                        indices=bad,
+                    )
+
+    def test_non_integer_index_member_raises_type_error(self):
+        _, batch = make_batch()
+        for bad in ((0, 1.0, 2), (0, "1", 2), (0, None, 2), (0, (1,), 2)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    batch.verify_bound(
+                        ("m0", "m1", "m2"),
+                        public_key=batch.public_key,
+                        indices=bad,
+                    )
+
+    def test_boolean_index_members_are_false_not_raising(self):
+        signer, batch = make_batch(messages=("m0", "m1", "m2"))
+        indices = tuple(signature.index for signature in batch.signatures)
+        for bad in (
+            (False, indices[1], indices[2]),
+            (indices[0], True, indices[2]),
+            (True,),
+        ):
+            with self.subTest(bad=bad):
+                self.assertFalse(
+                    batch.verify_bound(
+                        ("m0", "m1", "m2")[: len(bad)],
+                        public_key=signer.public_key,
+                        indices=bad,
+                    )
+                )
+
+    def test_duplicate_unordered_and_out_of_range_indices_are_false(self):
+        _, batch = make_batch()
+        key = batch.public_key
+        for bad in ((0, 0, 2), (0, 2, 1), (-1, 1, 2), (0, 1, 4)):
+            with self.subTest(bad=bad):
+                self.assertFalse(
+                    batch.verify_bound(
+                        ("m0", "m1", "m2"), public_key=key, indices=bad
+                    )
+                )
+
+    def test_type_errors_take_precedence_over_other_failures(self):
+        _, batch = make_batch()
+        # A non-tuple indices tuple-type error surfaces even though messages
+        # and the key would otherwise fail too.
+        with self.assertRaises(TypeError):
+            batch.verify_bound(
+                ("wrong", "also", "bad"),
+                public_key="not-a-key",
+                indices=[0, 1, 2],
+            )
+        with self.assertRaises(TypeError):
+            batch.verify_bound(
+                ("m0", "m1", "m2"),
+                public_key=batch.public_key,
+                indices=(0, 1.5, 2),
+            )
+
+    def test_malformed_bypass_constructed_batch_is_false(self):
+        signer, batch = make_batch()
+        rogue = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue, "public_key", "not-a-key")
+        object.__setattr__(rogue, "signatures", "not-a-tuple")
+        self.assertFalse(
+            rogue.verify_bound(("m0", "m1", "m2"), public_key=signer.public_key)
+        )
+        rogue2 = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue2, "public_key", batch.public_key)
+        object.__setattr__(rogue2, "signatures", (batch.signatures[0], "x"))
+        self.assertFalse(
+            rogue2.verify_bound(
+                ("m0", "m1"), public_key=signer.public_key, indices=(0, 1)
+            )
+        )
+
+    def test_round_tripped_batch_still_verifies_bound(self):
+        messages = ("m0", "m1", "m2")
+        signer, batch = make_batch(messages=messages)
+        restored = MerkleBatchProof.from_bytes(batch.to_bytes())
+        self.assertEqual(restored, batch)
+        indices = tuple(signature.index for signature in batch.signatures)
+        self.assertTrue(
+            restored.verify_bound(
+                messages, public_key=signer.public_key, indices=indices
+            )
+        )
+
+    def test_plain_verify_unchanged(self):
+        messages = ("m0", "m1", "m2")
+        signer, batch = make_batch(messages=messages)
+        self.assertTrue(batch.verify(messages))
+        self.assertFalse(batch.verify(("m0", "m1", "other")))
+        # No state is stored on the proof.
+        self.assertEqual(sorted(vars(batch).keys()), ["public_key", "signatures"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,9 @@ format via ``to_bytes`` / ``from_bytes`` (the signature codec is constrained
 by the corresponding :class:`MerklePublicKey`). A :class:`MerkleProof`
 bundles one public key and one signature for independent transport, and a
 :class:`MerkleBatchProof` does the same for several signatures of the same
-public key. The top-level :func:`multiproof_encode` /
+public key; :meth:`MerkleBatchProof.verify_bound` additionally binds such a
+batch to the receiver's expected public key and, optionally, an explicit
+leaf-index selection. The top-level :func:`multiproof_encode` /
 :func:`multiproof_verify` pair compresses several signatures of the same
 public key further into one deterministic proof whose shared authentication
 nodes are deduplicated into a canonical node set;
@@ -470,9 +472,11 @@ class MerkleBatchProof:
     The batch generalises :class:`MerkleProof`: every
     :class:`MerkleSignature` in ``signatures`` is constrained by the same
     :class:`MerklePublicKey`, so the whole batch travels as one
-    self-contained object and verifies with :meth:`verify`. ``signatures``
-    must be a non-empty tuple whose leaf indices are strictly increasing
-    (hence unique). The batch stores no messages and is a pure
+    self-contained object and verifies with :meth:`verify`.
+    :meth:`verify_bound` additionally binds the batch to the receiver's
+    expected public key and, optionally, an explicit leaf-index selection.
+    ``signatures`` must be a non-empty tuple whose leaf indices are strictly
+    increasing (hence unique). The batch stores no messages and is a pure
     serialisation container: it offers neither authentication nor
     encryption of the wrapper itself.
     """
@@ -585,6 +589,65 @@ class MerkleBatchProof:
             merkle_verify(message, signature, self.public_key)
             for message, signature in zip(messages, self.signatures)
         )
+
+    def verify_bound(
+        self, messages: Any, *, public_key: Any, indices: Any = None
+    ) -> bool:
+        """Verify every signature and bind the batch to an expected key/leaves.
+
+        Runs the exact per-item verification of :meth:`verify` — each member
+        of ``messages`` is checked with :func:`merkle_verify` against the
+        signature at the same tuple position, accepting
+        ``bytes``/``bytearray``/``str`` (a ``str`` is encoded as UTF-8) — and
+        additionally requires ``public_key`` to equal the public key embedded
+        in the batch value by value (``w``, ``height`` and ``root``). No wire
+        format changes, no new objects, no randomness and no state are
+        involved.
+
+        ``public_key`` must be a :class:`MerklePublicKey`; any other type
+        raises ``TypeError``. ``indices=None`` imposes no constraint on the
+        leaf selection. An explicit ``indices`` must be a tuple — any other
+        container type raises ``TypeError``, as does any member that is not an
+        integer — with exactly as many members as ``messages``; every member
+        must be a non-boolean integer, the values must be strictly increasing
+        and identical, position by position, to the ``index`` of the
+        signature in the same slot. A boolean member, a duplicate, an
+        out-of-order or out-of-range value, a wrong count, a non-tuple or
+        ill-sized ``messages``, an illegal message member, and any
+        cryptographic, structural or public-key-value mismatch all return
+        ``False``.
+        """
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        if indices is not None:
+            if not isinstance(indices, tuple):
+                raise TypeError("indices must be a tuple of integers")
+            for index in indices:
+                if not isinstance(index, int):
+                    raise TypeError("every index must be an integer")
+        try:
+            if not self.verify(messages):
+                return False
+            if (
+                public_key.w != self.public_key.w
+                or public_key.height != self.public_key.height
+                or public_key.root != self.public_key.root
+            ):
+                return False
+            if indices is None:
+                return True
+            if len(indices) != len(messages):
+                return False
+            if any(isinstance(index, bool) for index in indices):
+                return False
+            if any(former >= latter for former, latter in zip(indices, indices[1:])):
+                return False
+            leaf_count = 1 << self.public_key.height
+            if any(index < 0 or index >= leaf_count for index in indices):
+                return False
+            return indices == tuple(signature.index for signature in self.signatures)
+        except (TypeError, ValueError, AttributeError):
+            return False
 
 
 class MerkleSigner:

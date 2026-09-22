@@ -509,6 +509,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `merkle_transport_workload_frontier(capacity, groups, budgets)` — 与 `recommend_merkle_transport_workload` 同一工作负载，但**不排序取首项**，而是返回全部可行且非支配的部署，类型为 `tuple[MerkleTransportWorkloadProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组；`budgets` 必须为四元组，按顺序分别为检查点字节、单组传输字节、总传输字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，配置与步数取 `merkle_storage_profile` 与 `profile`，逐组以 `merkle_transport_profile` 取批次/多证明中更短的线长、等长取 `"multiproof"`，四项预算均须满足。支配判定：A 的 `config.checkpoint_bytes`、`total`、单签 `steps` 均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按步数、总量、检查点、叶数、`w`、`height` 稳定升序排列。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
 - `merkle_mode_frontier(capacity, groups, budgets)` — 与 `merkle_transport_workload_frontier` 同一工作负载，但**逐组枚举全部 `batch`/`multiproof` 模式组合**（每组两种，共 `2**len(groups)` 种，均参与预算筛选），返回全部可行且非支配的模式选择，类型为 `tuple[MerkleTransportWorkloadProfile, ...]`，各项沿用 `config, modes, sizes, total` 字段，`modes` 与 `sizes` 按组对齐，`total` 为各组线长之和，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组；`budgets` 必须为**五元组**，按顺序分别为检查点字节、单组峰值（`sizes` 中的最大值）、总传输字节、单签验签步数（`profile("merkle", ...).steps`）及**节点总数**（仅累加 multiproof 组的规范节点数，batch 组计 0）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 与各组最大索引的全部候选，尺寸、节点数与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。支配判定：A 在检查点字节、单组峰值、总量、单签步数、节点总数五项成本上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重，不因偏好预先舍弃尺寸与节点数形成取舍的组合。结果按单签步数、总量、单组峰值、节点总数、检查点字节、叶数、`w`、`height`、`modes` 字典序稳定升序排列。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_mode_deployment(capacity, groups, budgets, prefer="compact")` — 在 `merkle_mode_frontier` 的非支配结果上**按业务偏好选出一个模式组合**，返回现有的 `MerkleTransportWorkloadProfile`，不新增值类型、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态。前三参数无默认值；`capacity`、`groups` 与五元组 `budgets` 完全沿用 `merkle_mode_frontier` 的类型、范围、预算及异常规则，无可行项抛 `ValueError`。`prefer` 仅取 `"compact"`（默认）、`"nodes"` 或 `"speed"`，其他值抛 `ValueError`。排序键：`"compact"` 依次按 `total`、单组峰值（`max(sizes)`）、节点总数、单签步数升序；`"nodes"` 依次按节点总数、`total`、单组峰值、单签步数升序；节点总数沿用模式前沿定义，仅累加 multiproof 组的规范节点数；`"speed"` 依次按单签步数、`total`、单组峰值、节点总数升序。三种策略末段统一按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入抛 `ValueError`
+- `MerkleVerifyProfile` — 冻结的验签哈希成本值对象，七个字段均为 `int` 且按位置依次为 `w, height, k, wots, leaf, batch, multi`；冻结、可位置构造、按值相等（可哈希）。`k` 为叶索引数；`wots` 为全部 `k` 条 W-OTS 链步上界；`leaf` 为叶哈希数；`batch`/`multi` 分别为批次证明与多证明的内部节点 SHA-256 次数
+- `merkle_verify_profile(w, height, indices)` — 纯函数：比较同一叶集合的批次证明与多证明**验签哈希成本**，返回 `MerkleVerifyProfile`，不生成密钥、不取随机数、不修改状态。`w` 仅为 4 或 8，`height` 仅为 1..8 的非布尔整数；`indices` 须为非空、严格递增且落在 `0 .. 2**height-1` 内的非布尔整数元组。令 `k = len(indices)`：`wots` 链步上界为 `k*67*15`（`w=4`）或 `k*34*255`（`w=8`），`leaf = k`，这些 SHA-256 次数均按每叶计算，不因认证路径去重而减少；`batch = k*height`（每份证明重复完整路径），`multi = Σ(l=1..height)|{i>>l : i∈indices}|`（每层每个不同父节点仅执行一次内部节点 SHA-256）。`indices` 容器或非整数成员错型抛 `TypeError`；空元组、布尔成员、越界、重复或乱序，以及非法 `w` 或 `height` 均抛 `ValueError`
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -525,6 +527,7 @@ from pqattest import (
     merkle_transport_workload_frontier,
     merkle_mode_frontier,
     recommend_merkle_mode_deployment,
+    merkle_verify_profile,
 )
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
@@ -594,6 +597,14 @@ recommend_merkle_mode_deployment(
     16, ((0, 1), (3, 5)), (None, 5000, 12000, None, 8), prefer="compact"
 )
 # MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...)
+
+# 验签哈希成本：同一叶集合上批次证明（每份重复完整路径）与多证明（每层
+# 每个不同父节点仅哈希一次）的 SHA-256 次数对比；纯估算，不接触任何证明
+merkle_verify_profile(8, 3, (0, 1, 6))
+# MerkleVerifyProfile(w=8, height=3, k=3, wots=3*34*255, leaf=3,
+#                     batch=3*3, multi=|{(0,1,6)>>1}| + |{(0,1,6)>>2}|
+#                              + |{(0,1,6)>>3}| = |{0,3}| + |{0,1}| + |{0}|
+#                              = 2 + 2 + 1 = 5)
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

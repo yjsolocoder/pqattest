@@ -31,7 +31,9 @@ The Lamport and W-OTS signers additionally offer from_auth_state, which
 authenticates and restores a v2 envelope and then invokes a caller-supplied
 monotonic claim callback exactly once; restore_ots_pair restores a
 same-generation Lamport/W-OTS pair and claims both sides with a single
-callback, so a claim can never succeed for only one side.
+callback, so a claim can never succeed for only one side;
+restore_merkle_claimed does the same for a Merkle signer, restoring a v2
+"merkle" envelope and claiming its generation exactly once.
 Both envelopes authenticate but do not encrypt and give no replay
 protection on their own.
 """
@@ -147,6 +149,7 @@ __all__ = [
     "profile",
     "public_key_from",
     "recommend",
+    "restore_merkle_claimed",
     "restore_ots_pair",
     "recommend_merkle_deployment",
     "recommend_merkle_transport_deployment",
@@ -622,6 +625,52 @@ class OneTimeSigner:
         )
 
 
+def restore_merkle_claimed(
+    data: Any, *, key: Any, floor: Any = None, claim: Any
+) -> tuple["MerkleSigner", int]:
+    """Restore a Merkle signer from a v2 ``"merkle"`` envelope and claim it once.
+
+    Claimed counterpart of :meth:`MerkleSigner.from_auth_state`: combines v2
+    verification, the generation floor and the v1 checkpoint restore in one
+    call without drawing randomness, and — only once everything has succeeded
+    — performs the external monotonic claim, so a restored signer and its
+    trusted high-water-mark claim are inseparable. Only an envelope produced
+    by :func:`auth_state_wrap` with ``scheme="merkle"`` is accepted; no new
+    wire format or library state is introduced. ``key``, ``floor`` and
+    ``claim`` are keyword-only. Returns ``(signer, generation)``: the
+    restored :class:`MerkleSigner` (equal to
+    :meth:`MerkleSigner.from_checkpoint` on the embedded payload) and the
+    non-negative uint64 generation carried in the envelope.
+
+    ``data`` must be ``bytes`` or ``bytearray``; ``key`` must be a non-empty
+    ``bytes``/``bytearray`` shared secret; ``floor`` must be ``None`` or a
+    non-boolean integer in ``0 .. 2**64 - 1`` and, when given, the envelope
+    generation must be at least that high; ``claim`` must be callable. A
+    wrong type (including a boolean floor or a non-callable claim) raises
+    ``TypeError``. The v2 HMAC tag is verified first with
+    :func:`hmac.compare_digest`; the envelope scheme is then fixed to
+    ``"merkle"``, the payload magic checked and the generation floor applied;
+    only afterwards is the untouched payload handed to
+    :meth:`MerkleSigner.from_checkpoint`. Once the checkpoint is fully
+    restored, ``claim`` is called exactly once with the single token
+    ``("merkle", generation)``; the restore succeeds only when that call
+    returns ``True`` (compared by identity), and any exception it raises
+    propagates untouched. An empty key, a bad tag or envelope, a non-merkle
+    scheme (including a v1 envelope), a generation below the floor, an
+    invalid checkpoint, or a claim that is not ``True`` raises ``ValueError``
+    and the callback is never invoked on such a failure.
+    """
+    return _restore_auth_state(
+        "merkle",
+        data,
+        key=key,
+        min_generation=floor,
+        claim=claim,
+        restore=MerkleSigner.from_checkpoint,
+        floor_label="floor",
+    )
+
+
 def restore_ots_pair(
     a: Any, b: Any, *, key: Any, floor: Any = None, claim: Any
 ) -> tuple[tuple["OneTimeSigner", "WOTSOneTimeSigner"], int]:
@@ -646,8 +695,9 @@ def restore_ots_pair(
     both generations must be at least that high; ``claim`` must be callable.
     A wrong type (including a boolean floor or a non-callable claim) raises
     ``TypeError``. Each envelope's v2 HMAC tag is verified first with
-    :func:`hmac.compare_digest`; the fixed schemes, payload magics, the
-    common generation and the floor are checked next, and both v1
+    :func:`hmac.compare_digest` — both sides must authenticate before any
+    field of either envelope is parsed — then the fixed schemes, payload
+    magics, the common generation and the floor are checked, and both v1
     checkpoints are restored last. Only then is ``claim`` called exactly
     once with the paired token ``(("lamport", generation), ("wots",
     generation))``; the restore succeeds only when that call returns

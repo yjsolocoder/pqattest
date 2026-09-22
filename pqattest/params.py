@@ -27,8 +27,12 @@ returns one profile.
 of ordinary Merkle deployments under checkpoint, signature, proof and
 verifier-step budgets. :func:`merkle_verify_profile` compares the
 verifier-side SHA-256 hash cost of a batch proof against a multi-proof over
-the same leaf set, returning a :class:`MerkleVerifyProfile`. All thirteen
-are pure functions: no randomness, no
+the same leaf set, returning a :class:`MerkleVerifyProfile`.
+:func:`merkle_verify_workload_profile` aggregates those verification-hash
+counts over several independent leaf-index groups, each carried as its own
+batch proof or multi-proof, returning a
+:class:`MerkleVerifyWorkloadProfile` with one cost row per group and a
+global total. All fourteen are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
 
@@ -47,6 +51,7 @@ __all__ = [
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
     "MerkleVerifyProfile",
+    "MerkleVerifyWorkloadProfile",
     "profile",
     "recommend",
     "recommend_merkle_deployment",
@@ -627,6 +632,92 @@ def merkle_verify_profile(w: Any, height: Any, indices: Any) -> MerkleVerifyProf
     )
     return MerkleVerifyProfile(
         w=w, height=height, k=k, wots=wots, leaf=leaf, batch=batch, multi=multi
+    )
+
+
+@dataclass(frozen=True)
+class MerkleVerifyWorkloadProfile:
+    """Frozen SHA-256 verification-hash counts for several leaf-index groups.
+
+    Aggregates :func:`merkle_verify_profile` over a workload of several
+    independent leaf-index groups, each carried as its own batch proof or
+    multi-proof over the same Merkle tree. Fields, in positional order:
+
+    - ``w`` / ``height`` echo the validated parameters;
+    - ``costs`` is one five-tuple per group, aligned position-for-position
+      with the input groups: the mode name (``"batch"`` or
+      ``"multiproof"``), the W-OTS chain-step upper bound, the leaf-hash
+      count, the internal-node hash count of the chosen mode (the
+      :attr:`MerkleVerifyProfile.batch` or :attr:`MerkleVerifyProfile.multi`
+      value) and the group's three hash-count total;
+    - ``total`` is the sum of every group's five-tuple total: a repeated
+      group is billed separately each time it appears.
+
+    Instances are frozen, support positional construction and compare (and
+    hash) by value; no key material or randomness is involved.
+    """
+
+    w: int
+    height: int
+    costs: tuple[tuple[str, int, int, int, int], ...]
+    total: int
+
+
+def merkle_verify_workload_profile(
+    w: Any, height: Any, groups: Any, modes: Any
+) -> MerkleVerifyWorkloadProfile:
+    """Return the frozen :class:`MerkleVerifyWorkloadProfile` hash counts.
+
+    Aggregates the verifier-side SHA-256 work of a mixed batch/multi-proof
+    workload: each member of ``groups`` is an independent leaf-index set
+    carried in the transport named by the matching member of ``modes``, and
+    every group reuses :func:`merkle_verify_profile` for its W-OTS chain
+    steps, leaf hashes and both internal-node counts. ``w`` must be 4 or 8
+    and ``height`` a non-boolean integer from 1 to 8; ``groups`` must be a
+    non-empty tuple whose members are non-empty tuples of strictly
+    increasing, non-boolean integers, each in ``0 .. 2 ** height - 1`` (the
+    single-group rules of :func:`merkle_verify_profile` apply unchanged);
+    ``modes`` must be a tuple of the same length containing only the strings
+    ``"batch"`` and ``"multiproof"``.
+
+    Each cost row is ``(mode, wots, leaf, internal, wots + leaf +
+    internal)``, where ``internal`` is the group profile's ``batch`` field
+    for a ``"batch"`` group and its ``multi`` field for a
+    ``"multiproof"`` group; ``total`` is the sum of the per-group totals,
+    so a repeated group is billed separately every time. A non-tuple
+    ``groups`` or ``modes`` (a group that is not itself a tuple included)
+    raises ``TypeError``; an empty group tuple or group, a wrong-length
+    ``modes`` tuple, an unknown mode, or any group, index, ``w`` or
+    ``height`` rejected by :func:`merkle_verify_profile` raises
+    ``ValueError``. The estimate is pure: no keys are generated, no
+    randomness is drawn and no state is changed.
+    """
+    w = _validate_w(w)
+    height = _validate_height(height)
+    if not isinstance(groups, tuple):
+        raise TypeError("groups must be a tuple of leaf-index groups")
+    if not isinstance(modes, tuple):
+        raise TypeError("modes must be a tuple of mode names")
+    if not groups:
+        raise ValueError("groups must not be empty")
+    if len(modes) != len(groups):
+        raise ValueError("modes must have the same length as groups")
+    for mode in modes:
+        if not isinstance(mode, str):
+            raise TypeError("every mode must be a string")
+        if mode not in ("batch", "multiproof"):
+            raise ValueError('every mode must be "batch" or "multiproof"')
+
+    costs = []
+    total = 0
+    for group, mode in zip(groups, modes):
+        single = merkle_verify_profile(w, height, group)
+        internal = single.batch if mode == "batch" else single.multi
+        group_total = single.wots + single.leaf + internal
+        costs.append((mode, single.wots, single.leaf, internal, group_total))
+        total += group_total
+    return MerkleVerifyWorkloadProfile(
+        w=w, height=height, costs=tuple(costs), total=total
     )
 
 

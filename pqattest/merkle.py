@@ -9,9 +9,10 @@ format via ``to_bytes`` / ``from_bytes`` (the signature codec is constrained
 by the corresponding :class:`MerklePublicKey`). A :class:`MerkleProof`
 bundles one public key and one signature for independent transport, and a
 :class:`MerkleBatchProof` does the same for several signatures of the same
-public key; :meth:`MerkleBatchProof.verify_bound` additionally binds such a
-batch to the receiver's expected public key and, optionally, an explicit
-leaf-index selection. The top-level :func:`multiproof_encode` /
+public key; :meth:`MerkleProof.verify_bound` and
+:meth:`MerkleBatchProof.verify_bound` additionally bind such proofs to the
+receiver's expected public key and, optionally, an explicit leaf-index
+selection. The top-level :func:`multiproof_encode` /
 :func:`multiproof_verify` pair compresses several signatures of the same
 public key further into one deterministic proof whose shared authentication
 nodes are deduplicated into a canonical node set;
@@ -336,9 +337,11 @@ class MerkleProof:
     Unlike :class:`MerkleSignature` (whose wire format needs the
     corresponding key separately), a proof carries the
     :class:`MerklePublicKey` that constrains its :class:`MerkleSignature`, so
-    it can be transported on its own and verified with :meth:`verify`. The
-    proof stores no message and is a pure serialisation container: it offers
-    neither authentication nor encryption of the wrapper itself.
+    it can be transported on its own and verified with :meth:`verify`.
+    :meth:`verify_bound` additionally binds the proof to the receiver's
+    expected public key and, optionally, an explicit leaf-index selection.
+    The proof stores no message and is a pure serialisation container: it
+    offers neither authentication nor encryption of the wrapper itself.
     """
 
     public_key: MerklePublicKey
@@ -420,6 +423,73 @@ class MerkleProof:
         itself carries no message and cannot authenticate its own origin.
         """
         return merkle_verify(message, self.signature, self.public_key)
+
+    def verify_bound(
+        self, message: Any, *, public_key: Any, index: Any = None
+    ) -> bool:
+        """Verify the signature and bind the proof to an expected key/leaf.
+
+        First requires ``public_key`` to equal the public key embedded in the
+        proof value by value (``w``, ``height`` and ``root``), then runs the
+        exact verification of :meth:`verify` — ``message`` is checked with
+        :func:`merkle_verify` against the embedded signature, accepting
+        ``bytes``/``bytearray``/``str`` (a ``str`` is encoded as UTF-8). No
+        wire format changes, no new objects, no randomness and no state are
+        involved.
+
+        ``public_key`` must be a :class:`MerklePublicKey`; any other type
+        raises ``TypeError``. ``index=None`` imposes no constraint on the
+        leaf selection. An explicit ``index`` must be a non-boolean integer
+        equal to the signature's leaf ``index``: a value that is not an
+        integer at all raises ``TypeError``, while a boolean, a negative or
+        out-of-range value, or one unequal to the signature index returns
+        ``False``. Missing or mistyped embedded fields (including values
+        corrupted by bypassing the frozen constructor), and any message,
+        signature or public-key mismatch return ``False`` without leaking
+        any other exception.
+        """
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        if index is not None:
+            # ``bool`` is a subtype of ``int``, but a boolean is not an
+            # acceptable leaf selection: it falls through to the structural
+            # checks below and returns ``False``.
+            if not isinstance(index, int):
+                raise TypeError("index must be an integer")
+        try:
+            embedded_key = self.public_key
+            signature = self.signature
+            if not isinstance(embedded_key, MerklePublicKey):
+                return False
+            if not isinstance(signature, MerkleSignature):
+                return False
+            if (
+                public_key.w != embedded_key.w
+                or public_key.height != embedded_key.height
+                or public_key.root != embedded_key.root
+            ):
+                return False
+            if not merkle_verify(message, signature, embedded_key):
+                return False
+            if index is None:
+                return True
+            signature_index = signature.index
+            if (
+                isinstance(index, bool)
+                or isinstance(signature_index, bool)
+                or not isinstance(signature_index, int)
+                or index < 0
+                or index >= (1 << embedded_key.height)
+                or index != signature_index
+            ):
+                return False
+            return True
+        except Exception:
+            # A bypass-constructed proof may carry arbitrary field objects
+            # whose access or comparison raises anything; the bound check
+            # reports every such malformed structure as ``False``. External
+            # argument type errors were raised before this block.
+            return False
 
 
 def _signature_matches_key(signature: MerkleSignature, public_key: MerklePublicKey) -> bool:
@@ -613,9 +683,11 @@ class MerkleBatchProof:
         and identical, position by position, to the ``index`` of the
         signature in the same slot. A boolean member, a duplicate, an
         out-of-order or out-of-range value, a wrong count, a non-tuple or
-        ill-sized ``messages``, an illegal message member, and any
-        cryptographic, structural or public-key-value mismatch all return
-        ``False``.
+        ill-sized ``messages``, an illegal message member, a missing or
+        mistyped embedded public key or signature field (an empty or
+        non-tuple ``signatures`` included, including values corrupted by
+        bypassing the frozen constructor), and any cryptographic, structural
+        or public-key-value mismatch all return ``False``.
         """
         if not isinstance(public_key, MerklePublicKey):
             raise TypeError("public_key must be a MerklePublicKey")
@@ -626,12 +698,27 @@ class MerkleBatchProof:
                 if not isinstance(index, int):
                     raise TypeError("every index must be an integer")
         try:
-            if not self.verify(messages):
+            embedded_key = self.public_key
+            signatures = self.signatures
+            if not isinstance(embedded_key, MerklePublicKey):
+                return False
+            if not isinstance(signatures, tuple) or not signatures:
+                return False
+            if not all(
+                isinstance(signature, MerkleSignature) for signature in signatures
+            ):
+                return False
+            if not isinstance(messages, tuple) or len(messages) != len(signatures):
+                return False
+            if not all(
+                merkle_verify(message, signature, embedded_key)
+                for message, signature in zip(messages, signatures)
+            ):
                 return False
             if (
-                public_key.w != self.public_key.w
-                or public_key.height != self.public_key.height
-                or public_key.root != self.public_key.root
+                public_key.w != embedded_key.w
+                or public_key.height != embedded_key.height
+                or public_key.root != embedded_key.root
             ):
                 return False
             if indices is None:
@@ -642,11 +729,15 @@ class MerkleBatchProof:
                 return False
             if any(former >= latter for former, latter in zip(indices, indices[1:])):
                 return False
-            leaf_count = 1 << self.public_key.height
+            leaf_count = 1 << embedded_key.height
             if any(index < 0 or index >= leaf_count for index in indices):
                 return False
-            return indices == tuple(signature.index for signature in self.signatures)
-        except (TypeError, ValueError, AttributeError):
+            return indices == tuple(signature.index for signature in signatures)
+        except Exception:
+            # A bypass-constructed batch may carry arbitrary field objects
+            # whose access or comparison raises anything; the bound check
+            # reports every such malformed structure as ``False``. External
+            # argument type errors were raised before this block.
             return False
 
 

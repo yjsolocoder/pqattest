@@ -13,8 +13,9 @@ WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
 merkle_verify / multiproof_encode / multiproof_verify /
-multiproof_verify_bound (which binds a multiproof to the receiver's
-expected public key and, optionally, an explicit leaf-index selection), static
+multiproof_verify_bound (the two proof classes' verify_bound and this
+function bind a proof to the receiver's expected public key and,
+optionally, an explicit leaf-index selection), static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
 merkle_deployment_frontier /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /

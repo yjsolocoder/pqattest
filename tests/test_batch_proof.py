@@ -674,6 +674,69 @@ class BatchVerifyBoundTest(unittest.TestCase):
             )
         )
 
+    def test_missing_empty_or_non_tuple_embedded_fields_are_false(self):
+        signer, batch = make_batch(messages=("m0",))
+        signature = batch.signatures[0]
+        # No fields at all.
+        rogue = object.__new__(MerkleBatchProof)
+        self.assertFalse(rogue.verify_bound(("m0",), public_key=signer.public_key))
+        # signatures as a list.
+        rogue_list = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue_list, "public_key", batch.public_key)
+        object.__setattr__(rogue_list, "signatures", [signature])
+        self.assertFalse(
+            rogue_list.verify_bound(("m0",), public_key=signer.public_key)
+        )
+        # Empty signatures tuple.
+        rogue_empty = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue_empty, "public_key", batch.public_key)
+        object.__setattr__(rogue_empty, "signatures", ())
+        self.assertFalse(rogue_empty.verify_bound((), public_key=signer.public_key))
+        # Embedded public key missing even though signatures are intact.
+        rogue_nokey = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue_nokey, "signatures", (signature,))
+        self.assertFalse(
+            rogue_nokey.verify_bound(("m0",), public_key=signer.public_key)
+        )
+        # A single bare signature instead of a tuple of them.
+        rogue_bare = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue_bare, "public_key", batch.public_key)
+        object.__setattr__(rogue_bare, "signatures", signature)
+        self.assertFalse(
+            rogue_bare.verify_bound(("m0",), public_key=signer.public_key)
+        )
+
+    def test_bypass_corrupted_embedded_key_is_false(self):
+        signer, batch = make_batch(messages=("m0",))
+        bad_key = object.__new__(MerklePublicKey)
+        object.__setattr__(bad_key, "w", "x")
+        object.__setattr__(bad_key, "height", batch.public_key.height)
+        object.__setattr__(bad_key, "root", batch.public_key.root)
+        rogue = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue, "public_key", bad_key)
+        object.__setattr__(rogue, "signatures", batch.signatures)
+        self.assertFalse(rogue.verify_bound(("m0",), public_key=signer.public_key))
+
+    def test_external_type_errors_still_raise_on_malformed_batch(self):
+        signer, batch = make_batch()
+        rogue = object.__new__(MerkleBatchProof)
+        object.__setattr__(rogue, "public_key", "not-a-key")
+        object.__setattr__(rogue, "signatures", "not-a-tuple")
+        with self.assertRaises(TypeError):
+            rogue.verify_bound(("m0", "m1", "m2"), public_key="also-bad")
+        with self.assertRaises(TypeError):
+            rogue.verify_bound(
+                ("m0", "m1", "m2"),
+                public_key=signer.public_key,
+                indices=[0, 1, 2],
+            )
+        with self.assertRaises(TypeError):
+            rogue.verify_bound(
+                ("m0", "m1", "m2"),
+                public_key=signer.public_key,
+                indices=(0, 1.0, 2),
+            )
+
     def test_round_tripped_batch_still_verifies_bound(self):
         messages = ("m0", "m1", "m2")
         signer, batch = make_batch(messages=messages)

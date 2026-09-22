@@ -370,5 +370,241 @@ class ProofVerifyTest(unittest.TestCase):
         self.assertEqual(sorted(vars(proof).keys()), ["public_key", "signature"])
 
 
+class ProofVerifyBoundTest(unittest.TestCase):
+    def test_bound_verifies_signed_message(self):
+        signer = make_signer(height=3)
+        signature = signer.sign("m")
+        proof = MerkleProof(signer.public_key, signature)
+        self.assertTrue(proof.verify_bound("m", public_key=signer.public_key))
+        self.assertTrue(
+            proof.verify_bound(
+                "m", public_key=signer.public_key, index=signature.index
+            )
+        )
+        self.assertTrue(
+            proof.verify_bound("m", public_key=signer.public_key, index=None)
+        )
+
+    def test_message_types_match_merkle_verify(self):
+        for message in ("claim", b"bytes claim", bytearray(b"array claim")):
+            with self.subTest(kind=type(message).__name__):
+                signer = make_signer()
+                signature = signer.sign(message)
+                proof = MerkleProof(signer.public_key, signature)
+                self.assertTrue(
+                    proof.verify_bound(message, public_key=signer.public_key)
+                )
+
+    def test_value_equal_distinct_key_accepted(self):
+        signer, proof = make_proof()
+        other = MerklePublicKey(
+            w=signer.public_key.w,
+            height=signer.public_key.height,
+            root=signer.public_key.root,
+        )
+        self.assertIsNot(other, signer.public_key)
+        self.assertTrue(
+            proof.verify_bound("position claim", public_key=other)
+        )
+
+    def test_public_key_must_be_keyword(self):
+        _, proof = make_proof()
+        with self.assertRaises(TypeError):
+            proof.verify_bound("position claim", make_signer().public_key)
+
+    def test_wrong_public_key_type_raises_type_error(self):
+        _, proof = make_proof()
+        for bad in (None, 42, 4.5, "key", b"key", object(), ()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    proof.verify_bound("position claim", public_key=bad)
+
+    def test_public_key_value_mismatch_is_false(self):
+        signer, proof = make_proof(message="m0")
+        own = proof.public_key
+        foreign = make_signer(start=1000).public_key
+        cases = (
+            foreign,
+            MerklePublicKey(w=8, height=own.height, root=own.root),
+            MerklePublicKey(w=own.w, height=1, root=own.root),
+            MerklePublicKey(w=own.w, height=own.height, root=bytes(32)),
+        )
+        for bad_key in cases:
+            with self.subTest(bad_key=bad_key):
+                self.assertFalse(proof.verify_bound("m0", public_key=bad_key))
+
+    def test_wrong_message_is_false_even_with_matching_key(self):
+        signer = make_signer()
+        signature = signer.sign(b"signed")
+        proof = MerkleProof(signer.public_key, signature)
+        self.assertFalse(proof.verify_bound(b"other", public_key=signer.public_key))
+        self.assertFalse(
+            proof.verify_bound(None, public_key=signer.public_key)
+        )
+
+    def test_non_integer_index_raises_type_error(self):
+        _, proof = make_proof()
+        for bad in (1.0, "1", b"1", [0], (0,), None):
+            with self.subTest(bad=type(bad).__name__):
+                if bad is None:
+                    # Explicitly passing None is the documented default and
+                    # imposes no leaf restriction.
+                    self.assertTrue(
+                        proof.verify_bound(
+                            "position claim", public_key=proof.public_key, index=None
+                        )
+                    )
+                    continue
+                with self.assertRaises(TypeError):
+                    proof.verify_bound(
+                        "position claim", public_key=proof.public_key, index=bad
+                    )
+
+    def test_boolean_index_is_false_not_raising(self):
+        signer = make_signer(height=3)
+        # Sign away leaf 0 so the signature sits at index 1, numerically
+        # equal to ``True``: even then a boolean must be rejected.
+        signer.sign("gap")
+        signature = signer.sign("m")
+        self.assertEqual(signature.index, 1)
+        proof = MerkleProof(signer.public_key, signature)
+        self.assertFalse(
+            proof.verify_bound("m", public_key=signer.public_key, index=True)
+        )
+        signer0 = make_signer(height=3)
+        proof_at_zero = MerkleProof(signer0.public_key, signer0.sign("z"))
+        self.assertFalse(
+            proof_at_zero.verify_bound(
+                "z", public_key=signer0.public_key, index=False
+            )
+        )
+
+    def test_negative_out_of_range_and_unequal_index_are_false(self):
+        signer = make_signer(height=3)
+        signer.sign("gap0")
+        signature = signer.sign("m")
+        self.assertEqual(signature.index, 1)
+        proof = MerkleProof(signer.public_key, signature)
+        for bad in (-1, 0, 2, 8, 10**40):
+            with self.subTest(index=bad):
+                self.assertFalse(
+                    proof.verify_bound(
+                        "m", public_key=signer.public_key, index=bad
+                    )
+                )
+
+    def test_type_errors_take_precedence_over_other_failures(self):
+        _, proof = make_proof()
+        with self.assertRaises(TypeError):
+            proof.verify_bound("wrong", public_key="not-a-key", index=1)
+        with self.assertRaises(TypeError):
+            proof.verify_bound("wrong", public_key="not-a-key", index=True)
+        with self.assertRaises(TypeError):
+            proof.verify_bound(
+                "position claim", public_key="not-a-key", index=1.5
+            )
+
+    def test_malformed_bypass_constructed_proof_is_false(self):
+        signer, proof = make_proof()
+        rogue = object.__new__(MerkleProof)
+        object.__setattr__(rogue, "public_key", "not-a-key")
+        object.__setattr__(rogue, "signature", "not-a-signature")
+        self.assertFalse(
+            rogue.verify_bound("position claim", public_key=signer.public_key)
+        )
+        self.assertFalse(
+            rogue.verify_bound(
+                "position claim", public_key=signer.public_key, index=0
+            )
+        )
+        rogue2 = object.__new__(MerkleProof)
+        object.__setattr__(rogue2, "public_key", proof.public_key)
+        object.__setattr__(rogue2, "signature", "not-a-signature")
+        self.assertFalse(
+            rogue2.verify_bound("position claim", public_key=signer.public_key)
+        )
+        rogue3 = object.__new__(MerkleProof)
+        object.__setattr__(rogue3, "public_key", "x")
+        object.__setattr__(rogue3, "signature", proof.signature)
+        self.assertFalse(
+            rogue3.verify_bound("position claim", public_key=signer.public_key)
+        )
+        # Fields missing entirely.
+        rogue4 = object.__new__(MerkleProof)
+        self.assertFalse(
+            rogue4.verify_bound("position claim", public_key=signer.public_key)
+        )
+        # A tuple (even empty or wrapping a real signature) is not a
+        # MerkleSignature field.
+        for bogus in ((), (proof.signature,)):
+            rogue5 = object.__new__(MerkleProof)
+            object.__setattr__(rogue5, "public_key", proof.public_key)
+            object.__setattr__(rogue5, "signature", bogus)
+            self.assertFalse(
+                rogue5.verify_bound("position claim", public_key=signer.public_key)
+            )
+
+    def test_bypass_corrupted_nested_fields_are_false(self):
+        signer, proof = make_proof()
+        bad_signature = object.__new__(MerkleSignature)
+        object.__setattr__(bad_signature, "index", "x")
+        object.__setattr__(bad_signature, "wots_signature", ())
+        object.__setattr__(bad_signature, "auth_path", ())
+        rogue = object.__new__(MerkleProof)
+        object.__setattr__(rogue, "public_key", proof.public_key)
+        object.__setattr__(rogue, "signature", bad_signature)
+        self.assertFalse(
+            rogue.verify_bound("position claim", public_key=signer.public_key)
+        )
+        bad_key = object.__new__(MerklePublicKey)
+        object.__setattr__(bad_key, "w", "x")
+        object.__setattr__(bad_key, "height", 2)
+        object.__setattr__(bad_key, "root", bytes(32))
+        rogue2 = object.__new__(MerkleProof)
+        object.__setattr__(rogue2, "public_key", bad_key)
+        object.__setattr__(rogue2, "signature", proof.signature)
+        self.assertFalse(
+            rogue2.verify_bound("position claim", public_key=signer.public_key)
+        )
+
+    def test_hostile_field_objects_do_not_leak_exceptions(self):
+        class Boom:
+            def __eq__(self, other):
+                raise RuntimeError("boom")
+
+            def __ne__(self, other):
+                raise RuntimeError("boom")
+
+        signer, proof = make_proof()
+        hostile_key = object.__new__(MerklePublicKey)
+        object.__setattr__(hostile_key, "w", proof.public_key.w)
+        object.__setattr__(hostile_key, "height", proof.public_key.height)
+        object.__setattr__(hostile_key, "root", Boom())
+        rogue = object.__new__(MerkleProof)
+        object.__setattr__(rogue, "public_key", hostile_key)
+        object.__setattr__(rogue, "signature", proof.signature)
+        self.assertFalse(
+            rogue.verify_bound("position claim", public_key=signer.public_key)
+        )
+
+    def test_round_tripped_proof_still_verifies_bound(self):
+        signer, proof = make_proof(message="m")
+        restored = MerkleProof.from_bytes(proof.to_bytes())
+        self.assertEqual(restored, proof)
+        self.assertTrue(
+            restored.verify_bound(
+                "m",
+                public_key=signer.public_key,
+                index=restored.signature.index,
+            )
+        )
+
+    def test_plain_verify_unchanged(self):
+        signer, proof = make_proof(message="m")
+        self.assertTrue(proof.verify("m"))
+        self.assertFalse(proof.verify("other"))
+        self.assertEqual(sorted(vars(proof).keys()), ["public_key", "signature"])
+
+
 if __name__ == "__main__":
     unittest.main()

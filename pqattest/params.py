@@ -50,7 +50,12 @@ frontier by one of five preferences — ``"compact"``, ``"verify"``,
 caller-supplied five-tuple of non-negative weights over its five
 min-max-normalised costs, all arithmetic exact via :class:`fractions.Fraction`,
 and returns one :class:`MerkleModeCost`.
-All eighteen
+:func:`recommend_merkle_verify_mode_weighted` evaluates several such weight
+scenarios at once over the :func:`merkle_verify_mode_frontier` choices and
+returns the :class:`MerkleModeCost` whose worst per-scenario regret — the
+gap to the best normalised weighted score any frontier member reaches under
+that scenario — is smallest.
+All nineteen
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -87,6 +92,7 @@ __all__ = [
     "recommend_merkle_cardinality_deployment",
     "recommend_merkle_cardinality_weighted",
     "recommend_merkle_mode_deployment",
+    "recommend_merkle_verify_mode_weighted",
     "merkle_storage_profile",
     "merkle_transport_profile",
     "merkle_verify_profile",
@@ -2469,3 +2475,143 @@ def recommend_merkle_cardinality_weighted(
         )
 
     return min(frontier, key=ranking)
+
+
+def _validate_weight_scenarios(scenarios: Any) -> tuple[tuple[int, ...], ...]:
+    """Validate the non-empty tuple of five-tuple weight scenarios."""
+    if not isinstance(scenarios, tuple):
+        raise TypeError("scenarios must be a non-empty tuple of 5-tuples of weights")
+    if not scenarios:
+        raise ValueError("scenarios must not be empty")
+    for scenario in scenarios:
+        if not isinstance(scenario, tuple):
+            raise TypeError("every scenario must be a 5-tuple of weights")
+        if len(scenario) != 5:
+            raise ValueError("every scenario must contain exactly five weights")
+        for weight in scenario:
+            if isinstance(weight, bool):
+                raise ValueError(
+                    "every weight must be a non-boolean non-negative integer"
+                )
+            if not isinstance(weight, int):
+                raise TypeError(
+                    "every weight must be a non-boolean non-negative integer"
+                )
+            if weight < 0:
+                raise ValueError(
+                    "every weight must be a non-boolean non-negative integer"
+                )
+        if not any(weight > 0 for weight in scenario):
+            raise ValueError("every scenario must have at least one positive weight")
+    return scenarios
+
+
+def recommend_merkle_verify_mode_weighted(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+    scenarios: Any,
+) -> MerkleModeCost:
+    """Pick one regret-minimising mode choice across weight scenarios.
+
+    Computes :func:`merkle_verify_mode_frontier` exactly once and ranks the
+    returned feasible, non-dominated per-group mode choices against several
+    weight scenarios at once, choosing the candidate whose worst regret —
+    the gap between its scenario score and the best score any frontier member
+    achieves under that scenario — is smallest. The five ranked costs are
+    the same ones :func:`recommend_merkle_cardinality_weighted` uses:
+    aggregate transport bytes (:attr:`MerkleTransportWorkloadProfile.total`),
+    any single group's transport peak (the maximum of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), total verifier SHA-256
+    hashes (:attr:`MerkleVerifyWorkloadProfile.total`), carried multi-proof
+    nodes (:attr:`MerkleModeCost.nodes`) and the per-signature verifier
+    hash-chain steps (``profile("merkle", ...)``'s ``steps``).
+
+    ``scenarios`` must be a non-empty tuple whose every member is a
+    five-tuple of weights in that same order — total transport,
+    single-group peak, total verifier SHA-256 hashes, carried multi-proof
+    nodes and per-signature chain steps. Every weight must be a
+    non-boolean, non-negative integer and every scenario must carry at
+    least one positive weight; duplicate scenarios are kept and scored
+    separately. Each of the five costs is min-max normalised over the
+    whole frontier as ``(x - min) / (max - min)``, with a zero span
+    scoring ``0``; a candidate's score under one scenario is the sum of
+    the five normalised costs times their weights divided by that
+    scenario's weight total, computed as an exact rational
+    (``fractions.Fraction``) with no floating point anywhere. For every
+    scenario the smallest score over the frontier is found first, and a
+    candidate's regret under that scenario is its own score minus that
+    minimum. The candidate with the smallest maximum regret is returned;
+    ties are broken ascending by the sum of the regrets, then by the tuple
+    of the candidate's per-scenario scores, then by checkpoint bytes, leaf
+    count, ``w``, ``height`` and the ``modes`` tuple in lexicographic
+    order, exactly like every other mode ranking. The candidate
+    enumeration and Pareto filtering are not duplicated: the frontier is
+    the only source of candidates and is called exactly once.
+
+    ``capacity``, ``groups`` and the six-tuple ``budgets`` follow
+    :func:`merkle_verify_mode_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``scenarios``). A non-tuple ``scenarios`` or scenario member, or a
+    non-integer weight, raises ``TypeError``; an empty ``scenarios``, a
+    wrong-length scenario, or a boolean, negative or all-zero scenario
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state.
+    """
+    frontier = merkle_verify_mode_frontier(capacity, groups, budgets)
+    scenarios = _validate_weight_scenarios(scenarios)
+
+    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
+        return (
+            mode_cost.plan.total,
+            max(mode_cost.plan.sizes),
+            mode_cost.cost.total,
+            mode_cost.nodes,
+            profile(
+                "merkle",
+                w=mode_cost.plan.config.w,
+                height=mode_cost.plan.config.height,
+            ).steps,
+        )
+
+    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+
+    def scores(values: tuple[int, int, int, int, int]) -> tuple[Fraction, ...]:
+        normalised = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(values, spans)
+        )
+        return tuple(
+            sum(weight * cost for weight, cost in zip(scenario, normalised))
+            / sum(scenario)
+            for scenario in scenarios
+        )
+
+    score_rows = tuple(scores(row) for row in metric_rows)
+    best = tuple(min(column) for column in zip(*score_rows))
+
+    def ranking(
+        item: tuple[MerkleModeCost, tuple[Fraction, ...]],
+    ) -> tuple[
+        Fraction, Fraction, tuple[Fraction, ...], int, int, int, int, tuple[str, ...]
+    ]:
+        mode_cost, scenario_scores = item
+        regrets = tuple(score - low for score, low in zip(scenario_scores, best))
+        config = mode_cost.plan.config
+        return (
+            max(regrets),
+            sum(regrets),
+            scenario_scores,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+            mode_cost.plan.modes,
+        )
+
+    return min(zip(frontier, score_rows), key=ranking)[0]

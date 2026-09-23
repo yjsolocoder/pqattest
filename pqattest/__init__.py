@@ -31,6 +31,9 @@ frontier, recommend_merkle_cardinality_deployment to rank that frontier
 by one of five preferences, recommend_merkle_cardinality_weighted to
 rank it by a five-tuple of non-negative weights over min-max-normalised
 costs with exact Fraction arithmetic,
+recommend_merkle_verify_mode_weighted to pick the
+merkle_verify_mode_frontier member whose worst regret across several
+weight scenarios is smallest,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -138,6 +141,7 @@ from .params import (
     merkle_cardinality_frontier,
     recommend_merkle_cardinality_deployment,
     recommend_merkle_cardinality_weighted,
+    recommend_merkle_verify_mode_weighted,
     merkle_verify_profile,
     merkle_verify_workload_profile,
     profile,
@@ -216,6 +220,7 @@ __all__ = [
     "merkle_cardinality_frontier",
     "recommend_merkle_cardinality_deployment",
     "recommend_merkle_cardinality_weighted",
+    "recommend_merkle_verify_mode_weighted",
     "merkle_verify_profile",
     "merkle_verify_workload_profile",
     "message_bits",

@@ -516,6 +516,7 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `MerkleModeCost` — 冻结的模式选择与验签哈希成本配对值对象，三个字段按位置依次为 `plan, cost, nodes`，类型依次为 `MerkleTransportWorkloadProfile`、`MerkleVerifyWorkloadProfile`、`int`：传输方案（配置、逐组模式、逐组尺寸、总量）、同参数的验签 SHA-256 工作量及仅累计 multiproof 组的规范节点总数（batch 组计 0）；冻结、可位置构造、按值相等（可哈希）
 - `merkle_verify_mode_frontier(capacity, groups, budgets)` — 与 `merkle_mode_frontier` 同一工作负载与逐组模式枚举，但在五项传输/链步预算之外**再加一项验签 SHA-256 总量预算**，返回全部可行且非支配的选择，类型为 `tuple[MerkleModeCost, ...]`，不改变旧接口与任何线格式。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity`、`groups` 完全沿用 `merkle_mode_frontier` 的类型、范围与异常规则；`budgets` 必须为**六元组**，预算成员规则（各项为 `None` 或正的非布尔整数、至少一项非空、含边界、非元组抛 `TypeError`、长度或成员非法抛 `ValueError`）也沿用之，按顺序分别限制检查点字节、单组峰值、总传输字节、单签验签步数、multiproof 节点总数及**验签 SHA-256 总数**（`MerkleVerifyWorkloadProfile.total`）。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 与各组最大索引的全部候选，以及每组两种模式的全部 `2**len(groups)` 组合；`plan` 按现有公式保存配置、模式、逐组尺寸与总量，`cost` 取同参数 `merkle_verify_workload_profile(w, height, groups, modes)` 的结果，`nodes` 仅累计 multiproof 组的规范节点。支配判定：A 在六项成本（检查点、单组峰值、总量、单签步数、节点总数、验签哈希总数）上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按单签步数、验签哈希总量、总传输字节、单组峰值、节点总数、检查点字节、叶数、`w`、`height`、`modes` 字典序稳定升序排列；无可行项抛 `ValueError`
 - `merkle_cardinality_frontier(capacity, group_sizes, budgets)` — `merkle_verify_mode_frontier` 的**叶位置未定**版本：每组只给叶数 `group_sizes`（非空正整数元组，每项是一个独立索引组的叶数，重复项分别计费，且不得大于候选叶数），对每个 multiproof 组在该树**全部同规模严格递增索引子集中取传输字节、规范节点数与内部哈希数的最大值**（同一最大化铺开布局同时达到三者），batch 组沿用与位置无关的固定公式，返回全部可行且非支配的方案，类型仍为 `tuple[MerkleModeCost, ...]`，不新增值类型、不改变旧接口。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`budgets` 沿用联合前沿的**六元含边界上限**（检查点字节、单组峰值、总传输字节、单签验签步数、multiproof 节点总数、验签 SHA-256 总数，各项 `None` 或正的非布尔整数、至少一项非空）。枚举 `w=4/8` × `height=1..8` 中叶数同时覆盖 `capacity` 与每组叶数的全部候选，以及每组两种模式的全部 `2**len(group_sizes)` 组合。以 `n` 为 W-OTS 链数、`S = 16 + 32*(n+height)`：`k` 叶的 batch 组为 `58 + k*(4+S)` 字节、0 节点、内部哈希 `k*height`；multiproof 组最坏为 `60 + k*(4+32*n) + 35*m_max` 字节、`m_max` 节点，其中 `internal_max = Σ_{j=0..height-1} min(k, 2**j)`、`m_max = internal_max - (k-1)`（逐层祖先数上界且可由尽量均匀铺开的布局达到），W-OTS 链步 `k*n*(b-1)` 与叶哈希 `k` 两种模式相同、与位置无关。`plan.sizes`、`plan.total`、`cost.costs`、`cost.total` 与 `nodes` 均记录上述逐组最坏值或其和。六项成本 Pareto 支配、去重及排序完全沿用 `merkle_verify_mode_frontier`。`group_sizes`/`budgets` 非元组、或 `group_sizes` 含非整数成员抛 `TypeError`；空、布尔、非正成员、`capacity` 越界、预算非法或无可行方案抛 `ValueError`
+- `recommend_merkle_cardinality_deployment(capacity, group_sizes, budgets, prefer="compact")` — 在 `merkle_cardinality_frontier` 的非支配结果上**按业务偏好选出一个最坏位置基数方案**，返回该前沿成员（`MerkleModeCost`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。前三参数无默认值；`capacity`、`group_sizes` 与六元组 `budgets` 完全沿用 `merkle_cardinality_frontier` 的类型、范围、含边界预算、异常与无可行项规则。`prefer` 仅取 `"compact"`（默认）、`"verify"`、`"nodes"`、`"speed"`、`"robust"`，其他值抛 `ValueError`。排序的五项成本为总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签哈希总量（`cost.total`）、节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）：`"compact"` 依次最小化总传输、单组峰值、验签哈希总量、节点数、单签链步；`"verify"` 依次最小化验签哈希总量、单签链步、总传输、单组峰值、节点数；`"nodes"` 依次最小化节点数、总传输、验签哈希总量、单组峰值、单签链步；`"speed"` 依次最小化单签链步、验签哈希总量、总传输、单组峰值、节点数。`"robust"` 在前沿五项成本上各取 `(x-min)/(max-min)`（零跨度记 0），以精确有理数（`fractions.Fraction`，无浮点）先最小化最大归一化成本、再最小化其和。全部策略末段统一按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -537,6 +538,7 @@ from pqattest import (
     MerkleModeCost,
     merkle_verify_mode_frontier,
     merkle_cardinality_frontier,
+    recommend_merkle_cardinality_deployment,
 )
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
@@ -635,6 +637,14 @@ merkle_verify_mode_frontier(
 )
 # (MerkleModeCost(plan=MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...),
 #                 cost=MerkleVerifyWorkloadProfile(...), nodes=...), ...)
+
+# 叶位置未定时只给每组叶数；六元组预算顺序同上（检查点、单组峰值、总量、链步、节点、验签哈希）
+merkle_cardinality_frontier(4, (1, 2), (None, None, None, 9000, None, None))
+# 在该前沿上按偏好取一个成员；prefer ∈ compact/verify/nodes/speed/robust
+recommend_merkle_cardinality_deployment(
+    4, (1, 2), (None, None, None, 9000, None, None), prefer="compact"
+)
+# MerkleModeCost(plan=MerkleTransportWorkloadProfile(...), cost=MerkleVerifyWorkloadProfile(...), nodes=...)
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

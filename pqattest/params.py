@@ -42,7 +42,11 @@ multi-proof group is billed at the maximum transport bytes, canonical node
 count and internal-node hash count over every same-size strictly
 increasing index subset of the candidate tree, and it returns the same
 feasible, non-dominated :class:`MerkleModeCost` frontier.
-All sixteen
+:func:`recommend_merkle_cardinality_deployment` ranks that cardinality
+frontier by a business preference — ``"compact"``, ``"verify"``,
+``"nodes"``, ``"speed"`` or ``"robust"`` — and returns one
+:class:`MerkleModeCost`.
+All seventeen
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -50,6 +54,7 @@ state, no I/O, no keys are generated.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 from itertools import product
 from typing import Any
 
@@ -76,6 +81,7 @@ __all__ = [
     "merkle_verify_mode_frontier",
     "merkle_cardinality_frontier",
     "recommend_merkle_mode_deployment",
+    "recommend_merkle_cardinality_deployment",
     "merkle_storage_profile",
     "merkle_transport_profile",
     "merkle_verify_profile",
@@ -2245,3 +2251,108 @@ def merkle_cardinality_frontier(
         )
         for storage, modes, sizes, total, _steps, _peak, nodes, _hashes, verify in unique
     )
+
+
+def recommend_merkle_cardinality_deployment(
+    capacity: Any,
+    group_sizes: Any,
+    budgets: Any,
+    prefer: str = "compact",
+) -> MerkleModeCost:
+    """Pick one non-dominated worst-case cardinality plan by preference.
+
+    Computes :func:`merkle_cardinality_frontier` exactly once and ranks its
+    surviving :class:`MerkleModeCost` members by a business preference
+    instead of returning them all, reusing the frontier's own candidate
+    enumeration, budget screening and Pareto pruning verbatim:
+
+    - ``"compact"`` (the default): aggregate transport bytes
+      (:attr:`MerkleTransportWorkloadProfile.total`), then any single
+      group's transport peak (the maximum of
+      :attr:`MerkleTransportWorkloadProfile.sizes`), then total verifier
+      SHA-256 hashes (:attr:`MerkleVerifyWorkloadProfile.total`), then the
+      carried node total, then per-signature verifier hash-chain steps;
+    - ``"verify"``: total verifier hashes first, then verifier steps, then
+      aggregate bytes, the per-group peak and the node total;
+    - ``"nodes"``: the carried node total first, then aggregate bytes,
+      total verifier hashes, the per-group peak and verifier steps;
+    - ``"speed"``: verifier steps first, then total verifier hashes,
+      aggregate bytes, the per-group peak and the node total;
+    - ``"robust"``: each of the five ranked costs ``x`` is normalised over
+      the frontier to ``(x - min) / (max - min)`` as an exact rational; a
+      cost whose frontier span is zero is normalised to ``0``. Members rank
+      by their largest normalised cost first and then by the sum of their
+      normalised costs, so the chosen member is the one whose worst
+      relative deviation from each cost's frontier best is smallest, with
+      ties resolved towards the smallest total relative deviation.
+
+    Every ranking finishes with the same ascending tie-break — checkpoint
+    bytes, leaf count, ``w``, ``height`` and the ``modes`` tuple in
+    lexicographic order — and the first member after sorting is returned;
+    the result is therefore always itself a member of the cardinality
+    frontier.
+
+    ``capacity``, ``group_sizes`` and the six-tuple ``budgets`` follow
+    :func:`merkle_cardinality_frontier`'s types, ranges, inclusive budget
+    rules and exceptions exactly, and an unknown ``prefer`` value
+    (anything other than ``"compact"``, ``"verify"``, ``"nodes"``,
+    ``"speed"`` or ``"robust"``) or the absence of any feasible candidate
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state.
+    """
+    _validate_cardinality_groups(capacity, group_sizes)
+    _validate_verify_mode_budgets(budgets)
+    if prefer not in ("compact", "verify", "nodes", "speed", "robust"):
+        raise ValueError(
+            'prefer must be "compact", "verify", "nodes", "speed" or "robust"'
+        )
+    frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
+
+    def costs(member: MerkleModeCost) -> tuple[int, int, int, int, int]:
+        storage = member.plan.config
+        steps = profile("merkle", w=storage.w, height=storage.height).steps
+        return (
+            member.plan.total,
+            max(member.plan.sizes),
+            member.cost.total,
+            member.nodes,
+            steps,
+        )
+
+    def tie_break(member: MerkleModeCost) -> tuple[Any, ...]:
+        storage = member.plan.config
+        return (
+            storage.checkpoint_bytes,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+            member.plan.modes,
+        )
+
+    if prefer == "robust":
+        columns = tuple(zip(*(costs(member) for member in frontier)))
+        minima = tuple(min(column) for column in columns)
+        spans = tuple(max(column) - minimum for column, minimum in zip(columns, minima))
+
+        def ranking(member: MerkleModeCost) -> tuple[Any, ...]:
+            normalized = tuple(
+                Fraction(value - minimum, span) if span else Fraction(0)
+                for value, minimum, span in zip(costs(member), minima, spans)
+            )
+            return (max(normalized), sum(normalized)) + tie_break(member)
+    else:
+        # cost tuple order: (aggregate bytes, per-group peak, verifier
+        # hashes, carried nodes, verifier steps)
+        orders = {
+            "compact": (0, 1, 2, 3, 4),
+            "verify": (2, 4, 0, 1, 3),
+            "nodes": (3, 0, 2, 1, 4),
+            "speed": (4, 2, 0, 1, 3),
+        }
+        order = orders[prefer]
+
+        def ranking(member: MerkleModeCost) -> tuple[Any, ...]:
+            values = costs(member)
+            return tuple(values[index] for index in order) + tie_break(member)
+
+    return min(frontier, key=ranking)

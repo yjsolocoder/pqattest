@@ -2365,3 +2365,105 @@ def recommend_merkle_cardinality_deployment(
         return (*order, *tail(mode_cost))
 
     return min(frontier, key=ranking)
+
+
+def _validate_cardinality_weights(weights: Any) -> tuple[int, ...]:
+    """Validate the five-tuple of non-negative ranking weights.
+
+    Returns the validated five-tuple once every member is a non-boolean
+    non-negative integer and at least one member is positive.
+    """
+    if not isinstance(weights, tuple):
+        raise TypeError("weights must be a 5-tuple of non-negative integers")
+    if len(weights) != 5:
+        raise ValueError("weights must contain exactly five entries")
+    for weight in weights:
+        if isinstance(weight, bool) or not isinstance(weight, int) or weight < 0:
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("at least one weight must be positive")
+    return weights
+
+
+def recommend_merkle_cardinality_weighted(
+    capacity: Any,
+    group_sizes: Any,
+    budgets: Any,
+    weights: Any,
+) -> MerkleModeCost:
+    """Pick one non-dominated cardinality plan by a weighted normalized score.
+
+    Computes :func:`merkle_cardinality_frontier` exactly once and ranks the
+    returned worst-case-per-position cardinality plans by a caller-weighted
+    score instead of a fixed business preference. Each of the five ranked
+    costs — aggregate transport bytes
+    (:attr:`MerkleTransportWorkloadProfile.total`), any single group's
+    transport peak (the maximum of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), total verifier SHA-256
+    hashes (:attr:`MerkleVerifyWorkloadProfile.total`), carried multi-proof
+    nodes (:attr:`MerkleModeCost.nodes`) and the per-signature verifier
+    hash-chain steps (``profile("merkle", ...)``'s ``steps``) — is
+    normalised over the frontier as ``(x - min) / (max - min)``, with a
+    zero span scoring ``0``; every comparison is an exact :class:`Fraction`,
+    so no floating point is involved. The five ``weights`` multiply the
+    normalised costs in the order above and the products are summed; the
+    survivor with the smallest score is returned.
+
+    Ties on the weighted score break ascending by checkpoint bytes, leaf
+    count, ``w``, ``height`` and the ``modes`` tuple in lexicographic order,
+    the same tail used by
+    :func:`recommend_merkle_cardinality_deployment`.
+
+    ``capacity``, ``group_sizes`` and the six-tuple ``budgets`` follow
+    :func:`merkle_cardinality_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation raises
+    exactly as that function does and is screened before ``weights``.
+    ``weights`` must be a five-tuple of non-boolean, non-negative integers,
+    at least one of them positive; a non-tuple container raises
+    ``TypeError``, while a wrong length, a boolean, negative or non-integer
+    member, or an all-zero tuple raises ``ValueError``. The function is
+    pure: it draws no randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
+    validated_weights = _validate_cardinality_weights(weights)
+
+    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
+        return (
+            mode_cost.plan.total,
+            max(mode_cost.plan.sizes),
+            mode_cost.cost.total,
+            mode_cost.nodes,
+            profile(
+                "merkle",
+                w=mode_cost.plan.config.w,
+                height=mode_cost.plan.config.height,
+            ).steps,
+        )
+
+    def tail(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, tuple[str, ...]]:
+        config = mode_cost.plan.config
+        return (
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+            mode_cost.plan.modes,
+        )
+
+    columns = tuple(
+        [metrics(mode_cost)[i] for mode_cost in frontier] for i in range(5)
+    )
+    spans = tuple((min(column), max(column)) for column in columns)
+
+    def ranking(
+        mode_cost: MerkleModeCost,
+    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
+        score = Fraction(0)
+        for value, weight, (low, high) in zip(
+            metrics(mode_cost), validated_weights, spans
+        ):
+            if high > low:
+                score += weight * Fraction(value - low, high - low)
+        return (score, *tail(mode_cost))
+
+    return min(frontier, key=ranking)

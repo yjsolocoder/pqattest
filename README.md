@@ -504,6 +504,7 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_merkle_transport_deployment(capacity, indices, budgets, prefer="multiproof")` — 在预算内**联合**选择树参数与传输方案，返回 `MerkleTransportDeploymentProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`indices` 必须为非空、严格递增的非布尔整数元组，最大成员须小于候选树叶数；`budgets` 必须为四元组，按顺序分别为检查点字节、批次证明字节、多证明字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须同时覆盖 `capacity` 与 `indices`，尺寸与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。`prefer` 取 `"multiproof"`/`"batch"`/`"speed"`：主排序键分别为多证明字节、批次字节、步数；前两者次键取另一传输线长（multiproof 先多证明后批次，batch 反之），speed 依次再多证明字节、批次字节；三种偏好末段均按检查点字节、叶数、`w`、`height` 升序取首项。`indices`/`budgets` 容器类型错抛 `TypeError`，其余非法输入（含非整数或布尔索引成员）或无可行候选抛 `ValueError`
 - `MerkleTransportDeploymentProfile` — 冻结的联合部署选择值对象，四个字段按位置依次为 `config, nodes, batch, multi`，类型依次为 `MerkleStorageProfile, int, int, int`：所选配置、多证明节点数、批次证明字节数、多证明字节数；冻结、可位置构造、按值相等（可哈希）
 - `merkle_transport_deployment_frontier(capacity, indices, budgets)` — 与 `recommend_merkle_transport_deployment` 同一组候选与预算，但**不排序取首项**，而是返回全部可行且非支配的联合部署，类型为 `tuple[MerkleTransportDeploymentProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`indices` 必须为非空、严格递增的非负非布尔整数元组，候选树叶数须同时覆盖 `capacity` 与最大索引加一；`budgets` 必须为四元组，按顺序分别为检查点字节、批次证明字节、多证明字节及单签验签步数（`profile("merkle", ...).steps`）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，配置取 `merkle_storage_profile`、批次/多证明与节点数取 `merkle_transport_profile`、步数取 `profile`。支配判定固定为：A 在检查点字节、批次证明字节、多证明字节、单签步数四项上均不大于 B 且至少一项严格更小，则 A 支配 B（节点数仅作输出，不参与支配）；删除全部被支配候选并按值去重，不因偏好预先舍弃速度与传输尺寸形成取舍的配置。结果按单签步数、多证明字节、批次证明字节、检查点字节、叶数、`w`、`height` 稳定升序排列。`indices`/`budgets` 非元组抛 `TypeError`；其余非法输入或无可行候选抛 `ValueError`
+- `recommend_merkle_transport_deployment_weighted(capacity, indices, budgets, weights)` — 在 `merkle_transport_deployment_frontier` 的非支配结果上**按五元组权重的归一化加权评分选出一个联合部署方案**，返回该前沿成员（现有的 `MerkleTransportDeploymentProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`indices` 与四元组 `budgets` 完全沿用 `merkle_transport_deployment_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且先于 `weights` 筛查。`weights` 必须为五元组，依次对应批次证明字节（`batch`）、多证明字节（`multi`）、携带节点数（`nodes`）、检查点字节（`config.checkpoint_bytes`）与单签验签链步数（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且至少一项为正。对前沿五项成本分别按 `(x-min)/(max-min)` 归一化（零跨度记 0），五项归一化成本乘对应权重后求和，以精确有理数（`fractions.Fraction`，无浮点）取评分最小者；评分相同时按检查点字节、叶数、`w`、`height` 升序取首项。`weights` 非元组抛 `TypeError`；长度错误、含布尔、负数、非整数成员或全零抛 `ValueError`
 - `recommend_merkle_transport_workload(capacity, groups, budgets, prefer="compact")` — 把联合选择推广到**多个独立叶索引组**：每组各自携带一份批次证明或多证明，但共用同一棵 Merkle 树与同一 `(w, height)` 配置；返回 `MerkleTransportWorkloadProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组（一组叶索引），所选树的叶数须同时覆盖 `capacity` 与每组的最大索引加一。`budgets` 必须为四元组，按顺序分别为检查点字节、**单组**传输字节（每组所选格式线长均不得超过）、**总传输字节**（各组线长之和）及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，尺寸与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。`prefer="compact"`（默认）与 `"speed"` 均逐组取批次/多证明中**更短**者、等长取 `"multiproof"`；`"batch"` 与 `"multiproof"` 各组固定使用同名格式。配置排序：`"speed"` 先按验签步数、再按总传输字节，其余三种偏好先按总传输字节；四种偏好末段均按检查点字节、叶数、`w`、`height` 升序取首项。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
 - `MerkleTransportWorkloadProfile` — 冻结的多组工作负载选择值对象，四个字段按位置依次为 `config, modes, sizes, total`，类型依次为 `MerkleStorageProfile`、`str` 元组、`int` 元组、`int`：所选配置、每组的传输格式名（`"batch"` 或 `"multiproof"`，与输入组同序）、各组所选格式的线长（与 `modes` 逐位对齐）及各组长之和；冻结、可位置构造、按值相等（可哈希）
 - `merkle_transport_workload_frontier(capacity, groups, budgets)` — 与 `recommend_merkle_transport_workload` 同一工作负载，但**不排序取首项**，而是返回全部可行且非支配的部署，类型为 `tuple[MerkleTransportWorkloadProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组；`budgets` 必须为四元组，按顺序分别为检查点字节、单组传输字节、总传输字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，配置与步数取 `merkle_storage_profile` 与 `profile`，逐组以 `merkle_transport_profile` 取批次/多证明中更短的线长、等长取 `"multiproof"`，四项预算均须满足。支配判定：A 的 `config.checkpoint_bytes`、`total`、单签 `steps` 均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按步数、总量、检查点、叶数、`w`、`height` 稳定升序排列。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
@@ -533,6 +534,7 @@ from pqattest import (
     merkle_transport_profile,
     recommend_merkle_transport_deployment,
     merkle_transport_deployment_frontier,
+    recommend_merkle_transport_deployment_weighted,
     recommend_merkle_transport_workload,
     merkle_transport_workload_frontier,
     merkle_mode_frontier,
@@ -585,6 +587,12 @@ recommend_merkle_transport_deployment(16, (3, 5), (None, None, 8000, None))
 merkle_transport_deployment_frontier(4, (0, 1), (None, None, None, 9000))
 # (MerkleTransportDeploymentProfile(config=MerkleStorageProfile(w=4, height=2, ...), ...),
 #  MerkleTransportDeploymentProfile(config=MerkleStorageProfile(w=8, height=2, ...), ...))
+
+# 在该前沿上按五元组权重（批次字节、多证明字节、节点数、检查点字节、链步）
+# 取一个成员：五项成本 min-max 归一化后加权求和，Fraction 精确取最小
+recommend_merkle_transport_deployment_weighted(
+    4, (0, 1), (None, None, None, 9000), (1, 1, 1, 1, 1)
+)
 
 # 多组工作负载：三个独立叶组共用一棵树，每组各带一份证明；预算顺序为
 # (检查点, 单组传输, 总传输, 步数)，不限的项传 None。compact 逐组择短，

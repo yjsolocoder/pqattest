@@ -11,7 +11,11 @@ tree parameters and the transport encoding together under checkpoint, batch,
 multi-proof and verifier-step budgets, and
 :func:`merkle_transport_deployment_frontier` returns every feasible,
 non-dominated choice of the same joint deployment as a tuple instead of
-ranking one. :func:`recommend_merkle_transport_workload`
+ranking one. :func:`recommend_merkle_transport_deployment_weighted` ranks
+that frontier by a caller-supplied five-tuple of non-negative weights over
+its five min-max-normalised costs, all arithmetic exact via
+:class:`fractions.Fraction`, and returns one
+:class:`MerkleTransportDeploymentProfile`. :func:`recommend_merkle_transport_workload`
 extends that joint choice to several independent leaf-index groups, each carried
 in its own transport, under checkpoint, per-group, aggregate and verifier-step
 budgets. :func:`merkle_transport_workload_frontier` returns every feasible,
@@ -62,7 +66,7 @@ worst-case-position :func:`merkle_cardinality_frontier` frontier.
 :func:`merkle_verify_mode_frontier` frontier by one of five business
 preferences — ``"compact"``, ``"verify"``, ``"nodes"``, ``"speed"`` or
 ``"robust"`` — and returns one :class:`MerkleModeCost`.
-All twenty-one
+All twenty-two
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -91,6 +95,7 @@ __all__ = [
     "merkle_deployment_frontier",
     "recommend_merkle_transport_deployment",
     "merkle_transport_deployment_frontier",
+    "recommend_merkle_transport_deployment_weighted",
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
     "merkle_mode_frontier",
@@ -1062,6 +1067,90 @@ def merkle_transport_deployment_frontier(
         )
     )
     return tuple(unique)
+
+
+def recommend_merkle_transport_deployment_weighted(
+    capacity: Any,
+    indices: Any,
+    budgets: Any,
+    weights: Any,
+) -> MerkleTransportDeploymentProfile:
+    """Pick one joint deployment by weighted normalised costs.
+
+    Computes :func:`merkle_transport_deployment_frontier` exactly once and
+    ranks the returned feasible, non-dominated joint deployments by a
+    caller-supplied linear score over five costs: the batch-proof wire
+    length (:attr:`MerkleTransportDeploymentProfile.batch`), the multi-proof
+    wire length (:attr:`MerkleTransportDeploymentProfile.multi`), the
+    carried multi-proof node count
+    (:attr:`MerkleTransportDeploymentProfile.nodes`), the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`) and the per-signature
+    verifier hash-chain step count (``profile("merkle", ...)``'s ``steps``).
+
+    ``weights`` must be a five-tuple in that same order — batch-proof
+    bytes, multi-proof bytes, carried nodes, checkpoint bytes and verifier
+    chain steps. Every weight must be a non-boolean, non-negative integer
+    and at least one must be positive. Each of the five costs is min-max
+    normalised over the frontier as ``(x - min) / (max - min)``, with a
+    zero span scoring ``0``; the weighted score is the sum of the five
+    normalised costs times their weights, compared as exact rationals
+    (``fractions.Fraction``) with no floating point anywhere. The survivor
+    with the smallest score is returned; equal scores are broken ascending
+    by checkpoint bytes, leaf count, ``w`` and ``height``. The candidate
+    enumeration and Pareto filtering are not duplicated: the frontier is
+    the only source of candidates and is called exactly once, and the
+    returned object is a member of that frontier.
+
+    ``capacity``, ``indices`` and the four-tuple ``budgets`` follow
+    :func:`merkle_transport_deployment_frontier`'s types, ranges,
+    inclusive-budget, exception and no-feasible-candidate rules exactly, so
+    a violation raises exactly as that function does (and is screened
+    before ``weights``). A non-tuple ``weights`` raises ``TypeError``; a
+    wrong-length tuple or a boolean, negative, non-integer or all-zero
+    weight raises ``ValueError``. The function is pure: it draws no
+    randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_transport_deployment_frontier(capacity, indices, budgets)
+    _validate_cardinality_weights(weights)
+
+    def metrics(
+        deployment: MerkleTransportDeploymentProfile,
+    ) -> tuple[int, int, int, int, int]:
+        return (
+            deployment.batch,
+            deployment.multi,
+            deployment.nodes,
+            deployment.config.checkpoint_bytes,
+            profile(
+                "merkle",
+                w=deployment.config.w,
+                height=deployment.config.height,
+            ).steps,
+        )
+
+    metric_rows = tuple(metrics(deployment) for deployment in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+
+    def ranking(
+        deployment: MerkleTransportDeploymentProfile,
+    ) -> tuple[Fraction, int, int, int, int]:
+        score = Fraction(0)
+        for value, weight, (low, high) in zip(metrics(deployment), weights, spans):
+            if high > low:
+                score += weight * Fraction(value - low, high - low)
+        config = deployment.config
+        return (
+            score,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+        )
+
+    return min(frontier, key=ranking)
 
 
 @dataclass(frozen=True)

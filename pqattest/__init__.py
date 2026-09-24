@@ -34,6 +34,9 @@ costs with exact Fraction arithmetic,
 recommend_merkle_verify_mode_weighted to rank the fixed-position joint
 verify-mode frontier by the smallest worst-case regret over a non-empty
 tuple of such five-weight scenarios, again with exact Fraction arithmetic,
+recommend_merkle_cardinality_scenarios to do the same multi-scenario
+smallest-worst-case-regret ranking over the worst-case-position
+cardinality frontier,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -140,6 +143,7 @@ from .params import (
     merkle_verify_mode_frontier,
     merkle_cardinality_frontier,
     recommend_merkle_cardinality_deployment,
+    recommend_merkle_cardinality_scenarios,
     recommend_merkle_cardinality_weighted,
     recommend_merkle_verify_mode_weighted,
     merkle_verify_profile,
@@ -220,6 +224,7 @@ __all__ = [
     "merkle_cardinality_frontier",
     "recommend_merkle_cardinality_deployment",
     "recommend_merkle_cardinality_weighted",
+    "recommend_merkle_cardinality_scenarios",
     "recommend_merkle_verify_mode_weighted",
     "merkle_verify_profile",
     "merkle_verify_workload_profile",

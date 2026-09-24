@@ -28,7 +28,9 @@ MerkleVerifyWorkloadProfile / merkle_verify_workload_profile,
 MerkleModeCost / merkle_verify_mode_frontier,
 merkle_cardinality_frontier for the worst-case-position cardinality
 frontier, recommend_merkle_cardinality_deployment to rank that frontier
-by one of five preferences, recommend_merkle_cardinality_weighted to
+by one of five preferences, recommend_merkle_verify_mode_deployment to
+rank the fixed-leaf-position joint verify-mode frontier by those same
+five preferences, recommend_merkle_cardinality_weighted to
 rank it by a five-tuple of non-negative weights over min-max-normalised
 costs with exact Fraction arithmetic,
 recommend_merkle_verify_mode_weighted to rank the fixed-position joint
@@ -144,6 +146,7 @@ from .params import (
     merkle_verify_mode_frontier,
     merkle_cardinality_frontier,
     recommend_merkle_cardinality_deployment,
+    recommend_merkle_verify_mode_deployment,
     recommend_merkle_cardinality_weighted,
     recommend_merkle_cardinality_weighted_scenarios,
     recommend_merkle_verify_mode_weighted,
@@ -224,6 +227,7 @@ __all__ = [
     "merkle_verify_mode_frontier",
     "merkle_cardinality_frontier",
     "recommend_merkle_cardinality_deployment",
+    "recommend_merkle_verify_mode_deployment",
     "recommend_merkle_cardinality_weighted",
     "recommend_merkle_cardinality_weighted_scenarios",
     "recommend_merkle_verify_mode_weighted",

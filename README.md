@@ -520,6 +520,7 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_merkle_cardinality_weighted(capacity, group_sizes, budgets, weights)` — 在 `merkle_cardinality_frontier` 的非支配结果上**按五元组权重的归一化加权评分选出一个最坏位置基数方案**，返回该前沿成员（现有的 `MerkleModeCost`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。前三参数无默认值；`capacity`、`group_sizes` 与六元组 `budgets` 完全沿用 `merkle_cardinality_frontier` 的类型、范围、含边界预算、异常与无可行项规则。`weights` 必须为五元组，依次对应总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签 SHA-256 总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且至少一项为正。对前沿五项成本分别按 `(x-min)/(max-min)` 归一化（零跨度记 0），五项归一化成本乘对应权重后求和，以精确有理数（`fractions.Fraction`，无浮点）取评分最小者；评分相同时按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`weights` 非元组抛 `TypeError`；长度错误、含布尔、负数、非整数成员或全零抛 `ValueError`
 - `recommend_merkle_verify_mode_weighted(capacity, groups, budgets, scenarios)` — 为**固定叶位置**的 `merkle_verify_mode_frontier` 工作负载新增**抗偏好漂移的加权推荐**：同时评估多组权重情景，从同一次联合验签前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleModeCost`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变旧接口与任何线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与六元组 `budgets` 先按前沿原规则校验（异常与无可行项规则完全沿用 `merkle_verify_mode_frontier`，且先于 `scenarios` 筛查）。`scenarios` 必须为非空元组，每项是五元组权重，依次对应总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签 SHA-256 总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）；权重只能是非布尔非负整数，每项至少一个正数，重复情景分别计入。五项成本按全前沿各自的最小值与最大值归一化为 `Fraction`（零跨度记 0）；每个情景的加权和除以该情景的权重总和，禁止浮点。对每个情景先求其在全前沿上的最小归一化得分，再以候选得分减去该最小值得到该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，末段仍按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`scenarios` 或其成员非元组、权重非整数抛 `TypeError`；空元组、错长、布尔或负数权重、全零项抛 `ValueError`
 - `recommend_merkle_cardinality_weighted_scenarios(capacity, group_sizes, budgets, scenarios)` — 为**叶位置未定**的 `merkle_cardinality_frontier` 工作负载补上与 `recommend_merkle_verify_mode_weighted` 对应的**抗偏好漂移多情景版本**（基线已有 `recommend_merkle_cardinality_weighted` 的单一固定权重选择）：同时评估多组权重情景，从同一次基数前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleModeCost` 方案/成本配对对象），不新增值类型、不重复枚举或筛选候选、不改变既有前沿、单一权重推荐及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`group_sizes` 与六元组 `budgets` 先按 `merkle_cardinality_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查）。`scenarios` 必须为**非空元组**，每项是覆盖总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签哈希总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）的五元权重；权重只能是非布尔非负整数，每个情景至少一项为正，重复情景分别计入（权重总和参与归一化）。五项成本按全前沿各自的最小值与最大值归一化（零跨度记 0），全程为精确有理数（`fractions.Fraction`，禁止浮点）；每个情景的加权和除以该情景自身的权重总和作为该情景下的得分。先求每个情景的最优得分，候选得分减去它即为该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，完全平局时按检查点字节、叶数、`w`、`height` 与逐组模式（`modes`）的字典序取首项。`scenarios` 或其成员非元组、权重成员非整数抛 `TypeError`；空元组、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；无可行方案也抛 `ValueError`
+- `recommend_merkle_verify_mode_deployment(capacity, groups, budgets, prefer="compact")` — 在 `merkle_verify_mode_frontier` 的非支配结果上**按业务偏好为固定叶位置工作负载选出一个方案**，返回该前沿成员（`MerkleModeCost`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。前三参数无默认值；`capacity`、`groups` 与六元组 `budgets` 先按 `merkle_verify_mode_frontier` 原规则校验（类型、范围、含边界预算、异常与无可行项规则完全沿用，且先于 `prefer` 筛查）。`prefer` 仅取 `"compact"`（默认）、`"verify"`、`"nodes"`、`"speed"`、`"robust"`，其他值抛 `ValueError`。排序的五项成本为总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签哈希总量（`cost.total`）、节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）：`"compact"` 依次最小化总传输、单组峰值、验签哈希总量、节点数、单签链步；`"verify"` 依次最小化验签哈希总量、单签链步、总传输、单组峰值、节点数；`"nodes"` 依次最小化节点数、总传输、验签哈希总量、单组峰值、单签链步；`"speed"` 依次最小化单签链步、验签哈希总量、总传输、单组峰值、节点数。`"robust"` 在前沿五项成本上各取 `(x-min)/(max-min)`（零跨度记 0），全程精确有理数（`fractions.Fraction`，无浮点），先最小化最大归一化成本、再最小化各项之和。全部策略完全平局时按检查点字节、叶数、`w`、`height` 与逐组模式（`modes`）的字典序取首项。`groups` 或 `budgets` 非元组、或某个成员组本身不是元组抛 `TypeError`；`capacity` 越界或为布尔、组内索引非法、六元预算长度或成员非法、`prefer` 取值非法或预算下无可行方案均抛 `ValueError`
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
 
@@ -542,6 +543,7 @@ from pqattest import (
     merkle_verify_mode_frontier,
     merkle_cardinality_frontier,
     recommend_merkle_cardinality_deployment,
+    recommend_merkle_verify_mode_deployment,
     recommend_merkle_cardinality_weighted,
     recommend_merkle_cardinality_weighted_scenarios,
     recommend_merkle_verify_mode_weighted,
@@ -643,6 +645,11 @@ merkle_verify_mode_frontier(
 )
 # (MerkleModeCost(plan=MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...),
 #                 cost=MerkleVerifyWorkloadProfile(...), nodes=...), ...)
+
+# 在该固定叶位置前沿上按业务偏好取一个成员；prefer ∈ compact/verify/nodes/speed/robust
+recommend_merkle_verify_mode_deployment(
+    16, ((0, 1), (3, 5)), (None, 5000, 12000, None, 8, None), prefer="compact"
+)
 
 # 叶位置未定时只给每组叶数；六元组预算顺序同上（检查点、单组峰值、总量、链步、节点、验签哈希）
 merkle_cardinality_frontier(4, (1, 2), (None, None, None, 9000, None, None))

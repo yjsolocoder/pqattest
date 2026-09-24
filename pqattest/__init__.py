@@ -30,6 +30,10 @@ five-weight scenarios, again with exact Fraction arithmetic,
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
 merkle_transport_workload_frontier / merkle_mode_frontier /
 recommend_merkle_mode_deployment,
+recommend_merkle_mode_weighted to rank that mode frontier by a single
+five-tuple of non-negative weights over its five min-max-normalised costs
+(checkpoint bytes, single-group peak, total transport, verifier steps and
+carried nodes) with exact Fraction arithmetic,
 recommend_merkle_mode_weighted_scenarios to rank that mode frontier by the
 smallest worst-case regret over a non-empty tuple of five-weight scenarios
 (checkpoint bytes, single-group peak, total transport, verifier steps and
@@ -169,6 +173,7 @@ from .params import (
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_mode_deployment,
+    recommend_merkle_mode_weighted,
     recommend_merkle_mode_weighted_scenarios,
     recommend_merkle_transport_deployment,
     recommend_merkle_transport_deployment_weighted,
@@ -264,6 +269,7 @@ __all__ = [
     "recommend_merkle_transport_deployment_weighted_scenarios",
     "recommend_merkle_transport_workload",
     "recommend_merkle_mode_deployment",
+    "recommend_merkle_mode_weighted",
     "recommend_merkle_mode_weighted_scenarios",
     "sign",
     "sign_merkle_auth_state",

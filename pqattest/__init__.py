@@ -38,6 +38,9 @@ recommend_merkle_cardinality_weighted_scenarios to rank the
 worst-case-position cardinality frontier that same way, by the smallest
 worst-case regret over a non-empty tuple of five-weight scenarios with
 exact Fraction arithmetic,
+recommend_merkle_verify_mode_deployment to rank the fixed-position
+verify-mode frontier by one of five business preferences (compact /
+verify / nodes / speed / robust),
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -146,6 +149,7 @@ from .params import (
     recommend_merkle_cardinality_deployment,
     recommend_merkle_cardinality_weighted,
     recommend_merkle_cardinality_weighted_scenarios,
+    recommend_merkle_verify_mode_deployment,
     recommend_merkle_verify_mode_weighted,
     merkle_verify_profile,
     merkle_verify_workload_profile,
@@ -226,6 +230,7 @@ __all__ = [
     "recommend_merkle_cardinality_deployment",
     "recommend_merkle_cardinality_weighted",
     "recommend_merkle_cardinality_weighted_scenarios",
+    "recommend_merkle_verify_mode_deployment",
     "recommend_merkle_verify_mode_weighted",
     "merkle_verify_profile",
     "merkle_verify_workload_profile",

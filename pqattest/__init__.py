@@ -21,6 +21,9 @@ merkle_deployment_frontier /
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 merkle_transport_deployment_frontier /
+recommend_merkle_transport_deployment_weighted to rank that frontier by a
+five-tuple of non-negative weights over min-max-normalised costs with exact
+Fraction arithmetic,
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
 merkle_transport_workload_frontier / merkle_mode_frontier /
 recommend_merkle_mode_deployment, MerkleVerifyProfile / merkle_verify_profile,
@@ -159,6 +162,7 @@ from .params import (
     merkle_deployment_frontier,
     recommend_merkle_mode_deployment,
     recommend_merkle_transport_deployment,
+    recommend_merkle_transport_deployment_weighted,
     recommend_merkle_transport_workload,
 )
 from .toy_lattice import (
@@ -246,6 +250,7 @@ __all__ = [
     "restore_ots_pair",
     "recommend_merkle_deployment",
     "recommend_merkle_transport_deployment",
+    "recommend_merkle_transport_deployment_weighted",
     "recommend_merkle_transport_workload",
     "recommend_merkle_mode_deployment",
     "sign",

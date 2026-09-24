@@ -26,6 +26,12 @@ extends that joint choice to several independent leaf-index groups, each carried
 in its own transport, under checkpoint, per-group, aggregate and verifier-step
 budgets. :func:`merkle_transport_workload_frontier` returns every feasible,
 non-dominated choice of the same workload as a tuple instead of ranking one.
+:func:`recommend_merkle_transport_workload_weighted` instead ranks that same
+workload frontier by a caller-supplied four-tuple of non-negative weights
+over its four min-max-normalised costs in the order checkpoint bytes,
+single-group peak, aggregate transport and verifier steps (the weighted sum
+divided by the weight total), with exact :class:`fractions.Fraction`
+arithmetic, and returns one profile.
 :func:`merkle_mode_frontier` goes further and enumerates every per-group
 ``batch``/``multiproof`` mode combination of the workload under checkpoint,
 per-group, aggregate, verifier-step and carried-node budgets, returning the
@@ -84,7 +90,7 @@ worst-case-position :func:`merkle_cardinality_frontier` frontier.
 :func:`merkle_verify_mode_frontier` frontier by one of five business
 preferences — ``"compact"``, ``"verify"``, ``"nodes"``, ``"speed"`` or
 ``"robust"`` — and returns one :class:`MerkleModeCost`.
-All twenty-five
+All twenty-six
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -117,6 +123,7 @@ __all__ = [
     "recommend_merkle_transport_deployment_weighted_scenarios",
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
+    "recommend_merkle_transport_workload_weighted",
     "merkle_mode_frontier",
     "merkle_verify_mode_frontier",
     "merkle_cardinality_frontier",
@@ -1677,6 +1684,107 @@ def merkle_transport_workload_frontier(
         )
     )
     return tuple(unique)
+
+
+def _validate_workload_weights(weights: Any) -> tuple[int, ...]:
+    """Validate the four-tuple of non-negative workload-frontier cost weights."""
+    if not isinstance(weights, tuple):
+        raise TypeError("weights must be a 4-tuple of non-negative integer weights")
+    if len(weights) != 4:
+        raise ValueError("weights must contain exactly four entries")
+    for weight in weights:
+        if isinstance(weight, bool):
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+        if not isinstance(weight, int):
+            raise TypeError("every weight must be an integer")
+        if weight < 0:
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("at least one weight must be positive")
+    return weights
+
+
+def recommend_merkle_transport_workload_weighted(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+    weights: Any,
+) -> MerkleTransportWorkloadProfile:
+    """Pick one non-dominated workload deployment by weighted normalised costs.
+
+    Computes :func:`merkle_transport_workload_frontier` exactly once and ranks
+    the returned feasible, non-dominated workloads by a caller-supplied linear
+    score over four costs: the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), any single group's
+    transport peak (the maximum of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), the aggregate transport
+    bytes (:attr:`MerkleTransportWorkloadProfile.total`) and the per-signature
+    verifier hash-chain step count (``profile("merkle", ...)``'s ``steps``).
+
+    ``weights`` must be a four-tuple in that same order — checkpoint bytes,
+    single-group peak, total transport bytes and per-signature chain steps.
+    Every weight must be a non-boolean, non-negative integer and at least one
+    must be positive. Each of the four costs is min-max normalised over the
+    whole frontier as ``(x - min) / (max - min)``, with a zero span scoring
+    ``0``; the weighted score is the sum of the four normalised costs times
+    their weights, divided by the weight total, all compared as exact
+    rationals (``fractions.Fraction``) with no floating point anywhere. The
+    survivor with the smallest score is returned; equal scores are broken
+    ascending by checkpoint bytes, leaf count, ``w``, ``height`` and the
+    per-group ``modes`` tuple in lexicographic order. The candidate
+    enumeration and Pareto filtering are not duplicated: the frontier is the
+    only source of candidates and is called exactly once.
+
+    ``capacity``, ``groups`` and the four-tuple ``budgets`` follow
+    :func:`merkle_transport_workload_frontier`'s types, ranges,
+    inclusive-budget, exception and no-feasible-candidate rules exactly, so
+    a violation raises exactly as that function does (and is screened before
+    ``weights``). A non-tuple ``weights`` or a non-integer member raises
+    ``TypeError``; a wrong-length tuple or a boolean, negative or all-zero
+    weight raises ``ValueError``. The function is pure: it draws no
+    randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_transport_workload_frontier(capacity, groups, budgets)
+    validated_weights = _validate_workload_weights(weights)
+
+    def metrics(
+        workload: MerkleTransportWorkloadProfile,
+    ) -> tuple[int, int, int, int]:
+        return (
+            workload.config.checkpoint_bytes,
+            max(workload.sizes),
+            workload.total,
+            profile(
+                "merkle", w=workload.config.w, height=workload.config.height
+            ).steps,
+        )
+
+    metric_rows = tuple(metrics(workload) for workload in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(4)
+    )
+    weight_total = sum(validated_weights)
+
+    def ranking(
+        workload: MerkleTransportWorkloadProfile,
+    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
+        score = Fraction(0)
+        for value, weight, (low, high) in zip(metrics(workload), validated_weights, spans):
+            if high > low:
+                score += weight * Fraction(value - low, high - low)
+        score /= weight_total
+        config = workload.config
+        return (
+            score,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+            workload.modes,
+        )
+
+    return min(frontier, key=ranking)
 
 
 def _validate_mode_budgets(budgets: Any) -> tuple[int | None, ...]:

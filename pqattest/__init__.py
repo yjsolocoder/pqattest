@@ -34,6 +34,10 @@ frontier by a four-tuple of non-negative weights over min-max-normalised
 costs (checkpoint bytes, single-group peak, total transport and verifier
 steps), the weighted sum divided by the weight total, with exact Fraction
 arithmetic,
+recommend_merkle_transport_workload_weighted_scenarios to rank that same
+workload frontier by the smallest worst-case regret over a non-empty
+tuple of four-weight scenarios (checkpoint bytes, single-group peak,
+total transport and verifier steps) with exact Fraction arithmetic,
 merkle_mode_frontier /
 recommend_merkle_mode_deployment,
 recommend_merkle_mode_weighted to rank that mode frontier by a five-tuple
@@ -186,6 +190,7 @@ from .params import (
     recommend_merkle_transport_deployment_weighted_scenarios,
     recommend_merkle_transport_workload,
     recommend_merkle_transport_workload_weighted,
+    recommend_merkle_transport_workload_weighted_scenarios,
 )
 from .toy_lattice import (
     ToyLatticeCiphertext,
@@ -276,6 +281,7 @@ __all__ = [
     "recommend_merkle_transport_deployment_weighted_scenarios",
     "recommend_merkle_transport_workload",
     "recommend_merkle_transport_workload_weighted",
+    "recommend_merkle_transport_workload_weighted_scenarios",
     "recommend_merkle_mode_deployment",
     "recommend_merkle_mode_weighted",
     "recommend_merkle_mode_weighted_scenarios",

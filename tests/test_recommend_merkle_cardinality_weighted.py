@@ -267,25 +267,32 @@ class RecommendMerkleCardinalityWeightedTest(unittest.TestCase):
                     )
 
     def test_invalid_weights_members_raise_value_error(self):
-        for bad in (
+        bad_bases = (
             (),
             (1, 1, 1, 1),
             (1, 1, 1, 1, 1, 1),
             (0, 0, 0, 0, 0),
-            (1, -1, 1, 1, 1),
-            (-1, 1, 1, 1, 1),
-            (True, 1, 1, 1, 1),
-            (1, 1, 1, 1, False),
-            (1.0, 1, 1, 1, 1),
-            (1, "1", 1, 1, 1),
-            (1, None, 1, 1, 1),
-            (1, 1, 1, 1, 1.5),
-        ):
+        )
+        for bad in bad_bases:
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     recommend_merkle_cardinality_weighted(
                         4, _SIZES, _BUDGETS, bad
                     )
+        # a boolean, negative or non-integer member is rejected at every
+        # position, not just the first one the validator inspects
+        good = (1, 1, 1, 1, 1)
+        for position in range(5):
+            for replacement in (-1, True, False, 1.0, "1", None, 1.5):
+                bad = tuple(
+                    replacement if index == position else good[index]
+                    for index in range(5)
+                )
+                with self.subTest(position=position, replacement=replacement):
+                    with self.assertRaises(ValueError):
+                        recommend_merkle_cardinality_weighted(
+                            4, _SIZES, _BUDGETS, bad
+                        )
 
     def test_boolean_weights_are_value_error_even_though_int(self):
         for bad in ((True, 0, 0, 0, 0), (0, 0, 0, 0, True)):

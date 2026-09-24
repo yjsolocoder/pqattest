@@ -58,7 +58,13 @@ regret sum, then per-scenario scores) with the same exact
 :class:`fractions.Fraction` arithmetic, and returns one profile.
 :func:`merkle_deployment_frontier` likewise returns the whole Pareto frontier
 of ordinary Merkle deployments under checkpoint, signature, proof and
-verifier-step budgets. :func:`merkle_verify_profile` compares the
+verifier-step budgets. :func:`recommend_merkle_deployment_weighted` ranks
+that same ordinary-deployment frontier by a caller-supplied four-tuple of
+non-negative weights over its four min-max-normalised costs in the order
+checkpoint bytes, signature wire length, standalone proof wire length and
+verifier steps (the weighted sum divided by the weight total), with exact
+:class:`fractions.Fraction` arithmetic, and returns one profile.
+:func:`merkle_verify_profile` compares the
 verifier-side SHA-256 hash cost of a batch proof against a multi-proof over
 the same leaf set, returning a :class:`MerkleVerifyProfile`.
 :func:`merkle_verify_workload_profile` extends that comparison to several
@@ -95,7 +101,7 @@ worst-case-position :func:`merkle_cardinality_frontier` frontier.
 :func:`merkle_verify_mode_frontier` frontier by one of five business
 preferences — ``"compact"``, ``"verify"``, ``"nodes"``, ``"speed"`` or
 ``"robust"`` — and returns one :class:`MerkleModeCost`.
-All twenty-seven
+All twenty-eight
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -122,6 +128,7 @@ __all__ = [
     "recommend",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
+    "recommend_merkle_deployment_weighted",
     "recommend_merkle_transport_deployment",
     "merkle_transport_deployment_frontier",
     "recommend_merkle_transport_deployment_weighted",
@@ -510,6 +517,101 @@ def merkle_deployment_frontier(
         )
     )
     return tuple(unique)
+
+
+def _validate_deployment_weights(weights: Any) -> tuple[int, ...]:
+    """Validate the four-tuple of non-negative deployment cost weights."""
+    if not isinstance(weights, tuple):
+        raise TypeError("weights must be a 4-tuple of non-negative integer weights")
+    if len(weights) != 4:
+        raise ValueError("weights must contain exactly four entries")
+    for weight in weights:
+        if isinstance(weight, bool):
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+        if not isinstance(weight, int):
+            raise TypeError("every weight must be an integer")
+        if weight < 0:
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("at least one weight must be positive")
+    return weights
+
+
+def recommend_merkle_deployment_weighted(
+    capacity: Any,
+    budgets: Any,
+    weights: Any,
+) -> MerkleStorageProfile:
+    """Pick one non-dominated Merkle deployment by weighted normalised costs.
+
+    Computes :func:`merkle_deployment_frontier` exactly once and ranks the
+    returned feasible, non-dominated ordinary Merkle deployments by a
+    caller-supplied linear score over four costs: the checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), one signature wire
+    length (:attr:`MerkleStorageProfile.signature_wire_bytes`), one
+    standalone proof wire length
+    (:attr:`MerkleStorageProfile.proof_wire_bytes`) and the per-signature
+    verifier hash-chain step count (``profile("merkle", ...)``'s
+    ``steps``).
+
+    ``weights`` must be a four-tuple in that same order — checkpoint bytes,
+    signature wire bytes, standalone proof wire bytes and per-signature
+    chain steps. Every weight must be a non-boolean, non-negative integer
+    and at least one must be positive. Each of the four costs is min-max
+    normalised over the whole frontier as ``(x - min) / (max - min)``, with
+    a zero span scoring ``0``; the weighted score is the sum of the four
+    normalised costs times their weights, divided by the weight total, all
+    compared as exact rationals (``fractions.Fraction``) with no floating
+    point anywhere. The survivor with the smallest score is returned; equal
+    scores are broken ascending by checkpoint bytes, leaf count, ``w`` and
+    ``height``. The candidate enumeration and Pareto filtering are not
+    duplicated: the frontier is the only source of candidates and is called
+    exactly once.
+
+    ``capacity`` and the four-tuple ``budgets`` follow
+    :func:`merkle_deployment_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``weights``). A non-tuple ``weights`` or a non-integer member raises
+    ``TypeError``; a wrong-length tuple or a boolean, negative or all-zero
+    weight raises ``ValueError``. The function is pure: it draws no
+    randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_deployment_frontier(capacity, budgets)
+    validated_weights = _validate_deployment_weights(weights)
+
+    def metrics(storage: MerkleStorageProfile) -> tuple[int, int, int, int]:
+        return (
+            storage.checkpoint_bytes,
+            storage.signature_wire_bytes,
+            storage.proof_wire_bytes,
+            profile("merkle", w=storage.w, height=storage.height).steps,
+        )
+
+    metric_rows = tuple(metrics(storage) for storage in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(4)
+    )
+    weight_total = sum(validated_weights)
+
+    def ranking(
+        storage: MerkleStorageProfile,
+    ) -> tuple[Fraction, int, int, int, int]:
+        score = Fraction(0)
+        for value, weight, (low, high) in zip(metrics(storage), validated_weights, spans):
+            if high > low:
+                score += weight * Fraction(value - low, high - low)
+        score /= weight_total
+        return (
+            score,
+            storage.checkpoint_bytes,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+        )
+
+    return min(frontier, key=ranking)
 
 
 @dataclass(frozen=True)

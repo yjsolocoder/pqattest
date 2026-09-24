@@ -174,6 +174,30 @@ class RecommendMerkleVerifyModeWeightedTest(unittest.TestCase):
         self.assertEqual(once, twice)
         self.assertEqual(once, thrice)
 
+    def test_repeated_scenarios_regression_cases(self):
+        # repeated scenarios must be kept as separate tuple positions:
+        # every duplicated tuple must agree with the brute-force ranking
+        # (which zips the scenarios position for position), exercising
+        # both the max-regret and the regret-sum levels with duplicates
+        first = (3, 0, 7, 0, 2)
+        second = (0, 5, 0, 1, 0)
+        cases = (
+            (first, first, second),
+            (first, second, second),
+            (second, first, first),
+            (second, second, first),
+            (first, second, first, second),
+        )
+        for scenarios in cases:
+            with self.subTest(scenarios=scenarios):
+                result = recommend_merkle_verify_mode_weighted(
+                    16, _GROUPS, _BUDGETS, scenarios
+                )
+                self.assertEqual(
+                    result,
+                    _expected(16, _GROUPS, _BUDGETS, scenarios),
+                )
+
     def test_zero_span_dimensions_score_zero(self):
         # a single-member frontier makes every span zero: the unique member
         # is chosen regardless of the scenarios, without dividing by zero
@@ -378,36 +402,91 @@ class RecommendMerkleVerifyModeWeightedTest(unittest.TestCase):
                     recommend_merkle_verify_mode_weighted(
                         16, _GROUPS, _BUDGETS, bad
                     )
+        # the bad scenario member is also rejected when it follows a valid
+        # one, not only when it is the sole member of the tuple
+        good = (1, 1, 1, 1, 1)
+        for bad_member in ([1, 1, 1, 1, 1], "scenario", None, 7):
+            with self.subTest(bad_member=bad_member):
+                with self.assertRaises(TypeError):
+                    recommend_merkle_verify_mode_weighted(
+                        16, _GROUPS, _BUDGETS, (good, bad_member)
+                    )
 
     def test_non_integer_weight_raises_type_error(self):
-        for bad in (
+        base_bad = (
             ((1.0, 1, 1, 1, 1),),
             ((1, "1", 1, 1, 1),),
             ((1, None, 1, 1, 1),),
             ((1, 1, 1, 1, 1.5),),
-        ):
+        )
+        for bad in base_bad:
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
                     recommend_merkle_verify_mode_weighted(
                         16, _GROUPS, _BUDGETS, bad
                     )
+        # a non-integer weight is rejected at every weight position and in
+        # every scenario of the tuple, not just the first one inspected
+        good = (1, 1, 1, 1, 1)
+        for scenario_position in range(2):
+            for weight_position in range(5):
+                for replacement in (1.0, "1", None, 1.5):
+                    scenarios = [good, good]
+                    scenarios[scenario_position] = tuple(
+                        replacement if index == weight_position else good[index]
+                        for index in range(5)
+                    )
+                    with self.subTest(
+                        scenario_position=scenario_position,
+                        weight_position=weight_position,
+                        replacement=replacement,
+                    ):
+                        with self.assertRaises(TypeError):
+                            recommend_merkle_verify_mode_weighted(
+                                16, _GROUPS, _BUDGETS, tuple(scenarios)
+                            )
 
     def test_invalid_weights_members_raise_value_error(self):
-        for bad in (
+        base_bad = (
             (),
             ((1, 1, 1, 1),),
             ((1, 1, 1, 1, 1, 1),),
             ((0, 0, 0, 0, 0),),
-            ((1, -1, 1, 1, 1),),
-            ((-1, 1, 1, 1, 1),),
-            ((True, 1, 1, 1, 1),),
-            ((1, 1, 1, 1, False),),
-            ((1, 1, 1, 1, 1), (0, 0, 0, 0, 0)),
-        ):
+        )
+        for bad in base_bad:
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     recommend_merkle_verify_mode_weighted(
                         16, _GROUPS, _BUDGETS, bad
+                    )
+        # a boolean or negative weight is rejected at every weight position
+        # and in every scenario of the tuple, and an all-zero scenario is
+        # rejected at every outer position, not just the first inspected
+        good = (1, 1, 1, 1, 1)
+        for scenario_position in range(2):
+            for weight_position in range(5):
+                for replacement in (-1, True, False):
+                    scenarios = [good, good]
+                    scenarios[scenario_position] = tuple(
+                        replacement if index == weight_position else good[index]
+                        for index in range(5)
+                    )
+                    with self.subTest(
+                        scenario_position=scenario_position,
+                        weight_position=weight_position,
+                        replacement=replacement,
+                    ):
+                        with self.assertRaises(ValueError):
+                            recommend_merkle_verify_mode_weighted(
+                                16, _GROUPS, _BUDGETS, tuple(scenarios)
+                            )
+        for scenario_position in range(2):
+            scenarios = [good, good]
+            scenarios[scenario_position] = (0, 0, 0, 0, 0)
+            with self.subTest(scenario_position=scenario_position):
+                with self.assertRaises(ValueError):
+                    recommend_merkle_verify_mode_weighted(
+                        16, _GROUPS, _BUDGETS, tuple(scenarios)
                     )
 
     def test_boolean_weights_are_value_error_even_though_int(self):

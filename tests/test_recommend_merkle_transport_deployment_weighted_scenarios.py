@@ -177,6 +177,36 @@ class RecommendMerkleTransportDeploymentWeightedScenariosTest(unittest.TestCase)
         self.assertEqual(once, twice)
         self.assertEqual(once, thrice)
 
+    def test_repeating_one_scenario_can_change_the_choice(self):
+        # unlike an inert re-count of a lone scenario, duplicating one of
+        # two distinct scenarios weights that scenario's regret and can
+        # change the minimax choice; here two copies of the steps-weighted
+        # scenario move the choice to that single scenario's own winner
+        capacity, indices, budgets = 16, (3, 5), (None, None, 8000, None)
+        checkpoint_weights = (1, 0, 0, 0, 0)
+        steps_weights = (0, 0, 0, 0, 1)
+        distinct = recommend_merkle_transport_deployment_weighted_scenarios(
+            capacity, indices, budgets, (checkpoint_weights, steps_weights)
+        )
+        duplicated = recommend_merkle_transport_deployment_weighted_scenarios(
+            capacity,
+            indices,
+            budgets,
+            (checkpoint_weights, steps_weights, steps_weights),
+        )
+        tripled = recommend_merkle_transport_deployment_weighted_scenarios(
+            capacity,
+            indices,
+            budgets,
+            (checkpoint_weights, steps_weights, steps_weights, steps_weights),
+        )
+        steps_alone = recommend_merkle_transport_deployment_weighted_scenarios(
+            capacity, indices, budgets, (steps_weights,)
+        )
+        self.assertNotEqual(distinct, duplicated)
+        self.assertEqual(duplicated, tripled)
+        self.assertEqual(duplicated, steps_alone)
+
     def test_zero_span_dimensions_score_zero(self):
         # a single-member frontier makes every span zero: the unique member
         # is chosen regardless of the scenarios, without dividing by zero
@@ -400,7 +430,10 @@ class RecommendMerkleTransportDeploymentWeightedScenariosTest(unittest.TestCase)
             ((1.0, 1, 1, 1, 1),),
             ((1, "1", 1, 1, 1),),
             ((1, None, 1, 1, 1),),
+            ((1, 1, 1.5, 1, 1),),
+            ((1, 1, 1, "x", 1),),
             ((1, 1, 1, 1, 1.5),),
+            ((1, 1, 1, 1, 1), (1, None, 1, 1, 1)),
         ):
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
@@ -415,8 +448,12 @@ class RecommendMerkleTransportDeploymentWeightedScenariosTest(unittest.TestCase)
             ((1, 1, 1, 1, 1, 1),),
             ((0, 0, 0, 0, 0),),
             ((1, -1, 1, 1, 1),),
+            ((1, 1, -1, 1, 1),),
+            ((1, 1, 1, -1, 1),),
             ((-1, 1, 1, 1, 1),),
             ((True, 1, 1, 1, 1),),
+            ((1, 1, True, 1, 1),),
+            ((1, 1, 1, True, 1),),
             ((1, 1, 1, 1, False),),
             ((1, 1, 1, 1, 1), (0, 0, 0, 0, 0)),
         ):
@@ -427,7 +464,12 @@ class RecommendMerkleTransportDeploymentWeightedScenariosTest(unittest.TestCase)
                     )
 
     def test_boolean_weights_are_value_error_even_though_int(self):
-        for bad in (((True, 0, 0, 0, 0),), ((0, 0, 0, 0, True),)):
+        for bad in (
+            ((True, 0, 0, 0, 0),),
+            ((0, 0, True, 0, 0),),
+            ((0, 0, 0, True, 0),),
+            ((0, 0, 0, 0, True),),
+        ):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     recommend_merkle_transport_deployment_weighted_scenarios(

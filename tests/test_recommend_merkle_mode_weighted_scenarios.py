@@ -185,6 +185,40 @@ class RecommendMerkleModeWeightedScenariosTest(unittest.TestCase):
         self.assertEqual(once, twice)
         self.assertEqual(once, thrice)
 
+    def test_repeating_one_scenario_can_change_the_choice(self):
+        # duplicating one of two distinct scenarios weights that scenario's
+        # regret and can change the minimax choice; here enough copies of
+        # the steps-weighted scenario move the choice to that scenario's
+        # own single-scenario winner
+        capacity, groups, budgets = (
+            16,
+            ((1, 2), (0, 3)),
+            (None, None, None, 10**6, None),
+        )
+        checkpoint_weights = (1, 0, 0, 0, 0)
+        steps_weights = (0, 0, 0, 1, 0)
+        distinct = recommend_merkle_mode_weighted_scenarios(
+            capacity, groups, budgets, (checkpoint_weights, steps_weights)
+        )
+        duplicated = recommend_merkle_mode_weighted_scenarios(
+            capacity,
+            groups,
+            budgets,
+            (checkpoint_weights, steps_weights, steps_weights),
+        )
+        tripled = recommend_merkle_mode_weighted_scenarios(
+            capacity,
+            groups,
+            budgets,
+            (checkpoint_weights, steps_weights, steps_weights, steps_weights),
+        )
+        steps_alone = recommend_merkle_mode_weighted_scenarios(
+            capacity, groups, budgets, (steps_weights,)
+        )
+        self.assertNotEqual(distinct, duplicated)
+        self.assertEqual(duplicated, tripled)
+        self.assertEqual(duplicated, steps_alone)
+
     def test_zero_span_dimensions_score_zero(self):
         # a single-member frontier makes every span zero: the unique member
         # is chosen regardless of the scenarios, without dividing by zero
@@ -373,7 +407,10 @@ class RecommendMerkleModeWeightedScenariosTest(unittest.TestCase):
             ((1.0, 1, 1, 1, 1),),
             ((1, "1", 1, 1, 1),),
             ((1, None, 1, 1, 1),),
+            ((1, 1, 1.5, 1, 1),),
+            ((1, 1, 1, "x", 1),),
             ((1, 1, 1, 1, 1.5),),
+            ((1, 1, 1, 1, 1), (1, None, 1, 1, 1)),
         ):
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
@@ -388,8 +425,12 @@ class RecommendMerkleModeWeightedScenariosTest(unittest.TestCase):
             ((1, 1, 1, 1, 1, 1),),
             ((0, 0, 0, 0, 0),),
             ((1, -1, 1, 1, 1),),
+            ((1, 1, -1, 1, 1),),
+            ((1, 1, 1, -1, 1),),
             ((-1, 1, 1, 1, 1),),
             ((True, 1, 1, 1, 1),),
+            ((1, 1, True, 1, 1),),
+            ((1, 1, 1, True, 1),),
             ((1, 1, 1, 1, False),),
             ((1, 1, 1, 1, 1), (0, 0, 0, 0, 0)),
         ):
@@ -400,7 +441,12 @@ class RecommendMerkleModeWeightedScenariosTest(unittest.TestCase):
                     )
 
     def test_boolean_weights_are_value_error_even_though_int(self):
-        for bad in (((True, 0, 0, 0, 0),), ((0, 0, 0, 0, True),)):
+        for bad in (
+            ((True, 0, 0, 0, 0),),
+            ((0, 0, True, 0, 0),),
+            ((0, 0, 0, True, 0),),
+            ((0, 0, 0, 0, True),),
+        ):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     recommend_merkle_mode_weighted_scenarios(

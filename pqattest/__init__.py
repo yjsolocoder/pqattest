@@ -18,6 +18,11 @@ function bind a proof to the receiver's expected public key and,
 optionally, an explicit leaf-index selection), static
 parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
 merkle_deployment_frontier /
+recommend_merkle_deployment_weighted to rank that deployment frontier by a
+four-tuple of non-negative weights over min-max-normalised costs
+(checkpoint bytes, single-signature wire length, standalone-proof wire
+length and verifier steps), the weighted sum divided by the weight total,
+with exact Fraction arithmetic,
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 merkle_transport_deployment_frontier /
@@ -182,6 +187,7 @@ from .params import (
     recommend,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
+    recommend_merkle_deployment_weighted,
     recommend_merkle_mode_deployment,
     recommend_merkle_mode_weighted,
     recommend_merkle_mode_weighted_scenarios,
@@ -276,6 +282,7 @@ __all__ = [
     "restore_merkle_claimed",
     "restore_ots_pair",
     "recommend_merkle_deployment",
+    "recommend_merkle_deployment_weighted",
     "recommend_merkle_transport_deployment",
     "recommend_merkle_transport_deployment_weighted",
     "recommend_merkle_transport_deployment_weighted_scenarios",

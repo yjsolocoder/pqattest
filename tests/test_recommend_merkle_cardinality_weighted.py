@@ -273,12 +273,18 @@ class RecommendMerkleCardinalityWeightedTest(unittest.TestCase):
             (1, 1, 1, 1, 1, 1),
             (0, 0, 0, 0, 0),
             (1, -1, 1, 1, 1),
+            (1, 1, -1, 1, 1),
+            (1, 1, 1, -1, 1),
             (-1, 1, 1, 1, 1),
             (True, 1, 1, 1, 1),
+            (1, 1, True, 1, 1),
+            (1, 1, 1, True, 1),
             (1, 1, 1, 1, False),
             (1.0, 1, 1, 1, 1),
             (1, "1", 1, 1, 1),
             (1, None, 1, 1, 1),
+            (1, 1, 1.5, 1, 1),
+            (1, 1, 1, "x", 1),
             (1, 1, 1, 1, 1.5),
         ):
             with self.subTest(bad=bad):
@@ -288,7 +294,12 @@ class RecommendMerkleCardinalityWeightedTest(unittest.TestCase):
                     )
 
     def test_boolean_weights_are_value_error_even_though_int(self):
-        for bad in ((True, 0, 0, 0, 0), (0, 0, 0, 0, True)):
+        for bad in (
+            (True, 0, 0, 0, 0),
+            (0, 0, True, 0, 0),
+            (0, 0, 0, True, 0),
+            (0, 0, 0, 0, True),
+        ):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     recommend_merkle_cardinality_weighted(

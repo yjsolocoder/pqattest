@@ -76,6 +76,13 @@ breakdown behind that same weighted ranking as a tuple of frozen
 frontier order, each carrying the candidate's config, its four
 normalised costs, its final score and a selected flag — with the same
 exact :class:`fractions.Fraction` arithmetic.
+:func:`explain_merkle_deployment_weighted_scenarios` exports the
+decision-cost breakdown behind the multi-scenario ranking as a tuple of
+frozen :class:`MerkleDeploymentScenarioScore` rows — one per frontier
+member, in frontier order, each carrying the candidate's config, its
+four normalised costs, its per-scenario scores and regrets and a
+selected flag — with the same exact :class:`fractions.Fraction`
+arithmetic.
 :func:`merkle_verify_profile` compares the
 verifier-side SHA-256 hash cost of a batch proof against a multi-proof over
 the same leaf set, returning a :class:`MerkleVerifyProfile`.
@@ -139,7 +146,7 @@ Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All thirty-four
+All thirty-six
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -158,6 +165,7 @@ __all__ = [
     "Params",
     "MerkleStorageProfile",
     "MerkleDeploymentScore",
+    "MerkleDeploymentScenarioScore",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
@@ -174,6 +182,7 @@ __all__ = [
     "recommend_merkle_deployment_weighted",
     "recommend_merkle_deployment_weighted_scenarios",
     "explain_merkle_deployment_weighted",
+    "explain_merkle_deployment_weighted_scenarios",
     "explain_merkle_cardinality_weighted",
     "explain_merkle_cardinality_weighted_scenarios",
     "recommend_merkle_transport_deployment",
@@ -1034,6 +1043,170 @@ def explain_merkle_deployment_weighted(
     return tuple(
         MerkleDeploymentScore(storage, *costs, score, storage is chosen)
         for storage, costs, score in entries
+    )
+
+
+@dataclass(frozen=True)
+class MerkleDeploymentScenarioScore:
+    """Frozen multi-scenario breakdown for one ordinary Merkle deployment.
+
+    One row of :func:`explain_merkle_deployment_weighted_scenarios`'s
+    result. Fields, in positional order:
+
+    - ``config``: the candidate's :class:`MerkleStorageProfile`;
+    - ``checkpoint_cost`` / ``signature_cost`` / ``proof_cost`` /
+      ``steps_cost``: the candidate's four min-max-normalised costs, in
+      the same order as the weights — checkpoint bytes, signature wire
+      length, standalone proof wire length and per-signature verifier
+      chain steps — each ``(x - min) / (max - min)`` over the whole
+      frontier, with a zero span scoring ``0``;
+    - ``scores``: the per-scenario weighted scores, in the same order as
+      the input scenarios — each the four normalised costs times that
+      scenario's weights, summed and divided by the scenario's weight
+      total;
+    - ``regrets``: the per-scenario regrets, in the same order — each
+      score minus that scenario's best score over the whole frontier;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_merkle_deployment_weighted_scenarios` would pick.
+
+    Every normalised cost, score and regret is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    config: MerkleStorageProfile
+    checkpoint_cost: Fraction
+    signature_cost: Fraction
+    proof_cost: Fraction
+    steps_cost: Fraction
+    scores: tuple[Fraction, ...]
+    regrets: tuple[Fraction, ...]
+    selected: bool
+
+
+def explain_merkle_deployment_weighted_scenarios(
+    capacity: Any,
+    budgets: Any,
+    scenarios: Any,
+) -> tuple[MerkleDeploymentScenarioScore, ...]:
+    """Export the multi-scenario breakdown of the weighted deployment ranking.
+
+    The explanatory counterpart of
+    :func:`recommend_merkle_deployment_weighted_scenarios`: it computes
+    :func:`merkle_deployment_frontier` exactly once and, instead of
+    returning only the winning profile, returns one frozen
+    :class:`MerkleDeploymentScenarioScore` row per frontier member, in
+    the frontier's own order. Each row carries the candidate's
+    :class:`MerkleStorageProfile` config, its four min-max-normalised
+    costs in the same order as the weights — checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), one signature wire
+    length (:attr:`MerkleStorageProfile.signature_wire_bytes`), one
+    standalone proof wire length
+    (:attr:`MerkleStorageProfile.proof_wire_bytes`) and the per-signature
+    verifier hash-chain step count (``profile("merkle", ...)``'s
+    ``steps``) — the per-scenario weighted scores, the per-scenario
+    regrets and a ``selected`` flag.
+
+    ``scenarios`` must be a non-empty tuple; each member must itself be a
+    four-tuple in that same order — checkpoint bytes, signature wire
+    bytes, standalone proof wire bytes and per-signature chain steps.
+    Every weight must be a non-boolean, non-negative integer and at least
+    one weight of each scenario must be positive; repeated scenarios are
+    counted separately. Each of the four costs is min-max normalised over
+    the whole frontier as ``(x - min) / (max - min)``, with a zero span
+    scoring ``0``. For each scenario, a candidate's score is the weighted
+    sum of its four normalised costs divided by the scenario's weight
+    total, and its regret is that score minus the scenario's best score
+    over the whole frontier — all exact rationals
+    (``fractions.Fraction``) with no floating point anywhere. Exactly
+    one row is selected: the one whose config
+    :func:`recommend_merkle_deployment_weighted_scenarios` returns for
+    the same arguments, field for field — the smallest worst regret,
+    with ties broken by the regret sum, then the per-scenario score
+    tuple, then ascending by checkpoint bytes, leaf count, ``w`` and
+    ``height``.
+
+    ``capacity`` and the four-tuple ``budgets`` follow
+    :func:`merkle_deployment_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``scenarios``). A non-tuple ``scenarios`` or scenario member, or a
+    non-integer weight, raises ``TypeError``; an empty scenario tuple, a
+    wrong-length scenario, or a boolean, negative or all-zero weight
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state.
+    """
+    frontier = merkle_deployment_frontier(capacity, budgets)
+    validated_scenarios = _validate_deployment_weight_scenarios(scenarios)
+
+    def metrics(storage: MerkleStorageProfile) -> tuple[int, int, int, int]:
+        return (
+            storage.checkpoint_bytes,
+            storage.signature_wire_bytes,
+            storage.proof_wire_bytes,
+            profile("merkle", w=storage.w, height=storage.height).steps,
+        )
+
+    metric_rows = tuple(metrics(storage) for storage in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(4)
+    )
+    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
+
+    entries = []
+    for storage, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        scores = tuple(
+            sum(
+                (weight * component for weight, component in zip(weights, costs)),
+                Fraction(0),
+            )
+            / weight_total
+            for weights, weight_total in zip(validated_scenarios, scenario_totals)
+        )
+        entries.append((storage, costs, scores))
+
+    scenario_best = tuple(
+        min(entry[2][scenario_index] for entry in entries)
+        for scenario_index in range(len(validated_scenarios))
+    )
+    entries = [
+        (storage, costs, scores, tuple(
+            score - best for score, best in zip(scores, scenario_best)
+        ))
+        for storage, costs, scores in entries
+    ]
+
+    def ranking(
+        entry: tuple[
+            MerkleStorageProfile,
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+        ],
+    ) -> tuple[Fraction, Fraction, tuple[Fraction, ...], int, int, int, int]:
+        storage, _costs, scores, regrets = entry
+        return (
+            max(regrets),
+            sum(regrets, Fraction(0)),
+            scores,
+            storage.checkpoint_bytes,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        MerkleDeploymentScenarioScore(
+            storage, *costs, scores, regrets, storage is chosen
+        )
+        for storage, costs, scores, regrets in entries
     )
 
 

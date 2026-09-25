@@ -33,6 +33,12 @@ ranking's decision-cost breakdown as a tuple of frozen
 MerkleDeploymentScore rows — one per frontier member, in frontier order,
 each carrying the candidate's config, its four normalised costs, its
 final score and a selected flag — again with exact Fraction arithmetic,
+explain_merkle_deployment_weighted_scenarios to export the
+multi-scenario ranking's decision-cost breakdown as a tuple of frozen
+MerkleDeploymentScenarioScore rows — one per frontier member, in
+frontier order, each carrying the candidate's config, its four
+normalised costs, its per-scenario scores and regrets and a selected
+flag — again with exact Fraction arithmetic,
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 merkle_transport_deployment_frontier /
@@ -192,6 +198,7 @@ from .params import (
     MerkleCardinalityScore,
     MerkleCardinalityScenarioScore,
     MerkleDeploymentScore,
+    MerkleDeploymentScenarioScore,
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
     MerkleTransportWorkloadProfile,
@@ -226,6 +233,7 @@ from .params import (
     recommend_merkle_deployment_weighted,
     recommend_merkle_deployment_weighted_scenarios,
     explain_merkle_deployment_weighted,
+    explain_merkle_deployment_weighted_scenarios,
     recommend_merkle_mode_deployment,
     recommend_merkle_mode_weighted,
     recommend_merkle_mode_weighted_scenarios,
@@ -265,6 +273,7 @@ __all__ = [
     "MerkleCardinalityScore",
     "MerkleCardinalityScenarioScore",
     "MerkleDeploymentScore",
+    "MerkleDeploymentScenarioScore",
     "MerkleProof",
     "MerklePublicKey",
     "MerkleSignature",
@@ -297,6 +306,7 @@ __all__ = [
     "explain_merkle_cardinality_weighted",
     "explain_merkle_cardinality_weighted_scenarios",
     "explain_merkle_deployment_weighted",
+    "explain_merkle_deployment_weighted_scenarios",
     "explain_merkle_verify_mode_weighted",
     "keygen",
     "lamport_signature_from_bytes",

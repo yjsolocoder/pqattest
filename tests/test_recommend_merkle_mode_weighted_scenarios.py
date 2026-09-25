@@ -172,18 +172,27 @@ class RecommendMerkleModeWeightedScenariosTest(unittest.TestCase):
         )
 
     def test_repeated_scenarios_counted_separately(self):
-        weights = (3, 0, 7, 0, 2)
-        once = recommend_merkle_mode_weighted_scenarios(
-            16, _GROUPS, _BUDGETS, (weights,)
+        # two conflicting single-dimension scenarios: one minimises chain
+        # steps (picks w=4), the other minimises checkpoint bytes (picks
+        # w=8). One copy of each still picks w=4; repeating the second
+        # scenario must actually swing the minimax-regret choice to w=8. An
+        # implementation that deduped equal scenarios would collapse
+        # (first, second, second) to (first, second) and could not follow.
+        first = (0, 0, 0, 1, 0)
+        second = (1, 0, 0, 0, 0)
+        only_first = recommend_merkle_mode_weighted_scenarios(
+            16, _GROUPS, _BUDGETS, (first,)
         )
-        twice = recommend_merkle_mode_weighted_scenarios(
-            16, _GROUPS, _BUDGETS, (weights, weights)
+        one_each = recommend_merkle_mode_weighted_scenarios(
+            16, _GROUPS, _BUDGETS, (first, second)
         )
-        thrice = recommend_merkle_mode_weighted_scenarios(
-            16, _GROUPS, _BUDGETS, (weights, weights, weights)
+        second_doubled = recommend_merkle_mode_weighted_scenarios(
+            16, _GROUPS, _BUDGETS, (first, second, second)
         )
-        self.assertEqual(once, twice)
-        self.assertEqual(once, thrice)
+        self.assertEqual(only_first.config.w, 4)
+        self.assertEqual(one_each.config.w, 4)
+        self.assertEqual(second_doubled.config.w, 8)
+        self.assertNotEqual(one_each, second_doubled)
 
     def test_repeated_scenarios_regression_cases(self):
         # repeated scenarios must be kept as separate tuple positions:

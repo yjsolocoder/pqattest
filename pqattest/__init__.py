@@ -16,7 +16,8 @@ merkle_verify / multiproof_encode / multiproof_verify /
 multiproof_verify_bound (the two proof classes' verify_bound and this
 function bind a proof to the receiver's expected public key and,
 optionally, an explicit leaf-index selection), static
-parameter analysis: Params / profile / recommend / recommend_merkle_deployment /
+parameter analysis: Params / profile / recommend / recommend_scheme /
+recommend_merkle_deployment /
 merkle_deployment_frontier /
 recommend_merkle_deployment_weighted to rank that ordinary-deployment
 frontier by a four-tuple of non-negative weights over min-max-normalised
@@ -195,6 +196,7 @@ from .params import (
     merkle_verify_workload_profile,
     profile,
     recommend,
+    recommend_scheme,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
@@ -291,6 +293,7 @@ __all__ = [
     "profile",
     "public_key_from",
     "recommend",
+    "recommend_scheme",
     "restore_merkle_claimed",
     "restore_ots_pair",
     "recommend_merkle_deployment",

@@ -161,18 +161,28 @@ class RecommendMerkleCardinalityWeightedScenariosTest(unittest.TestCase):
         self.assertEqual(result, min(frontier, key=lambda mc: (score(mc), *_tail(mc))))
 
     def test_repeated_scenarios_counted_separately(self):
-        weights = (3, 0, 7, 0, 2)
-        once = recommend_merkle_cardinality_weighted_scenarios(
-            4, _SIZES, _BUDGETS, (weights,)
+        # two conflicting composite scenarios: one weights carried nodes
+        # and chain steps (picks w=4), the other weights the single-group
+        # peak and chain steps (picks w=8). One copy of each still picks
+        # w=4; repeating the second scenario must actually swing the
+        # minimax-regret choice to w=8. An implementation that deduped equal
+        # scenarios would collapse (first, second, second) to
+        # (first, second) and could not follow.
+        first = (0, 0, 0, 2, 1)
+        second = (0, 2, 0, 0, 1)
+        only_first = recommend_merkle_cardinality_weighted_scenarios(
+            4, _SIZES, _BUDGETS, (first,)
         )
-        twice = recommend_merkle_cardinality_weighted_scenarios(
-            4, _SIZES, _BUDGETS, (weights, weights)
+        one_each = recommend_merkle_cardinality_weighted_scenarios(
+            4, _SIZES, _BUDGETS, (first, second)
         )
-        thrice = recommend_merkle_cardinality_weighted_scenarios(
-            4, _SIZES, _BUDGETS, (weights, weights, weights)
+        second_doubled = recommend_merkle_cardinality_weighted_scenarios(
+            4, _SIZES, _BUDGETS, (first, second, second)
         )
-        self.assertEqual(once, twice)
-        self.assertEqual(once, thrice)
+        self.assertEqual(only_first.plan.config.w, 4)
+        self.assertEqual(one_each.plan.config.w, 4)
+        self.assertEqual(second_doubled.plan.config.w, 8)
+        self.assertNotEqual(one_each, second_doubled)
 
     def test_repeated_scenarios_regression_cases(self):
         # repeated scenarios must be kept as separate tuple positions:

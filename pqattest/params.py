@@ -3,7 +3,14 @@
 :func:`profile` reports the size and cost metrics of a scheme/parameter
 combination without generating any keys, and :func:`recommend` picks a Merkle
 configuration for a desired signature capacity, :func:`recommend_merkle_deployment`
-picks one that additionally fits deployment budgets. :func:`merkle_storage_profile`
+picks one that additionally fits deployment budgets.
+:func:`recommend_scheme` is the cross-scheme entry point: it enumerates every
+scheme/parameter combination :func:`profile` accepts — Lamport, W-OTS at both
+``w`` values and Merkle at both ``w`` values and every height — keeps the
+candidates whose capacity covers the requested signature count and that fit a
+two-tuple of budgets (signature serialised size, then verifier chain steps),
+and ranks the survivors by a ``"size"``/``"speed"`` preference, returning one
+:class:`Params`. :func:`merkle_storage_profile`
 breaks the Merkle wire sizes down per serialised object and
 :func:`merkle_transport_profile` sizes a batch or multi-proof over a chosen
 leaf-index set. :func:`recommend_merkle_transport_deployment` chooses both the
@@ -114,7 +121,7 @@ single-group peak, total verifier hashes, carried nodes and per-signature
 chain steps), the weighted sum divided by the weight total with exact
 :class:`fractions.Fraction` arithmetic, and returns one
 :class:`MerkleModeCost`.
-All thirty
+All thirty-one
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -139,6 +146,7 @@ __all__ = [
     "MerkleVerifyWorkloadProfile",
     "profile",
     "recommend",
+    "recommend_scheme",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
@@ -282,6 +290,112 @@ def recommend(capacity: Any, prefer: str = "size") -> Params:
         raise ValueError('prefer must be "size" or "speed"')
     height = max(1, (capacity - 1).bit_length())
     return profile("merkle", w=w, height=height)
+
+
+def recommend_scheme(capacity: Any, budgets: Any, prefer: str = "size") -> Params:
+    """Pick one scheme across Lamport, W-OTS and Merkle under budgets.
+
+    The cross-scheme counterpart of :func:`recommend`: instead of choosing
+    only within the Merkle family, it enumerates every scheme/parameter
+    combination :func:`profile` accepts — Lamport once, W-OTS once for
+    ``w`` 4 and 8, and Merkle for both ``w`` values times every height from
+    1 to 8 — keeps those whose ``capacity`` covers the requested number of
+    signatures and that satisfy both set budgets, and ranks the feasible
+    set.
+
+    The two one-time schemes only ever cover a single signature, so when
+    ``capacity`` is greater than 1 only Merkle candidates remain; the
+    requested signature count must itself be no greater than the largest
+    Merkle capacity, 256.
+
+    ``budgets`` must be a two-tuple, in order: an upper bound on one
+    signature's serialised size (:attr:`Params.sig_bytes`, the exact metric
+    :func:`profile` reports, so Merkle candidates include the
+    authentication path) and an upper bound on the verifier hash-chain step
+    count per signature (:attr:`Params.steps`). Each entry is either
+    ``None`` (no bound) or a positive, non-boolean integer, at least one
+    entry must be set, and every bound is inclusive; every candidate
+    exceeding a set bound is excluded.
+
+    ``prefer="size"`` (the default) ranks feasible candidates by signature
+    bytes first and then steps; ``prefer="speed"`` ranks by steps first and
+    then signature bytes. Both preferences share the same remaining
+    tie-break, ascending: the smallest spare capacity
+    (``Params.capacity - capacity``), the scheme name lexicographically,
+    and then ``w`` and ``height``, with a candidate lacking either
+    parameter (``None``) sorted before every candidate that has it. The
+    first candidate after sorting is returned as the :class:`Params`
+    metrics object, so its scheme, parameters, capacity and both costs can
+    be read off directly.
+
+    Arguments are validated in the order ``capacity``, ``budgets`` and
+    ``prefer``: when several are illegal, the error for the earliest of
+    those three is reported first. ``capacity`` must be a non-boolean
+    integer from 1 to 256. A non-tuple ``budgets`` raises ``TypeError``; a
+    wrong-length tuple, a boolean, non-positive or non-integer member, two
+    ``None`` entries, an out-of-range ``capacity``, an unknown ``prefer``
+    value or the absence of any feasible candidate raises ``ValueError``.
+    The function is pure: it draws no randomness, generates no keys and
+    changes no state, so repeated calls with equal arguments return
+    field-by-field equal results.
+    """
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 2-tuple of budget limits")
+    if len(budgets) != 2:
+        raise ValueError("budgets must contain exactly two entries")
+    labels = ("signature", "steps")
+    limits = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    if prefer not in ("size", "speed"):
+        raise ValueError('prefer must be "size" or "speed"')
+    signature_limit, steps_limit = limits
+
+    candidates: list[Params] = []
+    if capacity == 1:
+        candidates.append(profile("lamport"))
+        for w in (4, 8):
+            candidates.append(profile("wots", w=w))
+    for w in (4, 8):
+        for height in range(1, 9):
+            params = profile("merkle", w=w, height=height)
+            if params.capacity >= capacity:
+                candidates.append(params)
+    feasible = [
+        params
+        for params in candidates
+        if (signature_limit is None or params.sig_bytes <= signature_limit)
+        and (steps_limit is None or params.steps <= steps_limit)
+    ]
+    if not feasible:
+        raise ValueError("no scheme fits the requested capacity and budgets")
+
+    def tail(params: Params) -> tuple:
+        return (
+            params.capacity - capacity,
+            params.scheme,
+            (params.w is not None, params.w if params.w is not None else 0),
+            (params.height is not None, params.height if params.height is not None else 0),
+        )
+
+    if prefer == "speed":
+        feasible.sort(key=lambda params: (params.steps, params.sig_bytes) + tail(params))
+    else:
+        feasible.sort(key=lambda params: (params.sig_bytes, params.steps) + tail(params))
+    return feasible[0]
 
 
 def recommend_merkle_deployment(

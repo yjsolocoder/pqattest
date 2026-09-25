@@ -164,18 +164,21 @@ class RecommendMerkleTransportDeploymentWeightedScenariosTest(unittest.TestCase)
         )
 
     def test_repeated_scenarios_counted_separately(self):
-        weights = (3, 0, 7, 0, 2)
-        once = recommend_merkle_transport_deployment_weighted_scenarios(
-            4, _INDICES, _BUDGETS, (weights,)
+        # a repeated scenario is a separate tuple position, so repeating
+        # one of two distinct scenarios re-weights the minimax-regret
+        # ranking: duplicating the steps-only scenario flips the pick
+        # from w=8 to w=4
+        first = (1, 0, 0, 0, 0)
+        second = (0, 0, 0, 0, 1)
+        balanced = recommend_merkle_transport_deployment_weighted_scenarios(
+            4, _INDICES, _BUDGETS, (first, second)
         )
-        twice = recommend_merkle_transport_deployment_weighted_scenarios(
-            4, _INDICES, _BUDGETS, (weights, weights)
+        repeated = recommend_merkle_transport_deployment_weighted_scenarios(
+            4, _INDICES, _BUDGETS, (first, second, second)
         )
-        thrice = recommend_merkle_transport_deployment_weighted_scenarios(
-            4, _INDICES, _BUDGETS, (weights, weights, weights)
-        )
-        self.assertEqual(once, twice)
-        self.assertEqual(once, thrice)
+        self.assertEqual((balanced.config.w, balanced.config.height), (8, 2))
+        self.assertEqual((repeated.config.w, repeated.config.height), (4, 2))
+        self.assertNotEqual(balanced, repeated)
 
     def test_repeated_scenarios_regression_cases(self):
         # repeated scenarios must be kept as separate tuple positions:

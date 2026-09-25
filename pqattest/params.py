@@ -64,6 +64,14 @@ non-negative weights over its four min-max-normalised costs in the order
 checkpoint bytes, signature wire length, standalone proof wire length and
 verifier steps (the weighted sum divided by the weight total), with exact
 :class:`fractions.Fraction` arithmetic, and returns one profile.
+:func:`explain_merkle_deployment_weighted` is the decision-cost-detail
+counterpart of that weighted recommendation: it ranks the same
+ordinary-deployment frontier the same way but returns, in frontier order,
+one frozen :class:`MerkleDeploymentScore` row per member carrying that
+member's config, its four min-max-normalised costs aligned with the
+weights, its exact-:class:`fractions.Fraction` score and the selected
+flag, with exactly one selected row matching
+:func:`recommend_merkle_deployment_weighted`'s choice field for field.
 :func:`recommend_merkle_deployment_weighted_scenarios` ranks that same
 ordinary-deployment frontier against several such four-weight scenarios
 at once — checkpoint bytes, signature wire length, standalone proof wire
@@ -120,7 +128,7 @@ Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All thirty-one
+All thirty-two
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -138,6 +146,7 @@ from .wots import ELEMENT_BYTES, _params, _validate_w
 __all__ = [
     "Params",
     "MerkleStorageProfile",
+    "MerkleDeploymentScore",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
@@ -149,6 +158,7 @@ __all__ = [
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
+    "explain_merkle_deployment_weighted",
     "recommend_merkle_deployment_weighted_scenarios",
     "recommend_merkle_transport_deployment",
     "merkle_transport_deployment_frontier",
@@ -733,6 +743,145 @@ def recommend_merkle_deployment_weighted(
         )
 
     return min(frontier, key=ranking)
+
+
+@dataclass(frozen=True)
+class MerkleDeploymentScore:
+    """One frozen weighted-score explanation row for one frontier member.
+
+    Fields, in positional order:
+
+    - ``config``: the candidate :class:`MerkleStorageProfile` (its ``w``,
+      ``height``, leaf count and wire sizes);
+    - ``costs``: a four-tuple of min-max-normalised costs in the same order
+      as :func:`explain_merkle_deployment_weighted`'s weights — checkpoint
+      bytes, signature wire bytes, standalone proof wire bytes and
+      per-signature chain steps — each an exact :class:`fractions.Fraction`;
+    - ``score``: the weighted sum of those four normalised costs divided by
+      the weight total, an exact :class:`fractions.Fraction`;
+    - ``selected``: ``True`` for exactly one row — the member
+      :func:`recommend_merkle_deployment_weighted` would pick for the same
+      arguments — and ``False`` for every other row.
+
+    Instances are frozen, support positional construction and compare (and
+    hash) by value; no key material or randomness is involved.
+    """
+
+    config: MerkleStorageProfile
+    costs: tuple[Fraction, ...]
+    score: Fraction
+    selected: bool
+
+
+def explain_merkle_deployment_weighted(
+    capacity: Any,
+    budgets: Any,
+    weights: Any,
+) -> tuple[MerkleDeploymentScore, ...]:
+    """Explain the weighted ordinary-deployment choice for the whole frontier.
+
+    The decision-cost-detail counterpart of
+    :func:`recommend_merkle_deployment_weighted`: it computes
+    :func:`merkle_deployment_frontier` exactly once and returns one frozen
+    :class:`MerkleDeploymentScore` row per frontier member, in exactly the
+    order of that frontier tuple, so a caller can inspect every candidate's
+    normalised costs and score instead of receiving only the winner. The
+    candidate enumeration and Pareto filtering are not duplicated: the
+    frontier is the only source of candidates and is called exactly once.
+
+    Each row carries, in order, the candidate
+    :class:`MerkleStorageProfile`; a four-tuple of normalised costs aligned
+    position-for-position with ``weights`` — checkpoint bytes
+    (:attr:`MerkleStorageProfile.checkpoint_bytes`), one signature wire
+    length (:attr:`MerkleStorageProfile.signature_wire_bytes`), one
+    standalone proof wire length
+    (:attr:`MerkleStorageProfile.proof_wire_bytes`) and the per-signature
+    verifier hash-chain step count (``profile("merkle", ...)``'s
+    ``steps``); the final weighted score; and a ``selected`` flag. Each of
+    the four costs is min-max normalised over the whole frontier as
+    ``(x - min) / (max - min)``, with a zero span scoring ``0``; the score
+    is the sum of the four normalised costs times their weights, divided by
+    the weight total. Every value is an exact rational
+    (``fractions.Fraction``); no floating point is used anywhere.
+
+    Exactly one row has ``selected`` set — the member with the smallest
+    score, whose :class:`MerkleStorageProfile` is field-for-field identical
+    to what :func:`recommend_merkle_deployment_weighted` returns for the
+    same arguments. Equal scores are broken ascending by checkpoint bytes,
+    leaf count, ``w`` and ``height``, and that tie-break is the sole
+    decider when the whole frontier has zero span on every dimension
+    (every row then scores ``0``).
+
+    ``capacity`` and the four-tuple ``budgets`` follow
+    :func:`merkle_deployment_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``weights``); with no feasible candidate ``ValueError`` is raised and no
+    detail rows are returned. A non-tuple ``weights`` or a non-integer
+    member raises ``TypeError``; a wrong-length tuple or a boolean, negative
+    or all-zero weight raises ``ValueError``. The function is pure: it
+    draws no randomness, generates no keys and changes no state, so the
+    same inputs always produce item-for-item identical rows.
+    """
+    frontier = merkle_deployment_frontier(capacity, budgets)
+    validated_weights = _validate_deployment_weights(weights)
+
+    def metrics(storage: MerkleStorageProfile) -> tuple[int, int, int, int]:
+        return (
+            storage.checkpoint_bytes,
+            storage.signature_wire_bytes,
+            storage.proof_wire_bytes,
+            profile("merkle", w=storage.w, height=storage.height).steps,
+        )
+
+    metric_rows = tuple(metrics(storage) for storage in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(4)
+    )
+    weight_total = sum(validated_weights)
+
+    def normalised(row: tuple[int, ...]) -> tuple[Fraction, ...]:
+        return tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+
+    scored: list[tuple[MerkleStorageProfile, tuple[Fraction, ...], Fraction]] = []
+    for storage, row in zip(frontier, metric_rows):
+        costs = normalised(row)
+        score = (
+            sum(
+                (weight * component for weight, component in zip(validated_weights, costs)),
+                Fraction(0),
+            )
+            / weight_total
+        )
+        scored.append((storage, costs, score))
+
+    def tie_tail(entry: tuple[MerkleStorageProfile, tuple[Fraction, ...], Fraction]):
+        storage, _costs, _score = entry
+        return (
+            storage.checkpoint_bytes,
+            storage.leaf_count,
+            storage.w,
+            storage.height,
+        )
+
+    selected_index = min(
+        range(len(scored)),
+        key=lambda index: (scored[index][2], *tie_tail(scored[index])),
+    )
+
+    return tuple(
+        MerkleDeploymentScore(
+            storage,
+            costs,
+            score,
+            index == selected_index,
+        )
+        for index, (storage, costs, score) in enumerate(scored)
+    )
 
 
 def _validate_deployment_weight_scenarios(

@@ -190,30 +190,45 @@ class RecommendMerkleTransportDeploymentWeightedScenariosTest(unittest.TestCase)
         self.assertNotEqual(one_each, second_doubled)
 
     def test_repeated_scenarios_regression_cases(self):
-        # repeated scenarios must be kept as separate tuple positions:
-        # every duplicated tuple must agree with the brute-force ranking
-        # (which zips the scenarios position for position), and adding a
-        # copy of one scenario must reproduce exactly what a hand-computed
-        # extra regret column does — an implementation that deduped equal
-        # scenarios could not follow this
-        first = (3, 0, 7, 0, 2)
-        second = (0, 5, 0, 1, 0)
+        # repeated scenarios must be kept as separate tuple positions.
+        # Each case pairs a scenario tuple with the tuple a
+        # duplicate-dropping implementation would collapse it to: the
+        # minimax-regret ranking keeps every copy (an extra copy adds an
+        # extra regret column that can swing the regret-sum tie-break), so
+        # the full tuple must actually CHANGE the choice versus the
+        # collapsed one while still agreeing with the brute-force ranking.
+        # The previous (3, 0, 7, 0, 2)/(0, 5, 0, 1, 0) cases always
+        # selected the same config, so they could not detect a deduping
+        # implementation.
+        first = (0, 0, 0, 0, 1)
+        second = (0, 0, 0, 1, 0)
+
+        def collapsed(scenarios):
+            unique = []
+            for scenario in scenarios:
+                if scenario not in unique:
+                    unique.append(scenario)
+            return tuple(unique)
+
         cases = (
-            (first, first, second),
             (first, second, second),
             (second, first, first),
-            (second, second, first),
-            (first, second, first, second),
         )
         for scenarios in cases:
             with self.subTest(scenarios=scenarios):
                 result = recommend_merkle_transport_deployment_weighted_scenarios(
                     4, _INDICES, _BUDGETS, scenarios
                 )
+                collapsed_result = (
+                    recommend_merkle_transport_deployment_weighted_scenarios(
+                        4, _INDICES, _BUDGETS, collapsed(scenarios)
+                    )
+                )
                 self.assertEqual(
                     result,
                     _expected(4, _INDICES, _BUDGETS, scenarios),
                 )
+                self.assertNotEqual(result, collapsed_result)
 
     def test_zero_span_dimensions_score_zero(self):
         # a single-member frontier makes every span zero: the unique member

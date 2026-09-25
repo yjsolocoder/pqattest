@@ -24,6 +24,12 @@ frontier by a four-tuple of non-negative weights over min-max-normalised
 costs (checkpoint bytes, signature wire length, standalone proof wire
 length and verifier steps), the weighted sum divided by the weight total,
 with exact Fraction arithmetic,
+explain_merkle_deployment_weighted to explain that same weighted ranking
+for the whole frontier, returning one frozen MerkleDeploymentScore row
+per frontier member (its config, the four weights-aligned normalised
+costs, the exact-Fraction score and the selected flag) in frontier
+order, with exactly one selected row equal field-for-field to the
+recommend_merkle_deployment_weighted choice,
 recommend_merkle_deployment_weighted_scenarios to rank that same
 ordinary-deployment frontier by the smallest worst-case regret over a
 non-empty tuple of such four-weight scenarios, again with exact Fraction
@@ -173,6 +179,7 @@ from .merkle import (
 )
 from .params import (
     MerkleStorageProfile,
+    MerkleDeploymentScore,
     MerkleTransportDeploymentProfile,
     MerkleTransportWorkloadProfile,
     MerkleModeCost,
@@ -200,6 +207,7 @@ from .params import (
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
+    explain_merkle_deployment_weighted,
     recommend_merkle_deployment_weighted_scenarios,
     recommend_merkle_mode_deployment,
     recommend_merkle_mode_weighted,
@@ -242,6 +250,7 @@ __all__ = [
     "MerkleSignature",
     "MerkleSigner",
     "MerkleStorageProfile",
+    "MerkleDeploymentScore",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
@@ -298,6 +307,7 @@ __all__ = [
     "restore_ots_pair",
     "recommend_merkle_deployment",
     "recommend_merkle_deployment_weighted",
+    "explain_merkle_deployment_weighted",
     "recommend_merkle_deployment_weighted_scenarios",
     "recommend_merkle_transport_deployment",
     "recommend_merkle_transport_deployment_weighted",

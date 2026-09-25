@@ -532,6 +532,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_merkle_verify_mode_deployment_weighted(capacity, groups, budgets, weights)` — 为**固定叶位置**的 `merkle_verify_mode_frontier` 工作负载补上**单一五元组权重的归一化加权评分推荐**（基线已有该前沿、按偏好取一项的 `recommend_merkle_verify_mode_deployment` 与多情景加权的 `recommend_merkle_verify_mode_weighted`，本次只新增单权重版本）：从同一次前沿调用得到的非支配结果中选评分最小的一个方案，返回该前沿成员（现有的 `MerkleModeCost`），不新增值类型、不重复枚举或自行筛选候选、不改变既有前沿与任何旧接口及线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与六元组 `budgets` 先按 `merkle_verify_mode_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为五元组，依次对应总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签 SHA-256 总量（`cost.total`）、multiproof 节点数（`nodes`，口径与前沿一致：仅累计 multiproof 组的规范节点，batch 组计零）与单签链步（`profile("merkle", ...).steps`）；每项权重只能是非布尔非负整数，五项中至少一项为正。五项成本分别按整个前沿的最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度记 0），归一化成本乘各自权重求和后除以权重总和，全程为精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小者，只点亮其中一维时返回的即该维成本最小的前沿成员。评分完全相同时按检查点字节、叶数、`w`、`height` 与逐组模式（`modes`）字典序升序取首项。`weights` 容器或成员不是元组、不是整数抛 `TypeError`；长度不符、含布尔或负数、或五项全零抛 `ValueError`；预算下无可行方案同样抛 `ValueError`
 - `recommend_merkle_cardinality_weighted(capacity, group_sizes, budgets, weights)` — 在 `merkle_cardinality_frontier` 的非支配结果上**按五元组权重的归一化加权评分选出一个最坏位置基数方案**，返回该前沿成员（现有的 `MerkleModeCost`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。前三参数无默认值；`capacity`、`group_sizes` 与六元组 `budgets` 完全沿用 `merkle_cardinality_frontier` 的类型、范围、含边界预算、异常与无可行项规则。`weights` 必须为五元组，依次对应总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签 SHA-256 总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且至少一项为正。对前沿五项成本分别按 `(x-min)/(max-min)` 归一化（零跨度记 0），五项归一化成本乘对应权重后求和，以精确有理数（`fractions.Fraction`，无浮点）取评分最小者；评分相同时按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`weights` 非元组抛 `TypeError`；长度错误、含布尔、负数、非整数成员或全零抛 `ValueError`
 - `recommend_merkle_verify_mode_weighted(capacity, groups, budgets, scenarios)` — 为**固定叶位置**的 `merkle_verify_mode_frontier` 工作负载新增**抗偏好漂移的加权推荐**：同时评估多组权重情景，从同一次联合验签前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleModeCost`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变旧接口与任何线格式。纯函数：不取随机数、不生成密钥、不改状态；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与六元组 `budgets` 先按前沿原规则校验（异常与无可行项规则完全沿用 `merkle_verify_mode_frontier`，且先于 `scenarios` 筛查）。`scenarios` 必须为非空元组，每项是五元组权重，依次对应总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签 SHA-256 总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）；权重只能是非布尔非负整数，每项至少一个正数，重复情景分别计入。五项成本按全前沿各自的最小值与最大值归一化为 `Fraction`（零跨度记 0）；每个情景的加权和除以该情景的权重总和，禁止浮点。对每个情景先求其在全前沿上的最小归一化得分，再以候选得分减去该最小值得到该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，末段仍按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`scenarios` 或其成员非元组、权重非整数抛 `TypeError`；空元组、错长、布尔或负数权重、全零项抛 `ValueError`
+- `explain_merkle_verify_mode_weighted(capacity, groups, budgets, scenarios)` — 为**固定叶位置**的 `merkle_verify_mode_frontier` 多情景加权推荐 `recommend_merkle_verify_mode_weighted` 补上**决策成本明细的导出入口**（基线已有该前沿与按多情景最坏后悔选出单一方案的推荐入口，但没有明细入口）：在同一次前沿调用上逐项给出每个候选的归一化成本、各情景得分与后悔值，返回冻结的 `MerkleVerifyModeScore` 行元组，行序与该前沿成员顺序完全一致，不重复枚举或筛选候选、不改变既有前沿与任何旧接口及线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与六元组 `budgets` 先按 `merkle_verify_mode_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查），`scenarios` 规则与 `recommend_merkle_verify_mode_weighted` 完全一致：非空元组，每项是覆盖总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签 SHA-256 总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）的五元权重，权重只能是非布尔非负整数、每项至少一个正数，重复情景分别计入。每行依次携带该候选的方案成本配对对象（`MerkleModeCost`）、与权重逐位对应的五项归一化成本（各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、与情景同序的得分元组（归一化成本乘权重求和再除以该情景权重总和）、与情景同序的后悔值元组（该行得分减去该情景在全前沿上的最优得分）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点。选中标志恰好落在一行，沿用最坏后悔最小、后悔值总和与各情景得分元组依次决胜，该行方案与同参数调用 `recommend_merkle_verify_mode_weighted` 的结果逐字段相同，平局再按既有尾键（检查点字节、叶数、`w`、`height`、`modes` 字典序升序）取首项。`scenarios` 或其成员不是元组、权重成员不是整数抛 `TypeError`；情景集为空、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；前沿规则之外的非法输入与预算下无可行方案同样抛 `ValueError`，不返回任何明细行
+- `MerkleVerifyModeScore` — 冻结的决策成本明细行值对象，九个字段按位置依次为 `mode_cost, total_cost, peak_cost, hashes_cost, nodes_cost, steps_cost, scores, regrets, selected`：候选的方案成本配对对象（`MerkleModeCost`）、与权重逐位对应的五项归一化成本（`Fraction`）、与情景同序的得分元组与后悔值元组（`Fraction` 元组）及选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
 - `recommend_merkle_cardinality_weighted_scenarios(capacity, group_sizes, budgets, scenarios)` — 为**叶位置未定**的 `merkle_cardinality_frontier` 工作负载补上与 `recommend_merkle_verify_mode_weighted` 对应的**抗偏好漂移多情景版本**（基线已有 `recommend_merkle_cardinality_weighted` 的单一固定权重选择）：同时评估多组权重情景，从同一次基数前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleModeCost` 方案/成本配对对象），不新增值类型、不重复枚举或筛选候选、不改变既有前沿、单一权重推荐及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`group_sizes` 与六元组 `budgets` 先按 `merkle_cardinality_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查）。`scenarios` 必须为**非空元组**，每项是覆盖总传输（`plan.total`）、单组峰值（`max(plan.sizes)`）、验签哈希总量（`cost.total`）、multiproof 节点数（`nodes`）与单签链步（`profile("merkle", ...).steps`）的五元权重；权重只能是非布尔非负整数，每个情景至少一项为正，重复情景分别计入（权重总和参与归一化）。五项成本按全前沿各自的最小值与最大值归一化（零跨度记 0），全程为精确有理数（`fractions.Fraction`，禁止浮点）；每个情景的加权和除以该情景自身的权重总和作为该情景下的得分。先求每个情景的最优得分，候选得分减去它即为该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，完全平局时按检查点字节、叶数、`w`、`height` 与逐组模式（`modes`）的字典序取首项。`scenarios` 或其成员非元组、权重成员非整数抛 `TypeError`；空元组、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；无可行方案也抛 `ValueError`
 
 指标含义：`capacity` 为一把密钥可签的消息条数；`elements` 为单条（一次性）签名的 32 字节链元素个数；`sig_bytes` 为签名序列化字节数（Merkle 含认证路径，**不含**叶索引与 Python 对象开销）；`path_bytes` 为其中认证路径部分的字节数；`steps` 为验证一条（一次性）签名所需哈希链步数的上界。
@@ -572,6 +574,8 @@ from pqattest import (
     recommend_merkle_verify_mode_deployment,
     recommend_merkle_verify_mode_deployment_weighted,
     recommend_merkle_verify_mode_weighted,
+    MerkleVerifyModeScore,
+    explain_merkle_verify_mode_weighted,
 )
 
 profile("wots", w=4)          # Params(..., elements=67, sig_bytes=2144, steps=1005)
@@ -812,6 +816,21 @@ recommend_merkle_verify_mode_weighted(
     ((1, 0, 0, 0, 0), (0, 0, 1, 1, 1)),
 )
 # MerkleModeCost(plan=MerkleTransportWorkloadProfile(...), cost=MerkleVerifyWorkloadProfile(...), nodes=...)
+# 同一多情景加权推荐的决策成本明细：每个前沿候选一行，行序与前沿一致，依次为
+# 方案成本配对对象、五项归一化成本、各情景得分元组、各情景后悔值元组与选中标志；
+# 恰好一行 selected=True，其方案与 recommend_merkle_verify_mode_weighted
+# 同参数的结果逐字段相同
+explain_merkle_verify_mode_weighted(
+    16,
+    ((0, 1), (3, 5)),
+    (None, 5000, 12000, None, 8, None),
+    ((1, 0, 0, 0, 0), (0, 0, 1, 1, 1)),
+)
+# (MerkleVerifyModeScore(mode_cost=MerkleModeCost(...),
+#   total_cost=Fraction(...), peak_cost=Fraction(...), hashes_cost=Fraction(...),
+#   nodes_cost=Fraction(...), steps_cost=Fraction(...),
+#   scores=(Fraction(...), Fraction(...)), regrets=(Fraction(...), Fraction(...)),
+#   selected=False), ...)
 ```
 
 推荐策略：先按要签的消息条数定 `capacity`，`recommend` 给出能覆盖它的最小树高；签名体积敏感（默认）用 `w=8`，验证/签名速度敏感用 `prefer="speed"` 换 `w=4`——后者签名约大一倍，但链步上界从 `34×255=8670` 降到 `67×15=1005`。

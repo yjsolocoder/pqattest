@@ -71,6 +71,12 @@ frontier, recommend_merkle_cardinality_deployment to rank that frontier
 by one of five preferences, recommend_merkle_cardinality_weighted to
 rank it by a five-tuple of non-negative weights over min-max-normalised
 costs with exact Fraction arithmetic,
+explain_merkle_cardinality_weighted to export that same weighted
+ranking's decision-cost breakdown as a tuple of frozen
+MerkleCardinalityScore rows — one per frontier member, in frontier
+order, each carrying the candidate's plan/cost pairing, its five
+normalised costs, the final score and a selected flag — again with
+exact Fraction arithmetic,
 recommend_merkle_verify_mode_weighted to rank the fixed-position joint
 verify-mode frontier by the smallest worst-case regret over a non-empty
 tuple of such five-weight scenarios, again with exact Fraction arithmetic,
@@ -185,6 +191,7 @@ from .params import (
     MerkleVerifyProfile,
     MerkleVerifyWorkloadProfile,
     MerkleVerifyModeScore,
+    MerkleCardinalityScore,
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
@@ -195,6 +202,7 @@ from .params import (
     merkle_cardinality_frontier,
     recommend_merkle_cardinality_deployment,
     recommend_merkle_cardinality_weighted,
+    explain_merkle_cardinality_weighted,
     recommend_merkle_cardinality_weighted_scenarios,
     recommend_merkle_verify_mode_deployment,
     recommend_merkle_verify_mode_deployment_weighted,
@@ -256,6 +264,7 @@ __all__ = [
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
     "MerkleVerifyModeScore",
+    "MerkleCardinalityScore",
     "MerkleVerifyProfile",
     "MerkleVerifyWorkloadProfile",
     "OneTimeSigner",
@@ -276,6 +285,7 @@ __all__ = [
     "auth_state_wrap",
     "auth_unwrap",
     "auth_wrap",
+    "explain_merkle_cardinality_weighted",
     "explain_merkle_deployment_weighted",
     "explain_merkle_verify_mode_weighted",
     "keygen",

@@ -78,6 +78,12 @@ recommend_merkle_cardinality_weighted_scenarios to rank the
 worst-case-position cardinality frontier that same way, by the smallest
 worst-case regret over a non-empty tuple of five-weight scenarios with
 exact Fraction arithmetic,
+explain_merkle_cardinality_weighted to export the single-weight
+cardinality ranking's decision-cost breakdown as a tuple of frozen
+MerkleCardinalityScore rows — one per frontier member, in frontier order,
+each carrying the candidate's plan/cost pairing, its five normalised
+costs, its final score and a selected flag — again with exact Fraction
+arithmetic,
 recommend_merkle_verify_mode_deployment to rank the fixed-position
 verify-mode frontier by one of five business preferences (compact /
 verify / nodes / speed / robust),
@@ -177,6 +183,7 @@ from .merkle import (
     multiproof_verify_bound,
 )
 from .params import (
+    MerkleCardinalityScore,
     MerkleDeploymentScore,
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
@@ -196,6 +203,7 @@ from .params import (
     recommend_merkle_cardinality_deployment,
     recommend_merkle_cardinality_weighted,
     recommend_merkle_cardinality_weighted_scenarios,
+    explain_merkle_cardinality_weighted,
     recommend_merkle_verify_mode_deployment,
     recommend_merkle_verify_mode_deployment_weighted,
     recommend_merkle_verify_mode_weighted,
@@ -246,6 +254,7 @@ __all__ = [
     "HASH_BYTES",
     "KeyExhaustedError",
     "MerkleBatchProof",
+    "MerkleCardinalityScore",
     "MerkleDeploymentScore",
     "MerkleProof",
     "MerklePublicKey",
@@ -276,6 +285,7 @@ __all__ = [
     "auth_state_wrap",
     "auth_unwrap",
     "auth_wrap",
+    "explain_merkle_cardinality_weighted",
     "explain_merkle_deployment_weighted",
     "explain_merkle_verify_mode_weighted",
     "keygen",

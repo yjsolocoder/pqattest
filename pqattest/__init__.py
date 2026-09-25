@@ -104,6 +104,12 @@ fixed-position verify-mode frontier by a five-tuple of non-negative weights
 over min-max-normalised costs (total transport, single-group peak, total
 verifier hashes, carried nodes and per-signature chain steps), the weighted
 sum divided by the weight total, with exact Fraction arithmetic,
+explain_merkle_verify_mode_deployment_weighted to export that same
+single-weight fixed-position ranking's decision-cost breakdown as a tuple
+of frozen MerkleVerifyModeDeploymentScore rows — one per frontier member,
+in frontier order, each carrying the candidate's plan/cost pairing, its
+five normalised costs, its final score and a selected flag — again with
+exact Fraction arithmetic,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -206,6 +212,7 @@ from .params import (
     MerkleVerifyProfile,
     MerkleVerifyWorkloadProfile,
     MerkleVerifyModeScore,
+    MerkleVerifyModeDeploymentScore,
     Params,
     merkle_storage_profile,
     merkle_transport_profile,
@@ -223,6 +230,7 @@ from .params import (
     recommend_merkle_verify_mode_deployment_weighted,
     recommend_merkle_verify_mode_weighted,
     explain_merkle_verify_mode_weighted,
+    explain_merkle_verify_mode_deployment_weighted,
     merkle_verify_profile,
     merkle_verify_workload_profile,
     profile,
@@ -283,6 +291,7 @@ __all__ = [
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
     "MerkleVerifyModeScore",
+    "MerkleVerifyModeDeploymentScore",
     "MerkleVerifyProfile",
     "MerkleVerifyWorkloadProfile",
     "OneTimeSigner",
@@ -307,6 +316,7 @@ __all__ = [
     "explain_merkle_cardinality_weighted_scenarios",
     "explain_merkle_deployment_weighted",
     "explain_merkle_deployment_weighted_scenarios",
+    "explain_merkle_verify_mode_deployment_weighted",
     "explain_merkle_verify_mode_weighted",
     "keygen",
     "lamport_signature_from_bytes",

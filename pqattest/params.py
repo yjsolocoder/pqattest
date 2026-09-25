@@ -140,13 +140,20 @@ single-group peak, total verifier hashes, carried nodes and per-signature
 chain steps), the weighted sum divided by the weight total with exact
 :class:`fractions.Fraction` arithmetic, and returns one
 :class:`MerkleModeCost`.
+:func:`explain_merkle_verify_mode_deployment_weighted` exports the
+decision-cost breakdown behind that same single-weight fixed-position
+ranking as a tuple of frozen
+:class:`MerkleVerifyModeDeploymentScore` rows — one per frontier member,
+in frontier order, each carrying the candidate's plan/cost pairing, its
+five normalised costs, its final score and a selected flag — with the
+same exact :class:`fractions.Fraction` arithmetic.
 :func:`recommend_scheme` is the cross-scheme selector: it enumerates every
 configuration :func:`profile` accepts — the two one-time schemes and both
 Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All thirty-six
+All thirty-seven
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -172,6 +179,7 @@ __all__ = [
     "MerkleVerifyProfile",
     "MerkleVerifyWorkloadProfile",
     "MerkleVerifyModeScore",
+    "MerkleVerifyModeDeploymentScore",
     "MerkleCardinalityScore",
     "MerkleCardinalityScenarioScore",
     "profile",
@@ -203,6 +211,7 @@ __all__ = [
     "recommend_merkle_verify_mode_deployment_weighted",
     "recommend_merkle_verify_mode_weighted",
     "explain_merkle_verify_mode_weighted",
+    "explain_merkle_verify_mode_deployment_weighted",
     "recommend_merkle_mode_deployment",
     "recommend_merkle_mode_weighted",
     "recommend_merkle_mode_weighted_scenarios",
@@ -3680,6 +3689,151 @@ def recommend_merkle_verify_mode_deployment_weighted(
         )
 
     return min(frontier, key=ranking)
+
+
+@dataclass(frozen=True)
+class MerkleVerifyModeDeploymentScore:
+    """Frozen decision-cost breakdown for one fixed-position mode plan.
+
+    One row of :func:`explain_merkle_verify_mode_deployment_weighted`'s
+    result. Fields, in positional order:
+
+    - ``mode_cost``: the candidate's :class:`MerkleModeCost` plan/cost
+      pairing;
+    - ``transport_cost`` / ``peak_cost`` / ``hashes_cost`` / ``nodes_cost``
+      / ``steps_cost``: the candidate's five min-max-normalised costs, in
+      the same order as the weights — aggregate transport bytes, any single
+      group's transport peak, total verifier SHA-256 hashes, carried
+      multi-proof nodes and per-signature verifier chain steps — each
+      ``(x - min) / (max - min)`` over the whole frontier, with a zero span
+      scoring ``0``;
+    - ``score``: the final weighted score — the five normalised costs
+      times their weights, summed and divided by the weight total;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_merkle_verify_mode_deployment_weighted` would pick.
+
+    Every normalised cost and the score is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    mode_cost: MerkleModeCost
+    transport_cost: Fraction
+    peak_cost: Fraction
+    hashes_cost: Fraction
+    nodes_cost: Fraction
+    steps_cost: Fraction
+    score: Fraction
+    selected: bool
+
+
+def explain_merkle_verify_mode_deployment_weighted(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+    weights: Any,
+) -> tuple[MerkleVerifyModeDeploymentScore, ...]:
+    """Export the decision-cost breakdown of the weighted fixed-position ranking.
+
+    The explanatory counterpart of
+    :func:`recommend_merkle_verify_mode_deployment_weighted`: it computes
+    :func:`merkle_verify_mode_frontier` exactly once and, instead of
+    returning only the winning plan, returns one frozen
+    :class:`MerkleVerifyModeDeploymentScore` row per frontier member, in
+    the frontier's own order. Each row carries the candidate's
+    :class:`MerkleModeCost` plan/cost pairing, its five min-max-normalised
+    costs in the same order as the weights — aggregate transport bytes
+    (:attr:`MerkleTransportWorkloadProfile.total`), any single group's
+    transport peak (the maximum of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), total verifier SHA-256
+    hashes (:attr:`MerkleVerifyWorkloadProfile.total`), carried multi-proof
+    nodes (:attr:`MerkleModeCost.nodes`) and the per-signature verifier
+    hash-chain steps (``profile("merkle", ...)``'s ``steps``) — the final
+    weighted score and a ``selected`` flag.
+
+    ``weights`` must be a five-tuple in that same order — total transport,
+    single-group peak, total verifier hashes, carried nodes and per-signature
+    chain steps. Every weight must be a non-boolean, non-negative integer
+    and at least one must be positive. Each of the five costs is min-max
+    normalised over the whole frontier as ``(x - min) / (max - min)``, with
+    a zero span scoring ``0``; the score is the sum of the five normalised
+    costs times their weights, divided by the weight total, all exact
+    rationals (``fractions.Fraction``) with no floating point anywhere.
+    Exactly one row is selected: the one whose plan
+    :func:`recommend_merkle_verify_mode_deployment_weighted` returns for
+    the same arguments, field for field — the smallest score, with equal
+    scores broken ascending by checkpoint bytes, leaf count, ``w``,
+    ``height`` and the ``modes`` tuple in lexicographic order, exactly
+    like the tail of every other verify-mode ranking. When every span is
+    zero every row scores ``0`` and the tie-break tail alone decides; the
+    rows report exactly that.
+
+    ``capacity``, ``groups`` and the six-tuple ``budgets`` follow
+    :func:`merkle_verify_mode_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``weights``). A non-tuple ``weights`` or a non-integer member raises
+    ``TypeError``; a wrong-length tuple or a boolean, negative or all-zero
+    weight raises ``ValueError``. The function is pure: it draws no
+    randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_verify_mode_frontier(capacity, groups, budgets)
+    validated_weights = _validate_verify_mode_weights(weights)
+
+    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
+        return (
+            mode_cost.plan.total,
+            max(mode_cost.plan.sizes),
+            mode_cost.cost.total,
+            mode_cost.nodes,
+            profile(
+                "merkle",
+                w=mode_cost.plan.config.w,
+                height=mode_cost.plan.config.height,
+            ).steps,
+        )
+
+    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+    weight_total = sum(validated_weights)
+
+    entries = []
+    for mode_cost, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        score = sum(
+            (weight * cost for weight, cost in zip(validated_weights, costs)),
+            Fraction(0),
+        ) / weight_total
+        entries.append((mode_cost, costs, score))
+
+    def ranking(
+        entry: tuple[MerkleModeCost, tuple[Fraction, ...], Fraction],
+    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
+        mode_cost, _costs, score = entry
+        config = mode_cost.plan.config
+        return (
+            score,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+            mode_cost.plan.modes,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        MerkleVerifyModeDeploymentScore(
+            mode_cost, *costs, score, mode_cost is chosen
+        )
+        for mode_cost, costs, score in entries
+    )
 
 
 def _validate_cardinality_groups(capacity: Any, group_sizes: Any) -> tuple[int, ...]:

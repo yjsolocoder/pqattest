@@ -74,6 +74,12 @@ decision-cost breakdown as a tuple of frozen MerkleModeScore rows — one
 per frontier member, in frontier order, each carrying the candidate's
 workload plan, its five normalised costs, its final score and a selected
 flag — again with exact Fraction arithmetic,
+explain_merkle_mode_weighted_scenarios to export the multi-scenario mode
+ranking's decision-cost breakdown as a tuple of frozen
+MerkleModeScenarioScore rows — one per frontier member, in frontier
+order, each carrying the candidate's workload plan, its five normalised
+costs, its per-scenario scores and regrets and a selected flag — again
+with exact Fraction arithmetic,
 MerkleVerifyProfile / merkle_verify_profile,
 MerkleVerifyWorkloadProfile / merkle_verify_workload_profile,
 MerkleModeCost / merkle_verify_mode_frontier,
@@ -215,6 +221,7 @@ from .params import (
     MerkleTransportWorkloadProfile,
     MerkleModeCost,
     MerkleModeScore,
+    MerkleModeScenarioScore,
     MerkleVerifyProfile,
     MerkleVerifyWorkloadProfile,
     MerkleVerifyModeScore,
@@ -252,6 +259,7 @@ from .params import (
     recommend_merkle_mode_weighted,
     recommend_merkle_mode_weighted_scenarios,
     explain_merkle_mode_weighted,
+    explain_merkle_mode_weighted_scenarios,
     recommend_merkle_transport_deployment,
     recommend_merkle_transport_deployment_weighted,
     recommend_merkle_transport_deployment_weighted_scenarios,
@@ -298,6 +306,7 @@ __all__ = [
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
     "MerkleModeScore",
+    "MerkleModeScenarioScore",
     "MerkleVerifyModeScore",
     "MerkleVerifyModeDeploymentScore",
     "MerkleVerifyProfile",
@@ -325,6 +334,7 @@ __all__ = [
     "explain_merkle_deployment_weighted",
     "explain_merkle_deployment_weighted_scenarios",
     "explain_merkle_mode_weighted",
+    "explain_merkle_mode_weighted_scenarios",
     "explain_merkle_verify_mode_weighted",
     "explain_merkle_verify_mode_deployment_weighted",
     "keygen",

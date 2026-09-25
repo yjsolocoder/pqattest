@@ -501,6 +501,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `merkle_deployment_frontier(capacity, budgets)` — 与 `recommend_merkle_deployment` 同一组候选与预算，但**不排序取首项**，而是返回全部可行且非支配的普通 Merkle 部署，类型为 `tuple[MerkleStorageProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）及单签验签步数（`profile("merkle", ...).steps`）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 的全部候选，配置取 `merkle_storage_profile`、步数取 `profile` 的 Merkle 结果。支配判定固定为：A 在检查点字节、签名线长、证明线长、单签步数四项上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配候选并按值去重，不因偏好预先舍弃速度与尺寸形成取舍的配置。结果按单签步数、签名线长、证明线长、检查点字节、叶数、`w`、`height` 稳定升序排列。`budgets` 非元组抛 `TypeError`；其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_deployment_weighted(capacity, budgets, weights)` — 在 `merkle_deployment_frontier` 的非支配结果上**按四元组权重的归一化加权评分选出一个普通 Merkle 部署方案**，返回该前沿成员（现有的 `MerkleStorageProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变既有前沿与按偏好取一项的推荐入口。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与四元组 `budgets` 先按 `merkle_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为四元组，依次对应检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）与单签验签链步数（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且四项中至少一项为正。四项成本各自按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0），四项归一化成本乘对应权重求和后除以权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小的前沿成员，评分完全相同时按检查点字节、叶数、`w`、`height` 升序取首项。`weights` 非元组或权重成员非整数抛 `TypeError`；权重长度错误、含布尔或负数、整组全零抛 `ValueError`；无可行方案同样抛 `ValueError`
 - `recommend_merkle_deployment_weighted_scenarios(capacity, budgets, scenarios)` — 为普通 Merkle 存储部署前沿 `merkle_deployment_frontier` 补上**抗偏好漂移的多情景版本**（基线已有按偏好取一项的 `recommend_merkle_deployment` 与单一固定权重的 `recommend_merkle_deployment_weighted`）：同时评估多组权重情景，从同一次前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleStorageProfile`），不新增值类型、不重复枚举或筛选候选、不改变既有前沿与两个既有推荐入口。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与四元组 `budgets` 先按 `merkle_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查）。`scenarios` 必须为**非空元组**，每项是覆盖检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）与单签验签链步数（`profile("merkle", ...).steps`）的四元权重；权重只能是非布尔非负整数，每个情景至少一项为正，重复情景分别计入（权重总和参与归一化）。四项成本按全前沿各自的最小值与最大值归一化（零跨度记 0），全程为精确有理数（`fractions.Fraction`，禁止浮点）；每个情景的加权和除以该情景自身的权重总和作为该情景下的得分。先求每个情景在全前沿上的最优得分，候选得分减去它即为该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，完全平局时按检查点字节、叶数、`w`、`height` 升序取首项。`scenarios` 或其成员非元组、权重成员非整数抛 `TypeError`；空元组、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；无可行方案也抛 `ValueError`
+- `explain_merkle_deployment_weighted(capacity, budgets, weights)` — 为普通 Merkle 存储部署的加权推荐 `recommend_merkle_deployment_weighted` 补上**决策成本明细的导出入口**（基线无此类明细入口）：在同一次 `merkle_deployment_frontier` 前沿上逐项给出每个候选的归一化成本与最终评分，返回冻结的 `MerkleDeploymentScore` 行元组，行序与该前沿成员顺序完全一致，不重复枚举或筛选候选、不改变既有前沿与任何既有推荐入口。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定。三参数均无默认值；`capacity` 与四元组 `budgets` 先按 `merkle_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查），`weights` 规则与 `recommend_merkle_deployment_weighted` 完全一致。每行依次携带该候选的配置（`MerkleStorageProfile`）、与权重逐位对应的四项归一化成本（检查点字节、单签线长、独立证明线长、单签链步，各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度记 0）、最终评分（归一化成本乘各自权重求和再除以权重总和）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点。恰好一行被选中，其配置与同参数调用 `recommend_merkle_deployment_weighted` 的结果逐字段相同；评分完全相同时沿用既有决胜尾序（检查点字节、叶数、`w`、`height` 升序取首）。全前沿零跨度时各行评分都是零，选中项由决胜尾序决定，明细如实反映。`budgets`/`weights` 非元组或权重成员非整数抛 `TypeError`；容量越界或为布尔、预算长度不符或成员非法或全空、权重长度不符、含布尔或负数、整组全零均抛 `ValueError`；预算下无可行方案同样抛 `ValueError`，不返回任何明细行
+- `MerkleDeploymentScore` — 冻结的决策成本明细行值对象，七个字段按位置依次为 `config, checkpoint_cost, signature_cost, proof_cost, steps_cost, score, selected`：候选配置（`MerkleStorageProfile`）、与权重逐位对应的四项归一化成本（`Fraction`）、最终评分（`Fraction`）与选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
 - `MerkleStorageProfile` — 冻结的 Merkle 线长估算值对象，八个字段均为 `int` 且按位置依次为 `w, height, leaf_count, signature_wire_bytes, proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes`；冻结、可位置构造、按值相等（可哈希）
 - `merkle_storage_profile(w, height)` — 纯函数：返回 `(w, height)` 对应的 `MerkleStorageProfile`，不生成密钥、不取随机数。`w` 限 4/8，`height` 限 1 至 8 非布尔整数，非法抛 `ValueError`。令 `n = 67/34`（对应 `w = 4/8`）、`L = 2**height`、`S = 16 + 32*(n+height)`、`C = 81 + 32*L*n`：前四字段为 `w, height, L, S`，后四字段 `proof_wire_bytes, checkpoint_bytes, auth_v1_bytes, auth_v2_bytes` 依次为 `S+60, C, C+46, C+54`，分别对应 `MerkleProof` 线长、明文检查点、v1 封装、v2 封装
 - `merkle_transport_profile(w, height, indices)` — 纯函数：为同一叶集合估算批量证明与多证明线长，返回三元组 `(m, 58+k*(4+S), 60+k*(4+32*n)+35*m)`，分别为多证明携带的节点数 `m`、批量证明线长、多证明线长，其中 `k = len(indices)`，`m` 按既有多证明规范计入集合外兄弟并逐级右移去重。`indices` 必须为非空、严格递增的整数元组，成员均在 `0 .. 2**height-1`；容器或成员类型错抛 `TypeError`，空元组、布尔成员、越界或非严格递增抛 `ValueError`；`w`/`height` 非法同样抛 `ValueError`
@@ -543,6 +545,8 @@ from pqattest import (
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
     recommend_merkle_deployment_weighted_scenarios,
+    MerkleDeploymentScore,
+    explain_merkle_deployment_weighted,
     merkle_storage_profile,
     merkle_transport_profile,
     recommend_merkle_transport_deployment,
@@ -620,6 +624,21 @@ recommend_merkle_deployment_weighted_scenarios(
     4, (None, None, None, 9000), ((1, 0, 0, 0), (0, 0, 0, 1))
 )
 # MerkleStorageProfile(w=8, height=2, ...)；重复情景分别计入
+
+# 同一加权推荐的决策成本明细：每个前沿候选一行，行序与前沿一致，依次为
+# 配置、四项归一化成本、最终评分与选中标志；恰好一行 selected=True，
+# 其配置与 recommend_merkle_deployment_weighted 同参数的结果逐字段相同
+explain_merkle_deployment_weighted(
+    4, (None, None, None, 9000), (1, 1, 1, 1)
+)
+# (MerkleDeploymentScore(config=MerkleStorageProfile(w=4, height=2, ...),
+#   checkpoint_cost=Fraction(1, 1), signature_cost=Fraction(1, 1),
+#   proof_cost=Fraction(1, 1), steps_cost=Fraction(0, 1),
+#   score=Fraction(3, 4), selected=False),
+#  MerkleDeploymentScore(config=MerkleStorageProfile(w=8, height=2, ...),
+#   checkpoint_cost=Fraction(0, 1), signature_cost=Fraction(0, 1),
+#   proof_cost=Fraction(0, 1), steps_cost=Fraction(1, 1),
+#   score=Fraction(1, 4), selected=True))
 
 # 联合选择树参数与传输方案：对叶集合 (3, 5) 要求多证明不超过 8 KB，顺序为
 # (检查点, 批次证明, 多证明, 步数)，不限的项传 None

@@ -28,6 +28,11 @@ recommend_merkle_deployment_weighted_scenarios to rank that same
 ordinary-deployment frontier by the smallest worst-case regret over a
 non-empty tuple of such four-weight scenarios, again with exact Fraction
 arithmetic,
+explain_merkle_deployment_weighted to export that same weighted
+ranking's decision-cost breakdown as a tuple of frozen
+MerkleDeploymentScore rows — one per frontier member, in frontier order,
+each carrying the candidate's config, its four normalised costs, its
+final score and a selected flag — again with exact Fraction arithmetic,
 MerkleStorageProfile / merkle_storage_profile / merkle_transport_profile /
 recommend_merkle_transport_deployment / MerkleTransportDeploymentProfile /
 merkle_transport_deployment_frontier /
@@ -172,6 +177,7 @@ from .merkle import (
     multiproof_verify_bound,
 )
 from .params import (
+    MerkleDeploymentScore,
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
     MerkleTransportWorkloadProfile,
@@ -201,6 +207,7 @@ from .params import (
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
     recommend_merkle_deployment_weighted_scenarios,
+    explain_merkle_deployment_weighted,
     recommend_merkle_mode_deployment,
     recommend_merkle_mode_weighted,
     recommend_merkle_mode_weighted_scenarios,
@@ -237,6 +244,7 @@ __all__ = [
     "HASH_BYTES",
     "KeyExhaustedError",
     "MerkleBatchProof",
+    "MerkleDeploymentScore",
     "MerkleProof",
     "MerklePublicKey",
     "MerkleSignature",
@@ -265,6 +273,7 @@ __all__ = [
     "auth_state_wrap",
     "auth_unwrap",
     "auth_wrap",
+    "explain_merkle_deployment_weighted",
     "keygen",
     "lamport_signature_from_bytes",
     "lamport_signature_to_bytes",

@@ -75,6 +75,11 @@ exact Fraction arithmetic,
 recommend_merkle_verify_mode_deployment to rank the fixed-position
 verify-mode frontier by one of five business preferences (compact /
 verify / nodes / speed / robust),
+recommend_merkle_verify_mode_deployment_weighted to rank that same
+fixed-position frontier by a five-tuple of non-negative weights over
+min-max-normalised costs (total transport, single-group peak, verifier
+hash total, carried nodes and per-signature chain steps), the weighted
+sum divided by the weight total, with exact Fraction arithmetic,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
@@ -184,6 +189,7 @@ from .params import (
     recommend_merkle_cardinality_weighted,
     recommend_merkle_cardinality_weighted_scenarios,
     recommend_merkle_verify_mode_deployment,
+    recommend_merkle_verify_mode_deployment_weighted,
     recommend_merkle_verify_mode_weighted,
     merkle_verify_profile,
     merkle_verify_workload_profile,
@@ -273,6 +279,7 @@ __all__ = [
     "recommend_merkle_cardinality_weighted",
     "recommend_merkle_cardinality_weighted_scenarios",
     "recommend_merkle_verify_mode_deployment",
+    "recommend_merkle_verify_mode_deployment_weighted",
     "recommend_merkle_verify_mode_weighted",
     "merkle_verify_profile",
     "merkle_verify_workload_profile",

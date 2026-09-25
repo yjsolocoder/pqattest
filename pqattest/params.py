@@ -115,6 +115,13 @@ arithmetic, and returns one :class:`MerkleModeCost`.
 :func:`recommend_merkle_cardinality_weighted_scenarios` applies that same
 preference-drift-robust multi-scenario minimax-regret ranking to the
 worst-case-position :func:`merkle_cardinality_frontier` frontier.
+:func:`explain_merkle_cardinality_weighted_scenarios` exports the
+decision-cost breakdown behind that same multi-scenario ranking as a tuple
+of frozen :class:`MerkleCardinalityScenarioScore` rows — one per frontier
+member, in frontier order, each carrying the candidate's plan/cost
+pairing, its five normalised costs, its per-scenario score and regret
+tuples and a selected flag — with the same exact
+:class:`fractions.Fraction` arithmetic.
 :func:`recommend_merkle_verify_mode_deployment` ranks the fixed-position
 :func:`merkle_verify_mode_frontier` frontier by one of five business
 preferences — ``"compact"``, ``"verify"``, ``"nodes"``, ``"speed"`` or
@@ -132,7 +139,7 @@ Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All thirty-three
+All thirty-four
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -158,6 +165,7 @@ __all__ = [
     "MerkleVerifyWorkloadProfile",
     "MerkleVerifyModeScore",
     "MerkleCardinalityScore",
+    "MerkleCardinalityScenarioScore",
     "profile",
     "recommend",
     "recommend_scheme",
@@ -167,6 +175,7 @@ __all__ = [
     "recommend_merkle_deployment_weighted_scenarios",
     "explain_merkle_deployment_weighted",
     "explain_merkle_cardinality_weighted",
+    "explain_merkle_cardinality_weighted_scenarios",
     "recommend_merkle_transport_deployment",
     "merkle_transport_deployment_frontier",
     "recommend_merkle_transport_deployment_weighted",
@@ -4636,4 +4645,188 @@ def explain_merkle_cardinality_weighted(
     return tuple(
         MerkleCardinalityScore(mode_cost, *costs, score, mode_cost is chosen)
         for mode_cost, costs, score in entries
+    )
+
+
+@dataclass(frozen=True)
+class MerkleCardinalityScenarioScore:
+    """Frozen decision-cost breakdown for one worst-case cardinality plan.
+
+    One row of
+    :func:`explain_merkle_cardinality_weighted_scenarios`'s result. Fields,
+    in positional order:
+
+    - ``mode_cost``: the candidate's :class:`MerkleModeCost` plan/cost
+      pairing;
+    - ``transport_cost`` / ``peak_cost`` / ``hashes_cost`` / ``nodes_cost``
+      / ``steps_cost``: the candidate's five min-max-normalised costs, in
+      the same order as the weights — aggregate transport bytes, any single
+      group's transport peak, total verifier SHA-256 hashes, carried
+      multi-proof nodes and per-signature verifier chain steps — each
+      ``(x - min) / (max - min)`` over the whole frontier, with a zero span
+      scoring ``0``;
+    - ``scores``: the per-scenario weighted scores, in the same order as
+      the input scenarios — each the five normalised costs times that
+      scenario's weights, summed and divided by the scenario's weight
+      total;
+    - ``regrets``: the per-scenario regrets, in the same order — each
+      score minus that scenario's best score over the whole frontier;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_merkle_cardinality_weighted_scenarios` would pick.
+
+    Every normalised cost, score and regret is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    mode_cost: MerkleModeCost
+    transport_cost: Fraction
+    peak_cost: Fraction
+    hashes_cost: Fraction
+    nodes_cost: Fraction
+    steps_cost: Fraction
+    scores: tuple[Fraction, ...]
+    regrets: tuple[Fraction, ...]
+    selected: bool
+
+
+def explain_merkle_cardinality_weighted_scenarios(
+    capacity: Any,
+    group_sizes: Any,
+    budgets: Any,
+    scenarios: Any,
+) -> tuple[MerkleCardinalityScenarioScore, ...]:
+    """Export the decision-cost breakdown of the minimax-regret ranking.
+
+    The explanatory counterpart of
+    :func:`recommend_merkle_cardinality_weighted_scenarios`: it computes
+    :func:`merkle_cardinality_frontier` exactly once and, instead of
+    returning only the winning plan, returns one frozen
+    :class:`MerkleCardinalityScenarioScore` row per frontier member, in the
+    frontier's own order. Each row carries the candidate's
+    :class:`MerkleModeCost` plan/cost pairing, its five min-max-normalised
+    costs in the same order as the weights — aggregate transport bytes
+    (:attr:`MerkleTransportWorkloadProfile.total`), any single group's
+    transport peak (the maximum of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), total verifier SHA-256
+    hashes (:attr:`MerkleVerifyWorkloadProfile.total`), carried multi-proof
+    nodes (:attr:`MerkleModeCost.nodes`) and the per-signature verifier
+    hash-chain steps (``profile("merkle", ...)``'s ``steps``) — the
+    per-scenario weighted scores, the per-scenario regrets and a
+    ``selected`` flag.
+
+    ``scenarios`` must be a non-empty tuple; each member must itself be a
+    five-tuple in that same order. Every weight must be a non-boolean,
+    non-negative integer and at least one weight of each scenario must be
+    positive; repeated scenarios are counted separately, exactly like
+    repeated groups. Each of the five costs is min-max normalised over the
+    whole frontier as ``(x - min) / (max - min)``, with a zero span scoring
+    ``0``. For each scenario, a candidate's score is the weighted sum of
+    its five normalised costs divided by the scenario's weight total, and
+    its regret is that score minus the scenario's best score over the
+    whole frontier — all exact rationals (``fractions.Fraction``) with no
+    floating point anywhere. Exactly one row is selected: the one whose
+    plan :func:`recommend_merkle_cardinality_weighted_scenarios` returns
+    for the same arguments, field for field — the smallest worst regret,
+    with ties broken by the regret sum, then the per-scenario score
+    tuple, then ascending by checkpoint bytes, leaf count, ``w``,
+    ``height`` and the ``modes`` tuple in lexicographic order.
+
+    ``capacity``, ``group_sizes`` and the six-tuple ``budgets`` follow
+    :func:`merkle_cardinality_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``scenarios``). A non-tuple ``scenarios`` or scenario member, or a
+    non-integer weight, raises ``TypeError``; an empty scenario tuple, a
+    wrong-length scenario, or a boolean, negative or all-zero weight
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state.
+    """
+    frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
+    validated_scenarios = _validate_weight_scenarios(scenarios)
+
+    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
+        return (
+            mode_cost.plan.total,
+            max(mode_cost.plan.sizes),
+            mode_cost.cost.total,
+            mode_cost.nodes,
+            profile(
+                "merkle",
+                w=mode_cost.plan.config.w,
+                height=mode_cost.plan.config.height,
+            ).steps,
+        )
+
+    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
+
+    entries = []
+    for mode_cost, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        scores = tuple(
+            sum(
+                (weight * component for weight, component in zip(weights, costs)),
+                Fraction(0),
+            )
+            / weight_total
+            for weights, weight_total in zip(validated_scenarios, scenario_totals)
+        )
+        entries.append((mode_cost, costs, scores))
+
+    scenario_best = tuple(
+        min(entry[2][scenario_index] for entry in entries)
+        for scenario_index in range(len(validated_scenarios))
+    )
+    entries = [
+        (mode_cost, costs, scores, tuple(
+            score - best for score, best in zip(scores, scenario_best)
+        ))
+        for mode_cost, costs, scores in entries
+    ]
+
+    def ranking(
+        entry: tuple[
+            MerkleModeCost,
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+        ],
+    ) -> tuple[
+        Fraction,
+        Fraction,
+        tuple[Fraction, ...],
+        int,
+        int,
+        int,
+        int,
+        tuple[str, ...],
+    ]:
+        mode_cost, _costs, scores, regrets = entry
+        config = mode_cost.plan.config
+        return (
+            max(regrets),
+            sum(regrets, Fraction(0)),
+            scores,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+            mode_cost.plan.modes,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        MerkleCardinalityScenarioScore(
+            mode_cost, *costs, scores, regrets, mode_cost is chosen
+        )
+        for mode_cost, costs, scores, regrets in entries
     )

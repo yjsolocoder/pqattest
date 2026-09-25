@@ -522,6 +522,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_merkle_mode_deployment(capacity, groups, budgets, prefer="compact")` — 在 `merkle_mode_frontier` 的非支配结果上**按业务偏好选出一个模式组合**，返回现有的 `MerkleTransportWorkloadProfile`，不新增值类型、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态。前三参数无默认值；`capacity`、`groups` 与五元组 `budgets` 完全沿用 `merkle_mode_frontier` 的类型、范围、预算及异常规则，无可行项抛 `ValueError`。`prefer` 仅取 `"compact"`（默认）、`"nodes"` 或 `"speed"`，其他值抛 `ValueError`。排序键：`"compact"` 依次按 `total`、单组峰值（`max(sizes)`）、节点总数、单签步数升序；`"nodes"` 依次按节点总数、`total`、单组峰值、单签步数升序；节点总数沿用模式前沿定义，仅累加 multiproof 组的规范节点数；`"speed"` 依次按单签步数、`total`、单组峰值、节点总数升序。三种策略末段统一按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入抛 `ValueError`
 - `recommend_merkle_mode_weighted(capacity, groups, budgets, weights)` — 在 `merkle_mode_frontier` 的非支配结果上**按五元组权重的归一化加权评分选出一个模式组合**，返回该前沿成员（现有的 `MerkleTransportWorkloadProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与五元组 `budgets` 完全沿用 `merkle_mode_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且先于 `weights` 筛查。`weights` 必须为五元组，依次对应检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）、单签验签链步数（`profile("merkle", ...).steps`）与节点总数，节点总数沿用模式前沿口径，只累计 multiproof 组的规范节点、batch 组计零；每个成员只能是非布尔非负整数且至少一项为正。对前沿五项成本分别按 `(x-min)/(max-min)` 归一化（零跨度记 0），五项归一化成本乘对应权重后求和再除以权重总和，以精确有理数（`fractions.Fraction`，无浮点）取评分最小者；评分相同时按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`groups`/`budgets`/`weights` 非元组或权重含非整数成员抛 `TypeError`；权重长度错误、含布尔、负数或全零抛 `ValueError`；无可行方案也抛 `ValueError`
 - `recommend_merkle_mode_weighted_scenarios(capacity, groups, budgets, scenarios)` — 同一 `merkle_mode_frontier` 模式前沿的**抗偏好漂移多情景版本**（基线已有按偏好取一项的 `recommend_merkle_mode_deployment`）：同时评估多组权重情景，从同一次模式前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleTransportWorkloadProfile`），不新增值类型、不重复枚举或筛选候选、不改变既有前沿、既有推荐入口及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与五元组 `budgets` 先按 `merkle_mode_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查）。`scenarios` 必须为**非空元组**，每项是覆盖检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）、单签链步（`profile("merkle", ...).steps`）与节点总数（只累计 multiproof 组的规范节点、batch 组计零）的五元权重；权重只能是非布尔非负整数，每个情景至少一项为正，重复情景分别计入（权重总和参与归一化）。五项成本按全前沿各自的最小值与最大值归一化（零跨度记 0），全程为精确有理数（`fractions.Fraction`，禁止浮点）；每个情景的加权和除以该情景自身的权重总和作为该情景下的得分。先求每个情景的最优得分，候选得分减去它即为该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，完全平局时按检查点字节、叶数、`w`、`height` 与逐组模式（`modes`）的字典序取首项。`groups`/`budgets`/`scenarios` 非元组（含成员组或情景本身非元组）或权重成员非整数抛 `TypeError`；空组/空情景、权重组长度不符、含布尔或负数权重、或整组全零抛 `ValueError`；无可行方案也抛 `ValueError`
+- `explain_merkle_mode_weighted(capacity, groups, budgets, weights)` — 为**多组 Merkle 模式前沿**的单一权重推荐 `recommend_merkle_mode_weighted` 补上**决策成本明细的导出入口**（基线已有该前沿与按偏好取一项、单权重、多情景三类推荐，但没有明细入口，本次从零新增）：在同一次 `merkle_mode_frontier` 前沿上逐项给出每个候选的归一化成本与最终评分，返回冻结的 `MerkleModeScore` 行元组，行序与同参数模式前沿一次调用的成员顺序完全一致，不重复枚举或筛选候选、不改变既有模式前沿、各族推荐入口、已有明细入口及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与五元组 `budgets` 先按 `merkle_mode_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为五元组，依次对应检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）、单签验签链步数（`profile("merkle", ...).steps`）与节点总数，节点总数沿用模式前沿口径，只累计 multiproof 组的规范节点、batch 组计零；每个成员只能是非布尔非负整数且至少一项为正。每行依次携带该候选的工作负载方案对象（`MerkleTransportWorkloadProfile`）、与权重逐位对应的五项归一化成本（检查点字节、单组峰值、总传输字节、单签链步、节点总数，各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、最终评分（归一化成本乘各自权重求和再除以权重总和）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点。选中标志恰好落在一行，其方案与同参数调用 `recommend_merkle_mode_weighted` 的结果逐字段相同；评分完全相同时沿用其决胜尾序（检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首）。全前沿零跨度时各行评分都是零，选中项由决胜尾序决定，明细如实反映。`weights` 不是元组或权重成员不是整数抛 `TypeError`；权重长度不符、含布尔或负数、或整项全零抛 `ValueError`；容量为布尔或越界、组内索引非法、五元预算长度或成员非法同样抛 `ValueError`；前沿规则之外的非法输入沿用其异常口径，预算下无可行方案同样抛 `ValueError`，不返回任何明细行
+- `MerkleModeScore` — 冻结的决策成本明细行值对象，八个字段按位置依次为 `workload, checkpoint_cost, peak_cost, transport_cost, steps_cost, nodes_cost, score, selected`：候选的工作负载方案对象（`MerkleTransportWorkloadProfile`）、与权重逐位对应的五项归一化成本（`Fraction`，依次为检查点字节、单组峰值、总传输字节、单签链步、节点总数）、最终评分（`Fraction`）与选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
 - `MerkleVerifyProfile` — 冻结的验签哈希成本值对象，七个字段均为 `int` 且按位置依次为 `w, height, k, wots, leaf, batch, multi`；冻结、可位置构造、按值相等（可哈希）。`k` 为叶索引数；`wots` 为全部 `k` 条 W-OTS 链步上界；`leaf` 为叶哈希数；`batch`/`multi` 分别为批次证明与多证明的内部节点 SHA-256 次数
 - `merkle_verify_profile(w, height, indices)` — 纯函数：比较同一叶集合的批次证明与多证明**验签哈希成本**，返回 `MerkleVerifyProfile`，不生成密钥、不取随机数、不修改状态。`w` 仅为 4 或 8，`height` 仅为 1..8 的非布尔整数；`indices` 须为非空、严格递增且落在 `0 .. 2**height-1` 内的非布尔整数元组。令 `k = len(indices)`：`wots` 链步上界为 `k*67*15`（`w=4`）或 `k*34*255`（`w=8`），`leaf = k`，这些 SHA-256 次数均按每叶计算，不因认证路径去重而减少；`batch = k*height`（每份证明重复完整路径），`multi = Σ(l=1..height)|{i>>l : i∈indices}|`（每层每个不同父节点仅执行一次内部节点 SHA-256）。`indices` 容器或非整数成员错型抛 `TypeError`；空元组、布尔成员、越界、重复或乱序，以及非法 `w` 或 `height` 均抛 `ValueError`
 - `MerkleVerifyWorkloadProfile` — 冻结的多组验签哈希成本汇总值对象，四个字段按位置依次为 `w, height, costs, total`，类型依次为 `int`、`int`、五元组元组 `tuple[tuple[str,int,int,int,int], ...]`、`int`；冻结、可位置构造、按值相等（可哈希）。`costs` 与输入各组同序，每项依次为模式名（`"batch"` 或 `"multiproof"`）、该组 W-OTS 链步、叶哈希数、内部节点哈希数及该组三项哈希总数；`total` 为各组总数之和，重复组分别计费
@@ -573,6 +575,8 @@ from pqattest import (
     recommend_merkle_mode_deployment,
     recommend_merkle_mode_weighted,
     recommend_merkle_mode_weighted_scenarios,
+    MerkleModeScore,
+    explain_merkle_mode_weighted,
     merkle_verify_profile,
     merkle_verify_workload_profile,
     MerkleModeCost,
@@ -777,6 +781,21 @@ recommend_merkle_mode_weighted_scenarios(
     ((1, 0, 0, 0, 0), (0, 0, 0, 0, 1)),
 )
 # MerkleTransportWorkloadProfile(..., modes=("batch", "multiproof"), ...)
+
+# 同一单权重模式推荐的决策成本明细：每个前沿候选一行，行序与模式前沿一致，
+# 依次为工作负载方案、五项归一化成本（检查点、单组峰值、总传输、单签链步、
+# 节点总数）、最终评分与选中标志；恰好一行 selected=True，其方案与
+# recommend_merkle_mode_weighted 同参数的结果逐字段相同
+explain_merkle_mode_weighted(
+    16, ((0, 1), (3, 5)), (None, 5000, 12000, None, 8), (1, 1, 1, 1, 1)
+)
+# (MerkleModeScore(workload=MerkleTransportWorkloadProfile(...),
+#   checkpoint_cost=Fraction(...), peak_cost=Fraction(...),
+#   transport_cost=Fraction(...), steps_cost=Fraction(...),
+#   nodes_cost=Fraction(...), score=Fraction(...), selected=False),
+#  ...,
+#  MerkleModeScore(workload=MerkleTransportWorkloadProfile(...), ...,
+#   score=Fraction(...), selected=True))
 
 # 验签哈希成本：同一叶集合上批次证明（每份重复完整路径）与多证明（每层
 # 每个不同父节点仅哈希一次）的 SHA-256 次数对比；纯估算，不接触任何证明

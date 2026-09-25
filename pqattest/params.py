@@ -56,6 +56,13 @@ once — checkpoint bytes, single-group peak, aggregate transport, verifier
 steps and carried nodes — minimising the worst per-scenario regret (then
 regret sum, then per-scenario scores) with the same exact
 :class:`fractions.Fraction` arithmetic, and returns one profile.
+:func:`explain_merkle_mode_weighted` exports the decision-cost breakdown
+behind that same single-weight mode ranking as a tuple of frozen
+:class:`MerkleModeScore` rows — one per frontier member, in frontier
+order, each carrying the candidate's workload plan, its five normalised
+costs (checkpoint bytes, single-group peak, aggregate transport,
+verifier steps and carried nodes), its final score and a selected flag —
+with the same exact :class:`fractions.Fraction` arithmetic.
 :func:`merkle_deployment_frontier` likewise returns the whole Pareto frontier
 of ordinary Merkle deployments under checkpoint, signature, proof and
 verifier-step budgets. :func:`recommend_merkle_deployment_weighted` ranks
@@ -152,7 +159,7 @@ Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All thirty-seven
+All thirty-eight
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -175,6 +182,7 @@ __all__ = [
     "MerkleTransportDeploymentProfile",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
+    "MerkleModeScore",
     "MerkleVerifyProfile",
     "MerkleVerifyWorkloadProfile",
     "MerkleVerifyModeScore",
@@ -214,6 +222,7 @@ __all__ = [
     "recommend_merkle_mode_deployment",
     "recommend_merkle_mode_weighted",
     "recommend_merkle_mode_weighted_scenarios",
+    "explain_merkle_mode_weighted",
     "merkle_storage_profile",
     "merkle_transport_profile",
     "merkle_verify_profile",
@@ -3187,6 +3196,156 @@ def recommend_merkle_mode_weighted_scenarios(
         )
 
     return min(zip(frontier, score_rows), key=ranking)[0]
+
+
+@dataclass(frozen=True)
+class MerkleModeScore:
+    """Frozen decision-cost breakdown for one per-group mode plan.
+
+    One row of :func:`explain_merkle_mode_weighted`'s result. Fields, in
+    positional order:
+
+    - ``workload``: the candidate's :class:`MerkleTransportWorkloadProfile`
+      workload plan (config, per-group modes and sizes and total transport);
+    - ``checkpoint_cost`` / ``peak_cost`` / ``transport_cost`` /
+      ``steps_cost`` / ``nodes_cost``: the candidate's five
+      min-max-normalised costs, in the same order as the weights —
+      checkpoint bytes, any single group's transport peak, aggregate
+      transport bytes, per-signature verifier chain steps and carried
+      multi-proof nodes — each ``(x - min) / (max - min)`` over the whole
+      frontier, with a zero span scoring ``0``;
+    - ``score``: the final weighted score — the five normalised costs
+      times their weights, summed and divided by the weight total;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_merkle_mode_weighted` would pick.
+
+    Every normalised cost and the score is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    workload: MerkleTransportWorkloadProfile
+    checkpoint_cost: Fraction
+    peak_cost: Fraction
+    transport_cost: Fraction
+    steps_cost: Fraction
+    nodes_cost: Fraction
+    score: Fraction
+    selected: bool
+
+
+def explain_merkle_mode_weighted(
+    capacity: Any,
+    groups: Any,
+    budgets: Any,
+    weights: Any,
+) -> tuple[MerkleModeScore, ...]:
+    """Export the decision-cost breakdown of the weighted mode ranking.
+
+    The explanatory counterpart of :func:`recommend_merkle_mode_weighted`:
+    it computes :func:`merkle_mode_frontier` exactly once and, instead of
+    returning only the winning plan, returns one frozen
+    :class:`MerkleModeScore` row per frontier member, in the frontier's
+    own order. Each row carries the candidate's
+    :class:`MerkleTransportWorkloadProfile` workload plan, its five
+    min-max-normalised costs in the same order as the weights — checkpoint
+    bytes (:attr:`MerkleStorageProfile.checkpoint_bytes`), any single
+    group's transport peak (the maximum of
+    :attr:`MerkleTransportWorkloadProfile.sizes`), aggregate transport
+    bytes (:attr:`MerkleTransportWorkloadProfile.total`), per-signature
+    verifier hash-chain steps (``profile("merkle", ...)``'s ``steps``) and
+    the total carried multi-proof node count, using the mode frontier's
+    definition: it accumulates the canonical node count of every group
+    carried as a multi-proof and counts ``0`` for every group carried as a
+    batch proof — the final weighted score and a ``selected`` flag.
+
+    ``weights`` must be a five-tuple in that same order — checkpoint bytes,
+    single-group peak, total transport bytes, per-signature chain steps and
+    carried nodes. Every weight must be a non-boolean, non-negative integer
+    and at least one must be positive. Each of the five costs is min-max
+    normalised over the whole frontier as ``(x - min) / (max - min)``, with
+    a zero span scoring ``0``; the score is the sum of the five normalised
+    costs times their weights, divided by the weight total, all exact
+    rationals (``fractions.Fraction``) with no floating point anywhere.
+    Exactly one row is selected: the one whose plan
+    :func:`recommend_merkle_mode_weighted` returns for the same arguments,
+    field for field — the smallest score, with equal scores broken
+    ascending by checkpoint bytes, leaf count, ``w``, ``height`` and the
+    ``modes`` tuple in lexicographic order. When every span is zero every
+    row scores ``0`` and the tie-break tail alone decides; the rows report
+    exactly that.
+
+    ``capacity``, ``groups`` and the five-tuple ``budgets`` follow
+    :func:`merkle_mode_frontier`'s types, ranges, inclusive-budget,
+    exception and no-feasible-candidate rules exactly, so a violation
+    raises exactly as that function does (and is screened before
+    ``weights``). A non-tuple ``weights`` or a non-integer member raises
+    ``TypeError``; a wrong-length tuple or a boolean, negative or all-zero
+    weight raises ``ValueError``. The function is pure: it draws no
+    randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_mode_frontier(capacity, groups, budgets)
+    validated_weights = _validate_mode_weights(weights)
+
+    def metrics(
+        workload: MerkleTransportWorkloadProfile,
+    ) -> tuple[int, int, int, int, int]:
+        nodes = sum(
+            merkle_transport_profile(
+                workload.config.w, workload.config.height, group
+            )[0]
+            for mode, group in zip(workload.modes, groups)
+            if mode == "multiproof"
+        )
+        return (
+            workload.config.checkpoint_bytes,
+            max(workload.sizes),
+            workload.total,
+            profile(
+                "merkle", w=workload.config.w, height=workload.config.height
+            ).steps,
+            nodes,
+        )
+
+    metric_rows = tuple(metrics(workload) for workload in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+    weight_total = sum(validated_weights)
+
+    entries = []
+    for workload, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        score = sum(
+            (weight * cost for weight, cost in zip(validated_weights, costs)),
+            Fraction(0),
+        ) / weight_total
+        entries.append((workload, costs, score))
+
+    def ranking(
+        entry: tuple[MerkleTransportWorkloadProfile, tuple[Fraction, ...], Fraction],
+    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
+        workload, _costs, score = entry
+        config = workload.config
+        return (
+            score,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+            workload.modes,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        MerkleModeScore(workload, *costs, score, workload is chosen)
+        for workload, costs, score in entries
+    )
 
 
 def _validate_verify_mode_budgets(budgets: Any) -> tuple[int | None, ...]:

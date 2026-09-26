@@ -418,3 +418,42 @@ def _restore_auth_state_pair(data_a: Any, data_b: Any, *, key: Any, floor: Any,
     if result is not True:
         raise ValueError("claim callback did not return True")
     return (signer_a, signer_b), generation_a
+
+
+def _authenticate_auth_state_pair(
+    data_a: Any, data_b: Any, *, key: Any, floor: Any
+) -> tuple[int, bytes, bytes]:
+    """Authenticate two v2 envelopes and return ``(generation, checkpoint_a, checkpoint_b)``.
+
+    Authentication-only counterpart of :func:`_restore_auth_state_pair` for
+    the stateless pair conversion: argument types are checked first, both
+    HMAC tags are verified with :func:`hmac.compare_digest` before a single
+    field of either envelope is parsed, the first envelope is then fixed to
+    ``"lamport"`` and the second to ``"wots"`` (each with its payload magic
+    and the generation floor applied), and their generations are required to
+    be equal. No checkpoint is restored and no claim is performed here: the
+    caller builds every output first and runs the single paired claim only
+    afterwards.
+    """
+    if not isinstance(data_a, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    if not isinstance(data_b, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if floor is not None:
+        _validate_generation(floor, "floor")
+    # Authenticate both sides first: no field of either envelope is trusted
+    # until both tags check out.
+    body_a = _auth_state_authenticate(bytes(data_a), key_bytes)
+    body_b = _auth_state_authenticate(bytes(data_b), key_bytes)
+    _, generation_a, checkpoint_a = _auth_state_parse(
+        body_a, expect="lamport", min_generation=floor
+    )
+    _, generation_b, checkpoint_b = _auth_state_parse(
+        body_b, expect="wots", min_generation=floor
+    )
+    if generation_a != generation_b:
+        raise ValueError(
+            f"lamport generation {generation_a} does not match wots generation {generation_b}"
+        )
+    return generation_a, checkpoint_a, checkpoint_b

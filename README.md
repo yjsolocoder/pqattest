@@ -184,6 +184,7 @@ Winternitz（W-OTS）：
 - `sign_ots_pair_with_checkpoint(lamport, wots, message)` — 成对快照入口：用一把 `OneTimeSigner` 与一把 `WOTSOneTimeSigner` 在同一临界区对同一条消息各签名，返回 `((lamport_signature, wots_signature), (lamport_checkpoint, wots_checkpoint))`；两份签名分别等于各自 `sign(message)` 的产出，两份检查点分别等于签后各自 `checkpoint()` 的字节（即分别调用两个 `sign_with_checkpoint` 的两半）。两侧锁按先 Lamport 后 W-OTS 的顺序一起获取，整对要么一起推进要么都不推进；任一签名器已用抛 `KeyExhaustedError` 且两侧都不消耗，消息类型非法抛 `TypeError`，不取随机数。返回的检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_checkpoint(lamport, wots, message)` — 成对证明快照入口：`sign_ots_pair_with_checkpoint` 的证明打包对应物，返回 `(pair_proof, (lamport_checkpoint, wots_checkpoint))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`；两份检查点按先 Lamport 后 W-OTS 排列，逐字节等于签后各自 `checkpoint()` 的字节。签名器或消息类型错抛 `TypeError`、任一侧已用抛 `KeyExhaustedError`，失败时两侧密钥都不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，并发下至多一个调用成功，不取随机数。检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_auth_state(lamport, wots, message, *, key, generation)` — 成对证明认证封装入口：`sign_ots_pair` 的证明打包对应物、`sign_ots_pair_proof_with_checkpoint` 的认证对应物，在同一临界区内对同一条消息两侧各签名、打包证明并把两份签后状态封装，返回 `(pair_proof, (lamport_envelope, wots_envelope))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`，两份签名分别等于两个签名器对同一消息首次 `sign(message)` 的产出；两份 v2 封装按先 Lamport 后 W-OTS 排列（`scheme="lamport"` / `scheme="wots"`，同一 `key` 与 `generation`），各等于签后检查点直接经 `auth_state_wrap` 所得字节（即与签后各自 `checkpoint()` 再封装逐字节相同）。`key` 与 `generation` 仅限关键字：`key` 须为非空 `bytes`/`bytearray`，`generation` 须为 `0..2**64-1` 的非布尔整数。全部参数在花费密钥前验证：签名器或消息类型错抛 `TypeError`，空 key 或代次越界抛 `ValueError`，任一侧已用抛 `KeyExhaustedError` 且另一侧同样不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，整对要么一起推进要么都不推进，并发下至多一个调用成功，其余得到用尽异常，不取随机数、不修改传入对象，同一初始状态重复调用输出逐字节确定。封装仅防无密钥篡改、不加密，也不防复制、重放或回滚；封装内检查点含明文私钥，落盘与防回滚均由调用方负责
+- `sign_ots_pair_proof_auth_state(a, b, message, *, key, min_generation=None, claim) -> (pair_proof, (lamport_envelope, wots_envelope), generation)` — **无隐藏状态**的「成对认证恢复 + 两侧各签一条 + 成对证明 + 下一代封装」转换，是 `sign_ots_pair_proof_with_auth_state` 的无状态对应物，把 `restore_ots_pair` 的成对恢复换成「恢复并两侧各签一条」：`a` 必须是 `scheme="lamport"`、`b` 必须是 `scheme="wots"` 的既有 v2 封装（位置固定，互换即方案不符），两者携带同一代次 `g`，`g` 必须严格小于 `2**64-1`；`message` 沿用 `bytes`/`bytearray`/`str` 规则。处理顺序固定：类型校验先于一切，随后以 `hmac.compare_digest` **常量时间验证两侧标签**（两侧标签都通过前不解析任一封装字段），再核对固定方案、载荷魔数、同代与下限，最后恢复两份 v1 检查点；恢复出的任一签名器已用尽即抛 `KeyExhaustedError`，另一侧同样不被消耗。返回固定三元组：`pair_proof` 为先 Lamport 后 W-OTS 的 `OtsPairProof`（各带本次签名与对应公钥，对原消息 `verify` 返回 `True`，两份签名分别等于两把恢复签名器对该消息各自首次 `sign(message)` 的产出，逐值相同）；两份下一代 v2 封装按先 Lamport 后 W-OTS 排列，各认证签后检查点并绑定 `g+1`，与对签后检查点直接 `auth_state_wrap` 逐字节相同；`generation` 为 `g+1`。**全部输出生成后**才以旧令牌与新令牌组成的二元组 `((("lamport", g), ("wots", g)), (("lamport", g+1), ("wots", g+1)))` **恰好调用一次** `claim`——两枚令牌沿用 `restore_ots_pair` 的成对令牌形态、代次依次为 `g` 与 `g+1`、顺序不可换——仅返回值按身份 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（错型、空 key、标签/方案不符、两侧代次不一致、低于下限、代次触顶、检查点非法、任一侧用尽、认领拒绝）都**不调用** `claim`、不返回部分结果。错型（封装/密钥非 `bytes`/`bytearray`、`min_generation` 为布尔或非整数、`claim` 不可调用、消息类型非法）抛 `TypeError`；全程不取随机数、不修改传入对象、不新增线格式或库内状态，同一输入重复调用逐字节相同。封装仅认证不加密，本身不防重放/回滚
 
 构造细节（域串 `b"pqattest/wots/v1"`）：令 `B = 2**w`，SHA-256 摘要按大端拆成 `256/w` 个基 `B` 数字；校验和为 `sum(B-1-d)`，取满足 `B**l2 > (256/w)*(B-1)` 的最小 `l2`（w=4 时 l2=3，w=8 时 l2=2），并编码为固定 `l2` 位的大端基 `B` 数字（保留前导零）。每条链始于一个随机值，链步为 `H(x) = SHA256(b"pqattest/wots/v1" + x)`；签名依次给出消息数字与校验和数字对应的第 `d` 步值（w=4 共 67 个元素、2144 字节；w=8 共 34 个元素、1088 字节），公钥保存第 `B-1` 步端点；验证时补足剩余步数并逐条比对端点。无效 `w`、令牌长度错误或元素数量/长度错误抛 `ValueError`。
 
@@ -380,6 +381,7 @@ MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # �
 - `advance_and_sign_merkle_auth_state(data, next_index, message, *, key, min_generation=None, claim) -> ((before, target), signature, envelope, generation)` — **无隐藏状态**的「认证恢复 + 跳叶作废 + 目标叶单签 + 下一代封装」转换，合并 `advance_merkle_auth_state` 的跳叶与 `sign_merkle_auth_state` 的单签：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再把恢复签名器的下一可用叶索引推进到 `next_index`（低于目标的叶子此后再不能签名），用**目标叶**对 `message`（沿用 `bytes`/`bytearray`/`str` 规则）签一条，最后把 `next_index == target + 1` 的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。返回 `((before, target), signature, envelope, generation)`：内层二元组与同目标下 `advance_to` 的返回相同（等值目标合法，返回 `(x, x)`）；`signature` 为目标叶上的 `MerkleSignature`，与「同状态先 `advance_to(target)` 再 `sign(message)`」逐值相同；`envelope` 与对签后检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`。`next_index` 须为闭区间 `[恢复状态的当前 next_index, 叶总数 - 1]` 内的非布尔整数——与 `advance_merkle_auth_state` 不同，叶总数本身**不是**合法目标（目标叶必须仍可签）；其余参数规则与 `sign_merkle_auth_state` 相同。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。倒退或越过最后一片叶抛 `ValueError`，恢复状态叶已用尽抛 `KeyExhaustedError`，入参 `g` 必须小于 `2**64-1`（否则 `ValueError`）。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（认证失败、代次低于下限、代次触顶、目标越界、叶子用尽、检查点非法、认领拒绝）都**不调用** `claim`、不推进且无部分返回。错型（`data`/`key` 非 `bytes`/`bytearray`、目标或下限为布尔/非整数、`message` 类型非法、`claim` 不可调用）抛 `TypeError`，空 key 等抛 `ValueError`
 - `advance_and_sign_merkle_auth_state_batch(data, next_index, messages, *, key, min_generation=None, claim) -> ((before, target), signatures, envelope, generation)` — **无隐藏状态**的「认证恢复 + 跳叶作废 + 自目标叶起连续批量签名 + 下一代封装」转换，是 `advance_and_sign_merkle_auth_state` 的批量对应物：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再按 `MerkleSigner.advance_to` 的既有语义把恢复签名器的下一可用叶索引推进到 `next_index`，随后按 `MerkleSigner.sign_batch` 的既有规则从**目标叶**起对 `messages` **连续**签名（一次临界区、叶索引自 `target` 起严格递增），最后把 `next_index == target + len(messages)` 的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。`messages` 必须是**非空元组**，成员沿用 `bytes`/`bytearray`/`str`（UTF-8）规则。返回 `((before, target), signatures, envelope, generation)`：内层二元组与同目标下 `advance_to` 的返回相同（等值目标合法，返回 `(x, x)`）；`signatures` 为每消息一份 `MerkleSignature` 的元组（同序、索引自 `target` 连续），与「同状态先 `advance_to(target)` 再 `sign_batch(messages)`」**逐值相同**；`envelope` 与对批签后检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`，状态只推进一代（与批长无关）。`next_index` 须为闭区间 `[恢复状态的当前 next_index, 叶总数 - 1]` 内的非布尔整数（叶总数本身**不是**合法目标，目标叶必须仍可签）；其余参数规则与 `sign_merkle_auth_state_batch` 相同。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。倒退或越过最后一片叶、空批、入参 `g` 触顶（须小于 `2**64-1`）抛 `ValueError`；目标叶可签但整批超出剩余叶数时抛 `KeyExhaustedError`。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（含错型、空批、空 key、认证失败、代次低于下限、代次触顶、目标越界、容量不足、检查点非法、认领拒绝）都**不调用** `claim`、不推进且无部分返回。错型（`data`/`key` 非 `bytes`/`bytearray`、目标或下限为布尔/非整数、`messages` 非元组或成员类型非法、`claim` 不可调用）抛 `TypeError`，空批、空 key 或其他库内拒绝抛 `ValueError`
 - `advance_and_multiproof_merkle_auth_state(data, next_index, messages, *, key, min_generation=None, claim) -> ((before, target), proof, envelope, generation)` — **无隐藏状态**的「认证恢复 + 跳叶作废 + 自目标叶起连续批量签名 + 去重多证明 + 下一代封装」转换，是 `advance_and_sign_merkle_auth_state_batch` 的多证明对应物：`data` 为 `"merkle"` 的 v2 封装（`bytes`/`bytearray`），先按既有 v2 规则用 `hmac.compare_digest` 验 HMAC、固定方案、应用代次下限并恢复原样 v1 载荷，再按 `MerkleSigner.advance_to` 的既有语义把恢复签名器的下一可用叶索引推进到 `next_index`，随后按 `MerkleSigner.sign_batch` 的既有规则从**目标叶**起对 `messages` **连续**签名（一次临界区、叶索引自 `target` 起严格递增），把恢复公钥与本批签名交给 `multiproof_encode` 压成一份去重认证路径的证明，最后把 `next_index == target + len(messages)` 的 v1 检查点以 `scheme="merkle"`、原 `key` 与 **g+1** 代次封装。`messages` 必须是**非空元组**，成员沿用 `bytes`/`bytearray`/`str`（UTF-8）规则；`next_index` 须为闭区间 `[恢复状态的当前 next_index, 叶总数 - 1]` 内的非布尔整数（叶总数本身**不是**合法目标，目标叶必须仍可签）；其余参数规则与 `advance_and_sign_merkle_auth_state_batch` 相同。返回 `((before, target), proof, envelope, generation)`：内层二元组与同目标下 `advance_to` 的返回相同（等值目标合法，返回 `(x, x)`）；`proof` 为 `bytes`，与「同状态先 `advance_to(target)` 再 `sign_batch(messages)`、再以恢复公钥调用 `multiproof_encode`」**逐字节相同**，且 `multiproof_verify(messages, proof)` 返回 `True`；`envelope` 与对批签后检查点直接调用 `auth_state_wrap` **逐字节相同**；`generation` 为 `g+1`，状态只推进一代（与批长无关）。不修改任何对象、不保留库内状态、不取随机数、不新增线格式，同一输入重复调用逐字节相同。倒退或越过最后一片叶、空批、入参 `g` 触顶（须小于 `2**64-1`）抛 `ValueError`；目标叶可签但整批超出剩余叶数时抛 `KeyExhaustedError`。**全部输出生成后**才以唯一入参 `(("merkle", g), ("merkle", g+1))` 恰好调用一次 `claim`，仅返回值 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（含错型、空批、空 key、认证失败、代次低于下限、代次触顶、目标越界、容量不足、检查点非法、认领拒绝）都**不调用** `claim`、不推进且无部分返回。错型（`data`/`key` 非 `bytes`/`bytearray`、目标或下限为布尔/非整数、`messages` 非元组或成员类型非法、`claim` 不可调用）抛 `TypeError`，空批、空 key 或其他库内拒绝抛 `ValueError`
+- `sign_ots_pair_proof_auth_state(a, b, message, *, key, min_generation=None, claim) -> (pair_proof, (lamport_envelope, wots_envelope), generation)` — Lamport/W-OTS 成对的**无隐藏状态**转换，把成对恢复 `restore_ots_pair` 的「只恢复」换成「恢复并两侧各签一条、打包成对证明、封装下一代」：`a` 为 `"lamport"` v2 封装、`b` 为 `"wots"` v2 封装（位置固定），两者同代 `g` 且 `g < 2**64-1`。先常量时间验证两侧 HMAC（两侧标签都通过前不解析任一字段），再核对方案、载荷魔数、同代与下限，然后恢复两份 v1 检查点、在一次两侧联合临界区内对同一 `message` 各签一次并打包 `OtsPairProof`（先 Lamport 后 W-OTS），再把两份签后检查点各以原 `key` 与 **g+1** 封装。返回三元组：`pair_proof`（对原消息 `verify` 为 `True`，两份签名各等于恢复签名器首次 `sign(message)` 的产出）；下一代封装二元组（先 Lamport 后 W-OTS，各与对签后检查点直接 `auth_state_wrap` 逐字节相同）；`generation = g+1`。恢复出的任一签名器已用尽抛 `KeyExhaustedError`，另一侧不被消耗。不修改对象、不取随机数、不新增线格式或库内状态，同一输入重复调用逐字节相同。**全部输出生成后**才以二元组 `((("lamport", g), ("wots", g)), (("lamport", g+1), ("wots", g+1)))`（旧成对令牌在前、新成对令牌在后，形态同 `restore_ots_pair`，顺序不可换）恰好调用一次 `claim`，仅返回值 `is True` 成功（否则 `ValueError`），回调异常原样透传；任何先前失败（错型、空 key、坏标签/坏封装、v1 或方案不符、两侧代次不一致、低于下限、代次触顶、检查点非法、任一侧用尽、认领拒绝）都**不调用** `claim`、无部分返回。错型抛 `TypeError`，空 key 等抛 `ValueError`
 
 处理顺序固定：先以 `hmac.compare_digest` 验两侧 HMAC，再核对固定方案标识、载荷魔数与（成对的）同代/代次下限，最后恢复 v1 检查点；只有这一切都成功才调用一次 `claim` 并返回。因此任何 `ValueError`（空 `key`、坏标签/坏封装、v1 封装、方案不符、载荷魔数不符、代次低于下限、成对代次不一致、检查点非法，或认领未返回 `True`）发生时，回调**从未被调用**，调用方不可能认领一个没有成功恢复的状态（也不可能只认领成对中的一侧）。错型（非字节数据/密钥、非可调用 `claim`、布尔或非整数下限）抛 `TypeError`；不新增线格式、不使用随机数、不引入任何库内状态。
 
@@ -518,6 +520,44 @@ from pqattest import advance_and_multiproof_merkle_auth_state, multiproof_verify
 assert (before, target) == (0, 5)     # 叶子 0..4 已作废
 assert generation == 8
 assert multiproof_verify((b"claim 5", b"claim 6", b"claim 7"), proof)
+```
+
+成对 Lamport/W-OTS 的无状态转换则用 `sign_ots_pair_proof_auth_state`：输入两份同代 v2 封装，输出成对证明、两份 `g+1` 封装与新代次；认领令牌是「旧成对令牌 + 新成对令牌」的二元组，沿用 `restore_ots_pair` 的形态，调用方一次原子认领即可核对两侧同代且代次恰好推进一格：
+
+```python
+from pqattest import (
+    OneTimeSigner, WOTSOneTimeSigner, keygen, wots_keygen,
+    auth_state_wrap, sign_ots_pair_proof_auth_state,
+)
+
+pair_l = OneTimeSigner(keygen()[0])
+pair_w = WOTSOneTimeSigner(wots_keygen()[0])
+blob_a = auth_state_wrap(pair_l.checkpoint(), scheme="lamport",
+                         key=key, generation=7)
+blob_b = auth_state_wrap(pair_w.checkpoint(), scheme="wots",
+                         key=key, generation=7)
+
+def claim_pair_transition(token):
+    (old, new) = token
+    # old == (("lamport", 7), ("wots", 7))
+    # new == (("lamport", 8), ("wots", 8))
+    if {side for side, _ in old} != {"lamport", "wots"}:
+        return False
+    if old[0][1] != old[1][1] or new[0][1] != new[1][1]:
+        return False                      # 两侧始终同代
+    if new[0][1] != old[0][1] + 1:
+        return False                      # 代次必须恰好推进一格
+    if old[0][1] < state["high_water"]:
+        return False                      # 回滚：拒绝，调用抛 ValueError
+    state["high_water"] = new[0][1]      # 仅在此时原子推进
+    return True
+
+pair_proof, (next_a, next_b), generation = sign_ots_pair_proof_auth_state(
+    blob_a, blob_b, b"pair claim", key=key,
+    min_generation=state["high_water"], claim=claim_pair_transition,
+)
+assert generation == 8
+assert pair_proof.verify(b"pair claim")
 ```
 
 玩具格基 KEM（教学用，**未审计，禁止生产**）：

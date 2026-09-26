@@ -3,7 +3,6 @@ import unittest
 from fractions import Fraction
 
 from pqattest import (
-    MerkleSigner,
     MerkleStorageProfile,
     merkle_deployment_frontier,
     profile,
@@ -344,12 +343,17 @@ class RecommendMerkleDeploymentWeightedTest(unittest.TestCase):
             self.assertIs(sig.parameters[name].default, inspect.Parameter.empty)
 
     def test_repeated_calls_are_deterministic(self):
-        signer = MerkleSigner(w=4, height=2)
-        for weights in _WEIGHT_SETS:
-            first = recommend_merkle_deployment_weighted(16, _BUDGETS, weights)
-            second = recommend_merkle_deployment_weighted(16, _BUDGETS, weights)
-            self.assertEqual(first, second)
-        self.assertEqual(signer.next_index, 0)
+        def exploding_token_bytes(size):
+            raise AssertionError("pure parameter analysis must not draw randomness")
+
+        import secrets
+        from unittest import mock
+
+        with mock.patch.object(secrets, "token_bytes", exploding_token_bytes):
+            for weights in _WEIGHT_SETS:
+                first = recommend_merkle_deployment_weighted(16, _BUDGETS, weights)
+                second = recommend_merkle_deployment_weighted(16, _BUDGETS, weights)
+                self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

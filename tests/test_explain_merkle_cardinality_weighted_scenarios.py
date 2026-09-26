@@ -5,7 +5,6 @@ from fractions import Fraction
 from pqattest import (
     MerkleCardinalityScenarioScore,
     MerkleModeCost,
-    MerkleSigner,
     explain_merkle_cardinality_weighted_scenarios,
     merkle_cardinality_frontier,
     profile,
@@ -509,16 +508,21 @@ class ExplainMerkleCardinalityWeightedScenariosTest(unittest.TestCase):
             self.assertIs(sig.parameters[name].default, inspect.Parameter.empty)
 
     def test_repeated_calls_are_deterministic(self):
-        signer = MerkleSigner(w=4, height=2)
-        for scenarios in _SCENARIO_SETS:
-            first = explain_merkle_cardinality_weighted_scenarios(
-                4, _SIZES, _BUDGETS, scenarios
-            )
-            second = explain_merkle_cardinality_weighted_scenarios(
-                4, _SIZES, _BUDGETS, scenarios
-            )
-            self.assertEqual(first, second)
-        self.assertEqual(signer.next_index, 0)
+        def exploding_token_bytes(size):
+            raise AssertionError("pure parameter analysis must not draw randomness")
+
+        import secrets
+        from unittest import mock
+
+        with mock.patch.object(secrets, "token_bytes", exploding_token_bytes):
+            for scenarios in _SCENARIO_SETS:
+                first = explain_merkle_cardinality_weighted_scenarios(
+                    4, _SIZES, _BUDGETS, scenarios
+                )
+                second = explain_merkle_cardinality_weighted_scenarios(
+                    4, _SIZES, _BUDGETS, scenarios
+                )
+                self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

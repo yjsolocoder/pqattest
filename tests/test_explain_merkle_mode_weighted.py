@@ -4,7 +4,6 @@ from fractions import Fraction
 
 from pqattest import (
     MerkleModeScore,
-    MerkleSigner,
     MerkleTransportWorkloadProfile,
     explain_merkle_mode_weighted,
     merkle_mode_frontier,
@@ -421,12 +420,17 @@ class ExplainMerkleModeWeightedTest(unittest.TestCase):
             self.assertIs(sig.parameters[name].default, inspect.Parameter.empty)
 
     def test_repeated_calls_are_deterministic(self):
-        signer = MerkleSigner(w=4, height=2)
-        for weights in _WEIGHT_SETS:
-            first = explain_merkle_mode_weighted(16, _GROUPS, _BUDGETS, weights)
-            second = explain_merkle_mode_weighted(16, _GROUPS, _BUDGETS, weights)
-            self.assertEqual(first, second)
-        self.assertEqual(signer.next_index, 0)
+        def exploding_token_bytes(size):
+            raise AssertionError("pure parameter analysis must not draw randomness")
+
+        import secrets
+        from unittest import mock
+
+        with mock.patch.object(secrets, "token_bytes", exploding_token_bytes):
+            for weights in _WEIGHT_SETS:
+                first = explain_merkle_mode_weighted(16, _GROUPS, _BUDGETS, weights)
+                second = explain_merkle_mode_weighted(16, _GROUPS, _BUDGETS, weights)
+                self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

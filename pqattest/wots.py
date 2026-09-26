@@ -800,3 +800,33 @@ class WOTSProof:
             return wots_verify(message, self.signature, self.public_key)
         except Exception:
             return False
+
+    def verify_bound(self, message: Any, *, public_key: Any) -> bool:
+        """Verify the embedded signature and bind the proof to the expected key.
+
+        First requires ``public_key`` to equal the :class:`WOTSPublicKey`
+        embedded in the proof, compared by value, then runs the exact
+        verification of :meth:`verify` — ``message`` is checked against
+        the embedded signature, accepting ``bytes``/``bytearray``/``str``
+        (a ``str`` is encoded as UTF-8). No wire format changes, no new
+        objects, no randomness and no state are involved.
+
+        ``public_key`` is keyword-only and must be a :class:`WOTSPublicKey`;
+        any other type raises ``TypeError``. Missing or mistyped embedded
+        fields (including values corrupted by bypassing the frozen
+        constructor), any public-key value mismatch, and any message or
+        signature mismatch return ``False`` without leaking any other
+        exception.
+        """
+        if not isinstance(public_key, WOTSPublicKey):
+            raise TypeError("public_key must be a WOTSPublicKey")
+        try:
+            if self.public_key != public_key:
+                return False
+            return self.verify(message)
+        except Exception:
+            # A bypass-constructed proof may carry arbitrary field objects
+            # whose access or comparison raises anything; the bound check
+            # reports every such malformed structure as ``False``. The
+            # external argument type error was raised before this block.
+            return False

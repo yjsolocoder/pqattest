@@ -102,6 +102,7 @@ Lamport：
 - `LamportProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `PublicKey` 与成员全为 `bytes` 的签名元组（字段类型错误抛 `TypeError`，签名比特数/元素计数与公钥不一致抛 `ValueError`）；把一把 Lamport 公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密，不取随机数、不生成密钥、不保存状态
 - `LamportProof.to_bytes()` / `LamportProof.from_bytes(data)` — 证明包的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束签名；坏魔数、未知版本、长度字段不符、截断、尾随数据、嵌套编码非法或公钥与签名交叉不一致均抛 `ValueError`，不返回半有效对象；字段被绕过冻结构造破坏时编码抛 `ValueError`，不产出畸形字节
 - `LamportProof.verify(message)` — 接受 `bytes`/`bytearray`/`str`，等价于 `verify(message, proof.signature, proof.public_key)`；只对被签署的消息返回 `True`。篡改保证只覆盖可达成的部分：消息、消息位选中的公钥分支或签名元素被改动后返回 `False`（非法消息类型同样返回 `False`，不抛异常）；**未被消息位选中的 Lamport 公钥分支不在保证之内**，须由调用方在公钥完整性层兜底
+- `LamportProof.verify_bound(message, *, public_key)` — 在 `verify(message)` 的验证之外，把证明包绑定到接收方预期公钥，即上述未被消息位选中的 Lamport 公钥分支的兜底；不新增线格式、不取随机数、不保存状态。`public_key` 仅限关键字且须为 `PublicKey`（错型抛 `TypeError`）；先把预期公钥与包内公钥逐值比较，再沿用 `verify` 校验消息，全部匹配才返回 `True`（值相等的另一实例同样通过）。包内字段缺失或错型（含绕过冻结构造器形成的畸形结构）、公钥值不等、非法消息类型、消息或签名不匹配均返回 `False` 而不泄漏其他异常
 - `KeyExhaustedError` — 已用签名器再次签名时抛出（继承 `RuntimeError`）
 
 ```python
@@ -140,9 +141,11 @@ received = LamportProof.from_bytes(blob)      # 接收方无需任何旁带参�
 assert received == proof
 assert received.verify(b"position claim")
 assert not received.verify(b"other claim")
+assert received.verify_bound(b"position claim", public_key=public_key)
 
 wproof = WOTSProof(public_key=wots_public_key, signature=wots_signature)
 assert WOTSProof.from_bytes(wproof.to_bytes()).verify(b"position claim")
+assert wproof.verify_bound(b"position claim", public_key=wots_public_key)
 ```
 
 同一消息的 Lamport 与 W-OTS 双重证明可用 `OtsPairProof` 打成一份成对证明包整体传输；接收方有预期公钥时还可用 `verify_bound` 把包内公钥逐值绑定（补上未被消息位选中的 Lamport 公钥分支那一层兜底）：
@@ -177,6 +180,7 @@ Winternitz（W-OTS）：
 - `WOTSProof(public_key, signature)` — 冻结的证明值对象，字段须分别为 `WOTSPublicKey` 与成员全为 `bytes` 的签名元组（字段类型错误抛 `TypeError`，签名链数/元素与公钥 `w` 不一致抛 `ValueError`）；把一把 W-OTS 公钥和一份签名打包成一份可**独立传输**的证明。证明包不存消息，本身不提供认证或加密，不取随机数、不生成密钥、不保存状态
 - `WOTSProof.to_bytes()` / `WOTSProof.from_bytes(data)` — 证明包的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），解析时先恢复包内公钥、再以它约束签名；坏魔数、未知版本、长度字段不符、截断、尾随数据、嵌套编码非法或公钥与签名交叉不一致均抛 `ValueError`，不返回半有效对象；字段被绕过冻结构造破坏时编码抛 `ValueError`，不产出畸形字节
 - `WOTSProof.verify(message)` — 接受 `bytes`/`bytearray`/`str`，等价于 `wots_verify(message, proof.signature, proof.public_key)`；只对被签署的消息返回 `True`，消息、公钥或签名被改动后返回 `False`（非法消息类型同样返回 `False`，不抛异常）
+- `WOTSProof.verify_bound(message, *, public_key)` — 在 `verify(message)` 的验证之外，把证明包绑定到接收方预期公钥；不新增线格式、不取随机数、不保存状态。`public_key` 仅限关键字且须为 `WOTSPublicKey`（错型抛 `TypeError`）；先把预期公钥与包内公钥逐值比较，再沿用 `verify` 校验消息，全部匹配才返回 `True`（值相等的另一实例同样通过）。包内字段缺失或错型（含绕过冻结构造器形成的畸形结构）、公钥值不等、非法消息类型、消息或签名不匹配均返回 `False` 而不泄漏其他异常
 - `OtsPairProof(lamport, wots)` — 冻结的成对证明值对象，字段须分别为 `LamportProof` 与 `WOTSProof`（错型抛 `TypeError`）；把同一消息的 Lamport 与 W-OTS 两份证明打包成一份可**独立传输**的成对证明包。证明包不存消息，本身不提供认证或加密，不取随机数、不生成密钥、不保存状态
 - `OtsPairProof.to_bytes()` / `OtsPairProof.from_bytes(data)` — 成对证明包的版本化二进制编解码；编码确定、同值同字节。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），按先 Lamport 后 W-OTS 的顺序各自由既有 v1 解析器恢复两份证明包；坏魔数、未知版本、长度字段与内容不符、截断、尾随数据或内层编码非法均抛 `ValueError`，不返回半有效对象；字段被绕过冻结构造破坏时编码抛 `ValueError`，不产出畸形字节
 - `OtsPairProof.verify(message)` — 接受 `bytes`/`bytearray`/`str`，对同一消息依次校验包内两份证明，全部通过才返回 `True`；非法消息类型、任一侧失败、字段畸形或绕过冻结构造破坏的对象均返回 `False`，不抛异常。篡改保证只覆盖可达成的部分：消息、消息位用到的公钥分支与签名元素被改动时返回 `False`；**未被消息位选中的 Lamport 公钥分支不在其内**，由调用方在公钥完整性层兜底

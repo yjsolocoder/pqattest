@@ -119,7 +119,15 @@ class RecommendTest(unittest.TestCase):
 
 class MerkleVerifyHardeningTest(unittest.TestCase):
     def setUp(self):
-        self.signer = MerkleSigner(height=4, w=4)
+        # Deterministic counter-backed tokens: no randomness is drawn, and
+        # the tree is only built to exercise merkle_verify's input hardening.
+        state = {"value": 0}
+
+        def token_bytes(size: int) -> bytes:
+            state["value"] += 1
+            return state["value"].to_bytes(8, "big").rjust(size, b"\x00")
+
+        self.signer = MerkleSigner(height=4, w=4, token_bytes=token_bytes)
         self.public_key = self.signer.public_key
         self.signature = self.signer.sign(b"message")
 

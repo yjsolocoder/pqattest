@@ -7,7 +7,10 @@ PrivateKey.to_bytes / PrivateKey.from_bytes,
 PublicKey.to_bytes / PublicKey.from_bytes,
 lamport_signature_to_bytes / lamport_signature_from_bytes, and a versioned
 state checkpoint for the signer: OneTimeSigner.checkpoint /
-OneTimeSigner.from_checkpoint; the Winternitz
+OneTimeSigner.from_checkpoint; LamportProof / WOTSProof bundle each
+one-time public key together with one signature into a single frozen,
+deterministically encoded object that can be transported and verified on
+its own; the Winternitz
 construction: wots_keygen / wots_sign / wots_verify / WOTSPrivateKey /
 WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, Merkle-aggregated W-OTS: MerkleSigner /
@@ -314,6 +317,7 @@ from .wots import (
     ELEMENT_BYTES,
     WOTSOneTimeSigner,
     WOTSPrivateKey,
+    WOTSProof,
     WOTSPublicKey,
     wots_keygen,
     wots_sign,
@@ -327,6 +331,7 @@ __all__ = [
     "ELEMENT_BYTES",
     "HASH_BYTES",
     "KeyExhaustedError",
+    "LamportProof",
     "MerkleBatchProof",
     "MerkleCardinalityScore",
     "MerkleCardinalityScenarioScore",
@@ -359,6 +364,7 @@ __all__ = [
     "ToyLatticePublicKey",
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
+    "WOTSProof",
     "WOTSPublicKey",
     "advance_and_multiproof_merkle_auth_state",
     "advance_and_sign_merkle_auth_state",
@@ -454,6 +460,10 @@ _CHECKPOINT_MAGIC = b"PQALCP\0\0"
 _CHECKPOINT_VERSION = 1
 _CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 4
 _CHECKPOINT_CHECKSUM_BYTES = 32
+
+_PROOF_MAGIC = b"PQALPRF\0"
+_PROOF_VERSION = 1
+_PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
 
 
 def _validate_bits(bits: Any) -> int:
@@ -670,6 +680,137 @@ def verify(message: Any, signature: Sequence[bytes], public_key: PublicKey) -> b
         if _secret_digest(materialised[index]) != public_key.digests[2 * index + bit]:
             return False
     return True
+
+
+def _validate_proof_fields(public_key: Any, signature: Any) -> None:
+    """Enforce the :class:`LamportProof` field types and key/signature counts."""
+    if not isinstance(public_key, PublicKey):
+        raise TypeError("public_key must be a PublicKey")
+    if not isinstance(signature, tuple):
+        raise TypeError("signature must be a tuple of 32-byte values")
+    for element in signature:
+        if not isinstance(element, bytes):
+            raise TypeError("every signature element must be bytes")
+    digests = public_key.digests
+    _validate_container(digests, "public digest")
+    bits = len(digests) // 2
+    _validate_bits(bits)
+    if len(digests) != 2 * bits:
+        raise ValueError("public key must contain exactly 2 * bits digests")
+    if len(signature) != bits:
+        raise ValueError("signature length does not match the public key's bits")
+    for element in signature:
+        if len(element) != HASH_BYTES:
+            raise ValueError(
+                f"every signature element must be exactly {HASH_BYTES} bytes"
+            )
+
+
+@dataclass(frozen=True)
+class LamportProof:
+    """Frozen, self-contained bundle of one Lamport public key and one signature.
+
+    Unlike a bare stateless signature (whose wire format needs ``bits``
+    separately), a proof carries the :class:`PublicKey` that constrains its
+    signature, so it can be transported on its own and verified with
+    :meth:`verify`. The proof stores no message and is a pure serialisation
+    container: it offers neither authentication nor encryption of the
+    wrapper itself.
+    """
+
+    public_key: PublicKey
+    signature: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        _validate_proof_fields(self.public_key, self.signature)
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 proof wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALPRF\\0"``; one version byte
+        (1); the public-key and signature lengths as 4 big-endian bytes each;
+        then the existing v1 encodings of the public key and of the signature
+        constrained by that key's ``bits``, in that order. Encoding is
+        deterministic: the same proof always produces the same bytes. Fields
+        corrupted by bypassing the frozen constructor raise ``ValueError``
+        instead of producing a malformed encoding.
+        """
+        if not isinstance(self, LamportProof):
+            raise TypeError("to_bytes must be called on a LamportProof")
+        try:
+            _validate_proof_fields(self.public_key, self.signature)
+        except (TypeError, AttributeError) as exc:
+            raise ValueError(f"corrupted proof fields: {exc}") from exc
+        key_bytes = self.public_key.to_bytes()
+        signature_bytes = lamport_signature_to_bytes(
+            self.signature, bits=self.public_key.bits
+        )
+        return (
+            _PROOF_MAGIC
+            + bytes((_PROOF_VERSION,))
+            + len(key_bytes).to_bytes(4, "big")
+            + len(signature_bytes).to_bytes(4, "big")
+            + key_bytes
+            + signature_bytes
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "LamportProof":
+        """Parse ``to_bytes()`` output back into a :class:`LamportProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The embedded public key is recovered first and then
+        constrains the signature. A bad magic, an unknown version, a length
+        field that is zero, out of bounds or disagrees with the actual
+        content, truncation, trailing data, an invalid nested encoding, or a
+        signature inconsistent with the key (a different ``bits``) raises
+        ``ValueError`` and no half-valid object is returned. The restored
+        proof is equal by value to the original.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PROOF_HEADER_BYTES:
+            raise ValueError("proof encoding is truncated")
+        if data[:8] != _PROOF_MAGIC:
+            raise ValueError("bad proof magic")
+        if data[8] != _PROOF_VERSION:
+            raise ValueError(f"unsupported proof version: {data[8]}")
+        key_length = int.from_bytes(data[9:13], "big")
+        signature_length = int.from_bytes(data[13:17], "big")
+        key_end = _PROOF_HEADER_BYTES + key_length
+        signature_end = key_end + signature_length
+        if key_length == 0 or signature_length == 0:
+            raise ValueError("a length field must not be zero")
+        if key_end > len(data) or signature_end > len(data):
+            raise ValueError("proof encoding is truncated")
+        if signature_end < len(data):
+            raise ValueError("trailing data after the proof encoding")
+        public_key = PublicKey.from_bytes(data[_PROOF_HEADER_BYTES:key_end])
+        bits, elements = lamport_signature_from_bytes(data[key_end:signature_end])
+        if bits != public_key.bits:
+            raise ValueError("signature bits do not match the public key")
+        return cls(public_key=public_key, signature=elements)
+
+    def verify(self, message: Any) -> bool:
+        """Verify the embedded signature against the embedded public key.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like :func:`verify`,
+        to which this call delegates; it returns ``True`` only for the
+        message that was actually signed. A tampered message, public key or
+        signature — including fields corrupted by bypassing the frozen
+        constructor — and an unsupported message type all return ``False``
+        instead of raising. The proof itself carries no message and cannot
+        authenticate its own origin.
+        """
+        try:
+            return verify(message, self.signature, self.public_key)
+        except Exception:
+            # A bypass-constructed proof may carry arbitrary field objects
+            # whose access or comparison raises anything, and the stateless
+            # ``verify`` raises ``TypeError`` for an unsupported message
+            # type; both are reported as ``False`` here.
+            return False
 
 
 class OneTimeSigner:

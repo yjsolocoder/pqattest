@@ -173,6 +173,10 @@ checkpoint bytes of the advanced state(s) in one locked step;
 sign_ots_pair_proof_with_checkpoint is its proof-packing counterpart,
 returning the OtsPairProof of the two fresh signatures together with the
 two raw v1 checkpoint bytes in one locked step;
+sign_ots_pair_proof_with_auth_state is the authenticated proof-packing
+counterpart of sign_ots_pair, returning the OtsPairProof of the two
+fresh signatures together with the two v2 envelopes of the advanced
+states in one locked step;
 restore_merkle_claimed does the same one-step authenticated restore and
 claim for a Merkle signer v2 envelope.
 sign_merkle_auth_state is the stateless restore-sign-wrap conversion: it
@@ -441,6 +445,7 @@ __all__ = [
     "sign_merkle_auth_state_batch",
     "sign_multiproof_merkle_auth_state",
     "sign_ots_pair",
+    "sign_ots_pair_proof_with_auth_state",
     "sign_ots_pair_proof_with_checkpoint",
     "sign_ots_pair_with_checkpoint",
     "toy_lattice_decapsulate",
@@ -1500,6 +1505,99 @@ def sign_ots_pair_proof_with_checkpoint(
             lamport._checkpoint_bytes(),
             wots._checkpoint_bytes(),
         )
+
+
+def sign_ots_pair_proof_with_auth_state(
+    lamport: Any, wots: Any, message: Any, *, key: Any, generation: Any
+) -> tuple[OtsPairProof, tuple[bytes, bytes]]:
+    """Sign one message with a Lamport/W-OTS pair, pack the proof, wrap both.
+
+    Proof-packing counterpart of :func:`sign_ots_pair` for callers that
+    keep the two one-time keys in lockstep: ``lamport`` must be a
+    :class:`OneTimeSigner` and ``wots`` a :class:`WOTSOneTimeSigner`, and
+    the single ``message`` is signed by both under one joint critical
+    section, so the pair either advances together or not at all. No new
+    wire format, randomness or library state is involved. ``key`` and
+    ``generation`` are keyword-only. Returns ``(pair_proof,
+    (lamport_envelope, wots_envelope))``: an :class:`OtsPairProof`
+    holding the :class:`LamportProof` first and the :class:`WOTSProof`
+    second, each carrying the signature produced by this call together
+    with the corresponding signer's public key, and the two
+    :func:`auth_state_wrap` v2 envelopes (``bytes``) over the v1
+    :meth:`checkpoint` bytes of each used state with ``scheme="lamport"``
+    and ``scheme="wots"`` respectively and the given ``key`` and
+    ``generation``, in the same Lamport-first order. The proof encodes
+    byte-for-byte identically to an :class:`OtsPairProof` assembled by
+    hand from the same two signatures and public keys, verifies ``True``
+    for ``message``, and each signature is value-for-value identical to
+    what the matching signer's :meth:`sign` returns for ``message`` from
+    the same state. Each envelope is byte-for-byte identical to wrapping
+    the checkpoint the matching :meth:`checkpoint` returns immediately
+    after the call.
+
+    Every argument is validated before either key is spent: ``message``
+    follows the usual ``bytes``/``bytearray``/``str`` rules; ``key`` must
+    be a non-empty ``bytes``/``bytearray`` shared secret; ``generation``
+    must be a non-boolean integer in ``0 .. 2**64 - 1``. A wrong signer,
+    message or key type (including a boolean generation) raises
+    ``TypeError``; an empty key or an out-of-range generation raises
+    ``ValueError``; an already used signer on either side raises
+    :class:`KeyExhaustedError`. Every failure leaves both ``used`` flags
+    untouched and returns no partial result — when either side is
+    already used, neither side is consumed. Both signing locks are
+    acquired together, Lamport first and W-OTS second, and the whole
+    call — both signatures, both ``used`` flips, the proof packing, both
+    snapshots and both wrappings — linearises with
+    :meth:`OneTimeSigner.sign`, :meth:`WOTSOneTimeSigner.sign` and both
+    :meth:`checkpoint` methods, so at most one concurrent caller can
+    succeed and no randomness is drawn. The envelopes are plaintext and
+    authenticated only: they protect against tampering without the key
+    but provide neither encryption nor protection against copying,
+    replay or rollback on their own, and the wrapped checkpoints still
+    carry the private keys in the clear, so confidentiality, durable
+    storage and rollback protection remain the caller's responsibility.
+    """
+    if not isinstance(lamport, OneTimeSigner):
+        raise TypeError("lamport must be a OneTimeSigner")
+    if not isinstance(wots, WOTSOneTimeSigner):
+        raise TypeError("wots must be a WOTSOneTimeSigner")
+    message = _as_bytes(message)
+    key_bytes = _validate_key(key)
+    generation_value = _validate_generation(generation, "generation")
+    with lamport._lock, wots._lock:
+        if lamport._used:
+            raise KeyExhaustedError(
+                "this lamport one-time signing key has already been used"
+            )
+        if wots._used:
+            raise KeyExhaustedError(
+                "this wots one-time signing key has already been used"
+            )
+        lamport_signature = sign(message, lamport._private_key)
+        wots_signature = wots_sign(message, wots._private_key)
+        lamport._used = True
+        wots._used = True
+        pair_proof = OtsPairProof(
+            lamport=LamportProof(
+                public_key=lamport._public_key, signature=lamport_signature
+            ),
+            wots=WOTSProof(
+                public_key=wots._public_key, signature=wots_signature
+            ),
+        )
+        lamport_envelope = auth_state_wrap(
+            lamport._checkpoint_bytes(),
+            scheme="lamport",
+            key=key_bytes,
+            generation=generation_value,
+        )
+        wots_envelope = auth_state_wrap(
+            wots._checkpoint_bytes(),
+            scheme="wots",
+            key=key_bytes,
+            generation=generation_value,
+        )
+        return pair_proof, (lamport_envelope, wots_envelope)
 
 
 def restore_merkle_claimed(

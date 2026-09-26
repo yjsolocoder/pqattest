@@ -77,6 +77,12 @@ MerkleTransportWorkloadScore rows — one per frontier member, in frontier
 order, each carrying the candidate's workload plan, its four normalised
 costs, its final score and a selected flag — again with exact Fraction
 arithmetic,
+explain_merkle_transport_workload_weighted_scenarios to export the
+multi-scenario workload ranking's decision-cost breakdown as a tuple of
+frozen MerkleTransportWorkloadScenarioScore rows — one per frontier
+member, in frontier order, each carrying the candidate's workload plan,
+its four normalised costs, its per-scenario scores and regrets and a
+selected flag — again with exact Fraction arithmetic,
 merkle_mode_frontier /
 recommend_merkle_mode_deployment,
 recommend_merkle_mode_weighted to rank that mode frontier by a five-tuple
@@ -240,6 +246,7 @@ from .params import (
     MerkleTransportDeploymentScenarioScore,
     MerkleTransportWorkloadProfile,
     MerkleTransportWorkloadScore,
+    MerkleTransportWorkloadScenarioScore,
     MerkleModeCost,
     MerkleModeScore,
     MerkleModeScenarioScore,
@@ -290,6 +297,7 @@ from .params import (
     recommend_merkle_transport_workload_weighted,
     recommend_merkle_transport_workload_weighted_scenarios,
     explain_merkle_transport_workload_weighted,
+    explain_merkle_transport_workload_weighted_scenarios,
 )
 from .toy_lattice import (
     ToyLatticeCiphertext,
@@ -331,6 +339,7 @@ __all__ = [
     "MerkleTransportDeploymentScenarioScore",
     "MerkleTransportWorkloadProfile",
     "MerkleTransportWorkloadScore",
+    "MerkleTransportWorkloadScenarioScore",
     "MerkleModeCost",
     "MerkleModeScore",
     "MerkleModeScenarioScore",
@@ -365,6 +374,7 @@ __all__ = [
     "explain_merkle_transport_deployment_weighted",
     "explain_merkle_transport_deployment_weighted_scenarios",
     "explain_merkle_transport_workload_weighted",
+    "explain_merkle_transport_workload_weighted_scenarios",
     "explain_merkle_verify_mode_weighted",
     "explain_merkle_verify_mode_deployment_weighted",
     "keygen",

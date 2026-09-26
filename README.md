@@ -515,6 +515,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_merkle_transport_deployment_weighted_scenarios(capacity, indices, budgets, scenarios)` — 为单叶集合的 `merkle_transport_deployment_frontier` 联合部署前沿补上**抗偏好漂移的多情景版本**（基线已有 `recommend_merkle_transport_deployment_weighted` 的单一固定权重选择）：同时评估多组权重情景，从同一次联合部署前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleTransportDeploymentProfile`），不新增值类型、不重复枚举或筛选候选、不改变既有前沿、既有推荐入口及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`indices` 与四元组 `budgets` 先按 `merkle_transport_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查）。`scenarios` 必须为**非空元组**，每项是覆盖批次证明字节（`batch`）、多证明字节（`multi`）、携带节点数（`nodes`）、检查点字节（`config.checkpoint_bytes`）与单签链步（`profile("merkle", ...).steps`）的五元权重；权重只能是非布尔非负整数，每个情景至少一项为正，重复情景分别计入（权重总和参与归一化）。五项成本按全前沿各自的最小值与最大值归一化（零跨度记 0），全程为精确有理数（`fractions.Fraction`，禁止浮点）；每个情景的加权和除以该情景自身的权重总和作为该情景下的得分。先求每个情景的最优得分，候选得分减去它即为该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，完全平局时按检查点字节、叶数、`w`、`height` 升序取首项。`scenarios` 或其成员非元组、权重成员非整数抛 `TypeError`；空元组、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；无可行方案也抛 `ValueError`
 - `explain_merkle_transport_deployment_weighted(capacity, indices, budgets, weights)` — 为单叶集合联合部署前沿的单一权重推荐 `recommend_merkle_transport_deployment_weighted` 补上**决策成本明细的导出入口**（基线已有该前沿与按权重选出单一方案的推荐入口，但没有明细入口，本次从零新增）：在同一次 `merkle_transport_deployment_frontier` 前沿上逐项给出每个候选的归一化成本与最终评分，返回冻结的 `MerkleTransportDeploymentScore` 行元组，行序与同参数联合部署前沿一次调用的成员顺序完全一致，不重复枚举或筛选候选、不改变既有前沿、各族推荐入口及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`indices` 与四元组 `budgets` 先按 `merkle_transport_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为五元组，依次对应批次证明字节（`batch`）、多证明字节（`multi`）、携带节点数（`nodes`）、检查点字节（`config.checkpoint_bytes`）与单签链步（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且至少一项为正。每行依次携带该候选的部署方案对象（`MerkleTransportDeploymentProfile`）、与权重逐位对应的五项归一化成本（各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、最终评分（归一化成本乘各自权重求和再除以权重总和）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点；行对象可位置构造、按值相等且可哈希。选中标志恰好落在一行，其方案与同参数调用 `recommend_merkle_transport_deployment_weighted` 的结果逐字段相同；评分完全相同时沿用其决胜尾序（检查点字节、叶数、`w`、`height` 升序取首）。全前沿零跨度时各行评分都是零，选中项由决胜尾序决定，明细如实反映。`indices`/`budgets`/`weights` 非元组抛 `TypeError`；权重长度不符、含布尔、负数或非整数成员、整组全零抛 `ValueError`；预算下无可行方案同样抛 `ValueError`，不返回任何明细行
 - `MerkleTransportDeploymentScore` — 冻结的决策成本明细行值对象，八个字段按位置依次为 `deployment, batch_cost, multi_cost, nodes_cost, checkpoint_cost, steps_cost, score, selected`：候选的部署方案对象（`MerkleTransportDeploymentProfile`）、与权重逐位对应的五项归一化成本（`Fraction`）、最终评分（`Fraction`）与选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
+- `explain_merkle_transport_deployment_weighted_scenarios(capacity, indices, budgets, scenarios)` — 为单叶集合联合部署前沿的多情景加权推荐 `recommend_merkle_transport_deployment_weighted_scenarios` 补上**决策成本明细的导出入口**（基线已有该前沿、多情景推荐与单权重明细，缺多情景版明细，本次从零新增）：在同一次 `merkle_transport_deployment_frontier` 前沿上逐项给出每个候选的归一化成本、各情景得分与后悔值，返回冻结的 `MerkleTransportDeploymentScenarioScore` 行元组，行序与同参数前沿一次调用的成员顺序完全一致，不重复枚举或筛选候选、不改变既有前沿、各族推荐入口、已有明细入口及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`indices` 与四元组 `budgets` 先按 `merkle_transport_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查），`scenarios` 规则与 `recommend_merkle_transport_deployment_weighted_scenarios` 完全一致：非空元组，每项是覆盖批次证明字节（`batch`）、多证明字节（`multi`）、携带节点数（`nodes`）、检查点字节（`config.checkpoint_bytes`）与单签链步（`profile("merkle", ...).steps`）的五元权重，权重只能是非布尔非负整数、每项至少一个正数，重复情景分别计入。每行依次携带该候选的部署方案对象（`MerkleTransportDeploymentProfile`）、与权重逐位对应的五项归一化成本（各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、与情景同序的得分元组（归一化成本乘该情景权重求和再除以该情景权重总和）、与情景同序的后悔值元组（该行得分减去该情景在全前沿上的最优得分）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点。选中标志恰好落在一行，其方案与同参数调用 `recommend_merkle_transport_deployment_weighted_scenarios` 的结果逐字段相同：沿用最坏后悔最小、后悔值总和与各情景得分元组依次决胜，平局再按既有尾键（检查点字节、叶数、`w`、`height` 升序）取首项。`scenarios` 或其成员非元组、权重成员非整数抛 `TypeError`；情景集为空、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；前沿规则之外的非法输入与预算下无可行方案同样抛 `ValueError`，不返回任何明细行
+- `MerkleTransportDeploymentScenarioScore` — 冻结的多情景决策成本明细行值对象，九个字段按位置依次为 `deployment, batch_cost, multi_cost, nodes_cost, checkpoint_cost, steps_cost, scores, regrets, selected`：候选的部署方案对象（`MerkleTransportDeploymentProfile`）、与权重逐位对应的五项归一化成本（`Fraction`）、与情景同序的得分元组与后悔值元组（各 `Fraction` 元组）及选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
 - `recommend_merkle_transport_workload(capacity, groups, budgets, prefer="compact")` — 把联合选择推广到**多个独立叶索引组**：每组各自携带一份批次证明或多证明，但共用同一棵 Merkle 树与同一 `(w, height)` 配置；返回 `MerkleTransportWorkloadProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组（一组叶索引），所选树的叶数须同时覆盖 `capacity` 与每组的最大索引加一。`budgets` 必须为四元组，按顺序分别为检查点字节、**单组**传输字节（每组所选格式线长均不得超过）、**总传输字节**（各组线长之和）及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，尺寸与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。`prefer="compact"`（默认）与 `"speed"` 均逐组取批次/多证明中**更短**者、等长取 `"multiproof"`；`"batch"` 与 `"multiproof"` 各组固定使用同名格式。配置排序：`"speed"` 先按验签步数、再按总传输字节，其余三种偏好先按总传输字节；四种偏好末段均按检查点字节、叶数、`w`、`height` 升序取首项。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
 - `MerkleTransportWorkloadProfile` — 冻结的多组工作负载选择值对象，四个字段按位置依次为 `config, modes, sizes, total`，类型依次为 `MerkleStorageProfile`、`str` 元组、`int` 元组、`int`：所选配置、每组的传输格式名（`"batch"` 或 `"multiproof"`，与输入组同序）、各组所选格式的线长（与 `modes` 逐位对齐）及各组长之和；冻结、可位置构造、按值相等（可哈希）
 - `merkle_transport_workload_frontier(capacity, groups, budgets)` — 与 `recommend_merkle_transport_workload` 同一工作负载，但**不排序取首项**，而是返回全部可行且非支配的部署，类型为 `tuple[MerkleTransportWorkloadProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组；`budgets` 必须为四元组，按顺序分别为检查点字节、单组传输字节、总传输字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，配置与步数取 `merkle_storage_profile` 与 `profile`，逐组以 `merkle_transport_profile` 取批次/多证明中更短的线长、等长取 `"multiproof"`，四项预算均须满足。支配判定：A 的 `config.checkpoint_bytes`、`total`、单签 `steps` 均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按步数、总量、检查点、叶数、`w`、`height` 稳定升序排列。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
@@ -572,6 +574,8 @@ from pqattest import (
     recommend_merkle_transport_deployment_weighted_scenarios,
     MerkleTransportDeploymentScore,
     explain_merkle_transport_deployment_weighted,
+    MerkleTransportDeploymentScenarioScore,
+    explain_merkle_transport_deployment_weighted_scenarios,
     recommend_merkle_transport_workload,
     merkle_transport_workload_frontier,
     recommend_merkle_transport_workload_weighted,
@@ -737,6 +741,27 @@ explain_merkle_transport_deployment_weighted(
 #   multi=2419), batch_cost=Fraction(0, 1), multi_cost=Fraction(0, 1),
 #   nodes_cost=Fraction(0, 1), checkpoint_cost=Fraction(0, 1),
 #   steps_cost=Fraction(1, 1), score=Fraction(1, 5), selected=True))
+
+# 单叶集合联合部署多情景推荐的决策成本明细：每个前沿候选一行，行序与前沿
+# 一致，依次为部署方案、五项归一化成本（批次证明、多证明、节点数、检查点、
+# 链步）、与情景同序的得分元组、与情景同序的后悔值元组与选中标志；恰好一行
+# selected=True，其方案与 recommend_merkle_transport_deployment_weighted_scenarios
+# 同参数的结果逐字段相同
+explain_merkle_transport_deployment_weighted_scenarios(
+    16, (3, 5), (None, None, 8000, None), ((1, 0, 0, 0, 0), (0, 0, 1, 1, 1))
+)
+# (MerkleTransportDeploymentScenarioScore(deployment=MerkleTransportDeploymentProfile(
+#   config=MerkleStorageProfile(w=4, height=4, ...), nodes=5, batch=4642,
+#   multi=4531), batch_cost=Fraction(1, 1), multi_cost=Fraction(1, 1),
+#   nodes_cost=Fraction(0, 1), checkpoint_cost=Fraction(1, 1),
+#   steps_cost=Fraction(0, 1), scores=(Fraction(1, 1), Fraction(1, 3)),
+#   regrets=(Fraction(1, 1), Fraction(0, 1)), selected=False),
+#  MerkleTransportDeploymentScenarioScore(deployment=MerkleTransportDeploymentProfile(
+#   config=MerkleStorageProfile(w=8, height=4, ...), nodes=5, batch=2530,
+#   multi=2419), batch_cost=Fraction(0, 1), multi_cost=Fraction(0, 1),
+#   nodes_cost=Fraction(0, 1), checkpoint_cost=Fraction(0, 1),
+#   steps_cost=Fraction(1, 1), scores=(Fraction(0, 1), Fraction(1, 3)),
+#   regrets=(Fraction(0, 1), Fraction(0, 1)), selected=True))
 
 # 多组工作负载：三个独立叶组共用一棵树，每组各带一份证明；预算顺序为
 # (检查点, 单组传输, 总传输, 步数)，不限的项传 None。compact 逐组择短，

@@ -2,7 +2,10 @@ import unittest
 from dataclasses import FrozenInstanceError
 
 from pqattest import (
+    PublicKey,
     WOTSProof,
+    WOTSPublicKey,
+    keygen,
     wots_keygen,
     wots_sign,
     wots_signature_to_bytes,
@@ -254,6 +257,124 @@ class WOTSProofVerifyTest(unittest.TestCase):
         _, proof2 = make_proof()
         object.__setattr__(proof2, "public_key", object())
         self.assertFalse(proof2.verify(b"position claim"))
+
+
+class WOTSProofVerifyBoundTest(unittest.TestCase):
+    def test_bound_verifies_signed_message(self):
+        public_key, proof = make_proof()
+        self.assertTrue(proof.verify_bound(b"position claim", public_key=public_key))
+
+    def test_message_types_match_plain_verify(self):
+        for message in ("claim", b"bytes claim", bytearray(b"array claim")):
+            with self.subTest(kind=type(message).__name__):
+                public_key, proof = make_proof(message=message)
+                self.assertTrue(proof.verify_bound(message, public_key=public_key))
+
+    def test_value_equal_distinct_key_accepted(self):
+        public_key, proof = make_proof()
+        other = WOTSPublicKey(w=public_key.w, elements=tuple(public_key.elements))
+        self.assertIsNot(other, public_key)
+        self.assertTrue(proof.verify_bound(b"position claim", public_key=other))
+
+    def test_key_must_be_keyword(self):
+        public_key, proof = make_proof()
+        with self.assertRaises(TypeError):
+            proof.verify_bound(b"position claim", public_key)
+
+    def test_no_extra_arguments(self):
+        public_key, proof = make_proof()
+        with self.assertRaises(TypeError):
+            proof.verify_bound(b"position claim", public_key=public_key, extra=1)
+
+    def test_wrong_key_type_raises_type_error(self):
+        lamport_public = keygen()[1]
+        _, proof = make_proof()
+        for bad in (None, 42, 4.5, "key", b"key", lamport_public, object(), ()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    proof.verify_bound(b"position claim", public_key=bad)
+
+    def test_other_w_value_key_is_value_mismatch_not_type_error(self):
+        public_key, proof = make_proof(w=4)
+        other_key, _ = make_proof(w=8, start=5000)
+        self.assertIsInstance(other_key, WOTSPublicKey)
+        self.assertFalse(proof.verify_bound(b"position claim", public_key=other_key))
+
+    def test_type_error_takes_precedence_over_other_failures(self):
+        _, proof = make_proof()
+        with self.assertRaises(TypeError):
+            proof.verify_bound(b"wrong", public_key="not-a-key")
+
+    def test_key_value_mismatch_is_false(self):
+        public_key, proof = make_proof()
+        foreign_key, _ = make_proof(start=6000)
+        self.assertFalse(
+            proof.verify_bound(b"position claim", public_key=foreign_key)
+        )
+
+    def test_wrong_message_is_false_even_with_matching_key(self):
+        public_key, proof = make_proof()
+        self.assertFalse(proof.verify_bound(b"other", public_key=public_key))
+        self.assertFalse(proof.verify_bound(None, public_key=public_key))
+
+    def test_illegal_message_type_is_false(self):
+        public_key, proof = make_proof()
+        for bad in (None, 42, 3.5, object(), ["x"]):
+            with self.subTest(bad=type(bad).__name__):
+                self.assertFalse(proof.verify_bound(bad, public_key=public_key))
+
+    def test_tampered_signature_is_false_even_with_matching_key(self):
+        public_key, proof = make_proof()
+        tampered = proof.signature[:-1] + (b"\x00" * 32,)
+        forged = WOTSProof(public_key=public_key, signature=tampered)
+        self.assertFalse(forged.verify_bound(b"position claim", public_key=public_key))
+
+    def test_malformed_bypass_constructed_proof_is_false(self):
+        public_key, proof = make_proof()
+        rogue = object.__new__(WOTSProof)
+        object.__setattr__(rogue, "public_key", "not-a-key")
+        object.__setattr__(rogue, "signature", proof.signature)
+        self.assertFalse(rogue.verify_bound(b"position claim", public_key=public_key))
+        rogue2 = object.__new__(WOTSProof)
+        object.__setattr__(rogue2, "public_key", public_key)
+        object.__setattr__(rogue2, "signature", "not-a-tuple")
+        self.assertFalse(rogue2.verify_bound(b"position claim", public_key=public_key))
+        # Fields missing entirely.
+        rogue3 = object.__new__(WOTSProof)
+        self.assertFalse(rogue3.verify_bound(b"position claim", public_key=public_key))
+
+    def test_hostile_field_objects_do_not_leak_exceptions(self):
+        class Boom:
+            def __eq__(self, other):
+                raise RuntimeError("boom")
+
+            def __ne__(self, other):
+                raise RuntimeError("boom")
+
+        _, proof = make_proof()
+        rogue = object.__new__(WOTSProof)
+        object.__setattr__(rogue, "public_key", Boom())
+        object.__setattr__(rogue, "signature", proof.signature)
+        public_key, _ = make_proof(start=9000)
+        self.assertFalse(rogue.verify_bound(b"position claim", public_key=public_key))
+
+    def test_repeated_calls_are_stable(self):
+        public_key, proof = make_proof()
+        for _ in range(5):
+            self.assertTrue(proof.verify_bound(b"position claim", public_key=public_key))
+            self.assertFalse(proof.verify_bound(b"other", public_key=public_key))
+
+    def test_round_tripped_proof_still_verifies_bound(self):
+        public_key, proof = make_proof(message=b"m")
+        restored = WOTSProof.from_bytes(proof.to_bytes())
+        self.assertEqual(restored, proof)
+        self.assertTrue(restored.verify_bound(b"m", public_key=public_key))
+
+    def test_plain_verify_unchanged(self):
+        _, proof = make_proof(message=b"m")
+        self.assertTrue(proof.verify(b"m"))
+        self.assertFalse(proof.verify(b"other"))
+        self.assertEqual(sorted(vars(proof).keys()), ["public_key", "signature"])
 
 
 if __name__ == "__main__":

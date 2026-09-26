@@ -13,7 +13,10 @@ WOTSPublicKey / WOTSOneTimeSigner / wots_signature_to_bytes /
 wots_signature_from_bytes, plus the standalone one-time proof packs
 LamportProof and WOTSProof that bundle each construction's public key and
 signature into one independently transportable, deterministic v1 byte
-block, Merkle-aggregated W-OTS: MerkleSigner /
+block, and OtsPairProof that pairs one LamportProof with one WOTSProof
+for the same message into a single independently transportable v1 byte
+block (its verify_bound binds the pair to the receiver's expected Lamport
+and W-OTS public keys), Merkle-aggregated W-OTS: MerkleSigner /
 MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
 merkle_verify / multiproof_encode / multiproof_verify /
 multiproof_verify_bound (the two proof classes' verify_bound and this
@@ -356,6 +359,7 @@ __all__ = [
     "MerkleVerifyProfile",
     "MerkleVerifyWorkloadProfile",
     "OneTimeSigner",
+    "OtsPairProof",
     "Params",
     "PrivateKey",
     "PublicKey",
@@ -464,6 +468,10 @@ _CHECKPOINT_CHECKSUM_BYTES = 32
 _PROOF_MAGIC = b"PQALPRF\0"
 _PROOF_VERSION = 1
 _PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
+
+_PAIR_PROOF_MAGIC = b"PQAOPRF\0"
+_PAIR_PROOF_VERSION = 1
+_PAIR_PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
 
 
 def _validate_bits(bits: Any) -> int:
@@ -802,6 +810,139 @@ class LamportProof:
         """
         try:
             return verify(message, self.signature, self.public_key)
+        except Exception:
+            return False
+
+
+@dataclass(frozen=True)
+class OtsPairProof:
+    """Frozen bundle of one Lamport proof and one W-OTS proof for one message.
+
+    Pairs a :class:`LamportProof` with a :class:`WOTSProof` — each already
+    carrying its own public key and signature — into a single independently
+    transportable byte block, so a receiver can check both one-time
+    signatures over the same message with one :meth:`verify` call. The pair
+    stores no message and is a pure serialisation container: it offers
+    neither authentication nor encryption of the wrapper itself, draws no
+    randomness, generates no keys and keeps no state. The two embedded
+    proofs keep their own behaviour and wire formats unchanged.
+    """
+
+    lamport: LamportProof
+    wots: WOTSProof
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lamport, LamportProof):
+            raise TypeError("lamport must be a LamportProof")
+        if not isinstance(self.wots, WOTSProof):
+            raise TypeError("wots must be a WOTSProof")
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 pair-proof wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAOPRF\\0"``; one version byte
+        (1); the Lamport-proof and W-OTS-proof lengths as 4 big-endian bytes
+        each; then the existing v1 encodings of the two embedded proofs,
+        Lamport first and W-OTS second (the inner encodings are reused
+        unchanged). Encoding is deterministic: the same pair always produces
+        the same bytes. A field corrupted by bypassing the frozen
+        constructor raises ``ValueError`` instead of producing malformed
+        bytes.
+        """
+        if not isinstance(self, OtsPairProof):
+            raise TypeError("to_bytes must be called on an OtsPairProof")
+        try:
+            lamport_bytes = self.lamport.to_bytes()
+            wots_bytes = self.wots.to_bytes()
+        except (TypeError, AttributeError) as exc:
+            raise ValueError(f"corrupted proof field: {exc}") from exc
+        return (
+            _PAIR_PROOF_MAGIC
+            + bytes((_PAIR_PROOF_VERSION,))
+            + len(lamport_bytes).to_bytes(4, "big")
+            + len(wots_bytes).to_bytes(4, "big")
+            + lamport_bytes
+            + wots_bytes
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "OtsPairProof":
+        """Parse ``to_bytes()`` output back into an :class:`OtsPairProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The two embedded proofs are recovered in order,
+        Lamport first and W-OTS second, each by its own existing v1 parser.
+        A bad magic, an unknown version, a length field that is out of
+        bounds or disagrees with the actual content, truncation, trailing
+        data, or an invalid nested proof encoding raises ``ValueError`` and
+        no half-valid object is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PAIR_PROOF_HEADER_BYTES:
+            raise ValueError("proof encoding is truncated")
+        if data[:8] != _PAIR_PROOF_MAGIC:
+            raise ValueError("bad proof magic")
+        if data[8] != _PAIR_PROOF_VERSION:
+            raise ValueError(f"unsupported proof version: {data[8]}")
+        lamport_length = int.from_bytes(data[9:13], "big")
+        wots_length = int.from_bytes(data[13:17], "big")
+        lamport_end = _PAIR_PROOF_HEADER_BYTES + lamport_length
+        wots_end = lamport_end + wots_length
+        if lamport_length == 0 or wots_length == 0:
+            raise ValueError("a length field must not be zero")
+        if lamport_end > len(data) or wots_end > len(data):
+            raise ValueError("proof encoding is truncated")
+        if wots_end < len(data):
+            raise ValueError("trailing data after the proof encoding")
+        lamport = LamportProof.from_bytes(data[_PAIR_PROOF_HEADER_BYTES:lamport_end])
+        wots = WOTSProof.from_bytes(data[lamport_end:wots_end])
+        return cls(lamport=lamport, wots=wots)
+
+    def verify(self, message: Any) -> bool:
+        """Verify both embedded proofs against the same ``message``.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like the two
+        embedded proofs' own ``verify`` methods, to which this call
+        delegates; it returns ``True`` only when both sides pass for the
+        message that was actually signed. Any change to the message, to a
+        public-key branch selected by a message bit, or to a signature
+        element, an illegal message type, or fields corrupted by bypassing
+        the frozen constructor returns ``False`` instead of raising. A
+        Lamport public-key branch not selected by any message bit is not
+        covered by this check — bind the pair to the expected keys with
+        :meth:`verify_bound` for that layer. The pair itself carries no
+        message and cannot authenticate its own origin.
+        """
+        try:
+            return self.lamport.verify(message) and self.wots.verify(message)
+        except Exception:
+            return False
+
+    def verify_bound(self, message: Any, *, lamport_key: Any, wots_key: Any) -> bool:
+        """Verify the pair and bind it to the receiver's expected public keys.
+
+        ``lamport_key`` must be a :class:`PublicKey` and ``wots_key`` a
+        :class:`WOTSPublicKey`; anything else raises ``TypeError``. Returns
+        ``True`` only when the embedded Lamport public key equals
+        ``lamport_key`` by value, the embedded W-OTS public key equals
+        ``wots_key`` by value, and :meth:`verify` passes for ``message`` —
+        this covers the public-key branches that ``verify`` alone cannot
+        reach. A key mismatch, a failed verification, an illegal message
+        type, or fields corrupted by bypassing the frozen constructor
+        returns ``False`` instead of raising.
+        """
+        if not isinstance(lamport_key, PublicKey):
+            raise TypeError("lamport_key must be a PublicKey")
+        if not isinstance(wots_key, WOTSPublicKey):
+            raise TypeError("wots_key must be a WOTSPublicKey")
+        try:
+            return (
+                self.lamport.public_key == lamport_key
+                and self.wots.public_key == wots_key
+                and self.verify(message)
+            )
         except Exception:
             return False
 

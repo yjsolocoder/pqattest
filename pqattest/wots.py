@@ -373,6 +373,46 @@ class WOTSOneTimeSigner:
         with self._lock:
             return self._checkpoint_bytes()
 
+    def sign_with_checkpoint(
+        self, message: Any
+    ) -> tuple[tuple[bytes, ...], bytes]:
+        """Sign ``message`` and snapshot the used state in one atomic step.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like :meth:`sign`.
+        Returns ``(signature, checkpoint)``: the ordinary immutable W-OTS
+        signature tuple that :meth:`sign` returns for the first call from
+        this state — value-for-value identical, drawing no extra randomness
+        — and the ``bytes`` that :meth:`checkpoint` returns for the used
+        state, taken only after the key has been marked used. The checkpoint
+        uses the existing v1 :meth:`checkpoint` format unchanged: a signer
+        restored from it has the same public key, and the used state
+        restores as used, so every call on the restored signer raises
+        :class:`~pqattest.KeyExhaustedError`. Pairing the two halves in one
+        call keeps the signature and the state it advanced to together, so a
+        caller can never match a signature against a checkpoint taken at the
+        wrong point — before the key was marked used, or by a concurrent
+        signer.
+
+        The whole call — signature, ``used`` flip and snapshot — linearises
+        with :meth:`sign` and :meth:`checkpoint` under the same lock, so a
+        concurrent observer sees the state either before the whole call or
+        after both the signature and the snapshot are complete, and at most
+        one concurrent caller succeeds. A rejected message type raises
+        ``TypeError`` without consuming the key, and an already used
+        instance raises :class:`~pqattest.KeyExhaustedError`; a failed call
+        returns no partial result and draws no randomness. The returned
+        checkpoint still carries the private key in the clear; the trailing
+        hash only detects accidental corruption and provides neither
+        authentication nor encryption, and atomic durable storage, copy and
+        rollback protection remain the caller's responsibility.
+        """
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            signature = wots_sign(message, self._private_key)
+            self._used = True
+            return signature, self._checkpoint_bytes()
+
     def sign_with_auth_state(
         self, message: Any, *, key: Any, generation: Any
     ) -> tuple[tuple[bytes, ...], bytes]:

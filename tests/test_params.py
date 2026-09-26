@@ -1,13 +1,18 @@
+import hashlib
 import unittest
 from dataclasses import FrozenInstanceError
 
 from pqattest import (
-    MerkleSigner,
+    MerklePublicKey,
+    MerkleSignature,
     Params,
+    WOTSPrivateKey,
     merkle_verify,
     profile,
     recommend,
+    wots_sign,
 )
+import pqattest.merkle as merkle_module
 
 
 class ProfileTest(unittest.TestCase):
@@ -119,9 +124,39 @@ class RecommendTest(unittest.TestCase):
 
 class MerkleVerifyHardeningTest(unittest.TestCase):
     def setUp(self):
-        self.signer = MerkleSigner(height=4, w=4)
-        self.public_key = self.signer.public_key
-        self.signature = self.signer.sign(b"message")
+        # Lightweight, randomness-free verifier fixture: deterministic W-OTS
+        # key material feeds the same leaf/node hashing MerkleSigner uses, so
+        # the parameter-analysis tests never draw secrets.token_bytes.
+        w = 4
+        height = 1
+        self.private_keys = []
+        leaves = []
+        for leaf in range(1 << height):
+            elements = tuple(
+                hashlib.sha256(f"leaf-{leaf}-chain-{i}".encode()).digest()
+                for i in range(67)
+            )
+            private_key = WOTSPrivateKey(w=w, elements=elements)
+            self.private_keys.append(private_key)
+            endpoints = tuple(
+                merkle_module._chain_walk(start, (1 << w) - 1)
+                for start in elements
+            )
+            leaves.append(merkle_module._leaf_hash(w, endpoints))
+        root = merkle_module._node_hash(leaves[0], leaves[1])
+        self.public_key = MerklePublicKey(w=w, height=height, root=root)
+        self.sibling = leaves[1]
+
+    def fresh(self):
+        return MerkleSignature(
+            index=0,
+            wots_signature=wots_sign(b"message", self.private_keys[0]),
+            auth_path=(self.sibling,),
+        )
+
+    @property
+    def signature(self):
+        return self.fresh()
 
     def corrupt(self, obj, **fields):
         for name, value in fields.items():
@@ -169,7 +204,6 @@ class MerkleVerifyHardeningTest(unittest.TestCase):
         self.assertFalse(merkle_verify(b"message", self.signature, key))
 
     def test_corrupt_signature_returns_false(self):
-        fresh = lambda: self.signer.sign(b"message")
         cases = [
             {"index": -1},
             {"index": True},
@@ -184,11 +218,11 @@ class MerkleVerifyHardeningTest(unittest.TestCase):
         ]
         for fields in cases:
             with self.subTest(fields=fields):
-                signature = self.corrupt(fresh(), **fields)
+                signature = self.corrupt(self.fresh(), **fields)
                 self.assertFalse(merkle_verify(b"message", signature, self.public_key))
 
     def test_missing_signature_field_returns_false(self):
-        signature = self.signer.sign(b"message")
+        signature = self.fresh()
         object.__delattr__(signature, "index")
         self.assertFalse(merkle_verify(b"message", signature, self.public_key))
 

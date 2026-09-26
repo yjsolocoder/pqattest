@@ -98,6 +98,7 @@ Lamport：
 - `OneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `sign(message, private_key)` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `OneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
 - `OneTimeSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；按既有 Lamport 规则原序重建私钥及公钥，公钥与原实例相等，`used` 状态也一致（未用恢复后仍只允许一签，已用恢复后任何 `sign` 都抛 `KeyExhaustedError`）。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；坏魔数、未知版本、`used` 非 0/1、私钥长度字段不符、嵌套私钥编码非法、截断、尾随数据或校验值不符，均抛 `ValueError` 且不返回实例
+- `OneTimeSigner.sign_with_checkpoint(message) -> (signature, checkpoint)` — 一次原子调用内完成签名与状态快照：返回固定顺序二元组，第一项与同实例首次 `sign(message)` 的结果逐值相同（全程不取额外随机数），第二项是签名完成、密钥标记已用后取的 v1 检查点，与随后调用 `checkpoint()` 逐字节相同（沿用既有检查点格式，不引入新格式或版本号；用它恢复的签名器公钥不变，已用状态恢复后仍抛 `KeyExhaustedError`）。`message` 沿用 `bytes`/`bytearray`/`str` 规则，非法类型抛 `TypeError` 且不消耗密钥；已用实例抛 `KeyExhaustedError`；失败无部分结果。签名、置已用与快照在与 `sign`、`checkpoint` 共用的同一把锁内一次线性化完成，并发下至多一个成功、签名与检查点不会错配
 - `KeyExhaustedError` — 已用签名器再次签名时抛出（继承 `RuntimeError`）
 
 ```python
@@ -137,6 +138,7 @@ Winternitz（W-OTS）：
 - `WOTSOneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `wots_sign` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `WOTSOneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
 - `WOTSOneTimeSigner.from_checkpoint(data)` — 从检查点恢复签名器，不取随机数；按既有 W-OTS 规则原序重建私钥及公钥，公钥与原实例相等，`used` 状态也一致（未用恢复后仍只允许一签，已用恢复后任何 `sign` 都抛 `KeyExhaustedError`）。`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`；魔数、版本、`w`、`used`（仅 0/1）、元素计数（须严格等于 `w` 对应的链数）、长度、截断、尾随数据或校验值非法，均抛 `ValueError` 且不返回实例
+- `WOTSOneTimeSigner.sign_with_checkpoint(message) -> (signature, checkpoint)` — 一次原子调用内完成签名与状态快照：返回固定顺序二元组，第一项与同实例首次 `sign(message)` 的结果逐值相同（全程不取额外随机数），第二项是签名完成、密钥标记已用后取的 v1 检查点，与随后调用 `checkpoint()` 逐字节相同（沿用既有检查点格式，不引入新格式或版本号；用它恢复的签名器公钥不变，已用状态恢复后仍抛 `KeyExhaustedError`）。`message` 沿用 `bytes`/`bytearray`/`str` 规则，非法类型抛 `TypeError` 且不消耗密钥；已用实例抛 `KeyExhaustedError`；失败无部分结果。签名、置已用与快照在与 `sign`、`checkpoint` 共用的同一把锁内一次线性化完成，并发下至多一个成功、签名与检查点不会错配
 
 构造细节（域串 `b"pqattest/wots/v1"`）：令 `B = 2**w`，SHA-256 摘要按大端拆成 `256/w` 个基 `B` 数字；校验和为 `sum(B-1-d)`，取满足 `B**l2 > (256/w)*(B-1)` 的最小 `l2`（w=4 时 l2=3，w=8 时 l2=2），并编码为固定 `l2` 位的大端基 `B` 数字（保留前导零）。每条链始于一个随机值，链步为 `H(x) = SHA256(b"pqattest/wots/v1" + x)`；签名依次给出消息数字与校验和数字对应的第 `d` 步值（w=4 共 67 个元素、2144 字节；w=8 共 34 个元素、1088 字节），公钥保存第 `B-1` 步端点；验证时补足剩余步数并逐条比对端点。无效 `w`、令牌长度错误或元素数量/长度错误抛 `ValueError`。
 
@@ -257,6 +259,28 @@ restored.sign(b"position claim")           # 成功；此后任何 sign 都抛 K
 ```
 
 **检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
+
+### Lamport/W-OTS 成对原子签名与检查点
+
+需要把 Lamport 与 W-OTS 两把一次性密钥锁步使用时，可用成对入口一次签名并取回两侧的已用状态检查点：
+
+- `sign_ots_pair_with_checkpoint(lamport, wots, message) -> ((lamport_signature, wots_signature), (lamport_checkpoint, wots_checkpoint))` — `lamport` 必须是 `OneTimeSigner`、`wots` 必须是 `WOTSOneTimeSigner`（位置固定，类型不对抛 `TypeError`），`message` 沿用 `bytes`/`bytearray`/`str` 规则。在一个联合临界区内按 Lamport 先、W-OTS 后获取两把锁，两侧签名、两侧置已用与两份快照一次完成，因此成对推进要么整体成功、要么完全不发生。返回的每个签名与同状态下对该侧单独调用 `sign_with_checkpoint(message)` 的第一项逐值相同；每份检查点与那次调用的第二项（即签名后调用 `checkpoint()`）逐字节相同，均为既有 v1 明文格式。参数在消耗任何密钥前校验：签名器或消息类型非法抛 `TypeError` 且不消耗密钥；任一侧已用抛 `KeyExhaustedError`，且两侧都不得被消耗——临界区内先检查两个已用标志再产生任一签名，故已用一侧不会导致另一侧被消耗，传入对象也不被修改。失败不留部分结果、全程不取随机数。整个调用与两侧各自的 `sign`/`checkpoint` 线性化，并发下至多一个调用成功。检查点仍为明文私钥，末尾校验值只发现意外损坏，落盘原子性、防复制与防回滚仍由调用方负责
+
+```python
+from pqattest import (
+    OneTimeSigner, WOTSOneTimeSigner,
+    keygen, wots_keygen, sign_ots_pair_with_checkpoint,
+)
+
+lamport = OneTimeSigner(keygen()[0])
+wots = WOTSOneTimeSigner(wots_keygen()[0])
+(lamport_signature, wots_signature), (lamport_blob, wots_blob) = (
+    sign_ots_pair_with_checkpoint(lamport, wots, b"position claim")
+)
+assert lamport.used and wots.used
+assert OneTimeSigner.from_checkpoint(lamport_blob).used
+assert WOTSOneTimeSigner.from_checkpoint(wots_blob).used
+```
 
 ### 带密钥的认证封装 `auth_wrap` / `auth_unwrap`
 

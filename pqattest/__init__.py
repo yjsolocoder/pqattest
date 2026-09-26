@@ -160,7 +160,14 @@ callback, so a claim can never succeed for only one side;
 sign_ots_pair signs one message with a Lamport/W-OTS signer pair under a
 joint lock and returns both signatures together with the v2 envelopes of
 the two advanced states, so the pair either advances together or not at
-all;
+all; each of the two one-time signers also offers sign_with_checkpoint,
+which signs once and returns the signature together with the v1
+checkpoint of the used state in one lock-linearised step, and
+sign_ots_pair_with_checkpoint is the plaintext-checkpoint paired
+counterpart of sign_ots_pair: it signs one message with a Lamport/W-OTS
+pair under one joint critical section and returns both signatures
+together with the two advanced-state v1 checkpoints, again all or
+nothing;
 restore_merkle_claimed does the same one-step authenticated restore and
 claim for a Merkle signer v2 envelope.
 sign_merkle_auth_state is the stateless restore-sign-wrap conversion: it
@@ -425,6 +432,7 @@ __all__ = [
     "sign_merkle_auth_state_batch",
     "sign_multiproof_merkle_auth_state",
     "sign_ots_pair",
+    "sign_ots_pair_with_checkpoint",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
     "toy_lattice_keygen",
@@ -757,6 +765,45 @@ class OneTimeSigner:
         with self._lock:
             return self._checkpoint_bytes()
 
+    def sign_with_checkpoint(
+        self, message: Any
+    ) -> tuple[tuple[bytes, ...], bytes]:
+        """Sign ``message`` and snapshot the used state in one atomic step.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like :meth:`sign`.
+        Returns ``(signature, checkpoint)``: the ordinary immutable Lamport
+        signature tuple that :meth:`sign` returns for the first call from
+        this state — value-for-value identical, drawing no extra randomness
+        — and the ``bytes`` that :meth:`checkpoint` returns for the used
+        state, taken only after the key has been marked used. The checkpoint
+        uses the existing v1 :meth:`checkpoint` format unchanged: a signer
+        restored from it has the same public key, and the used state
+        restores as used, so every call on the restored signer raises
+        :class:`KeyExhaustedError`. Pairing the two halves in one call keeps
+        the signature and the state it advanced to together, so a caller can
+        never match a signature against a checkpoint taken at the wrong point
+        — before the key was marked used, or by a concurrent signer.
+
+        The whole call — signature, ``used`` flip and snapshot — linearises
+        with :meth:`sign` and :meth:`checkpoint` under the same lock, so a
+        concurrent observer sees the state either before the whole call or
+        after both the signature and the snapshot are complete, and at most
+        one concurrent caller succeeds. A rejected message type raises
+        ``TypeError`` without consuming the key, and an already used
+        instance raises :class:`KeyExhaustedError`; a failed call returns no
+        partial result and draws no randomness. The returned checkpoint
+        still carries the private key in the clear; the trailing hash only
+        detects accidental corruption and provides neither authentication
+        nor encryption, and atomic durable storage, copy and rollback
+        protection remain the caller's responsibility.
+        """
+        with self._lock:
+            if self._used:
+                raise KeyExhaustedError("this one-time signing key has already been used")
+            signature = sign(message, self._private_key)
+            self._used = True
+            return signature, self._checkpoint_bytes()
+
     def sign_with_auth_state(
         self, message: Any, *, key: Any, generation: Any
     ) -> tuple[tuple[bytes, ...], bytes]:
@@ -1015,6 +1062,73 @@ def sign_ots_pair(
             generation=generation_value,
         )
         return (lamport_signature, wots_signature), (lamport_envelope, wots_envelope)
+
+
+def sign_ots_pair_with_checkpoint(
+    lamport: Any, wots: Any, message: Any
+) -> tuple[tuple[tuple[bytes, ...], tuple[bytes, ...]], tuple[bytes, bytes]]:
+    """Sign one message with a Lamport/W-OTS pair and snapshot both used states.
+
+    Paired counterpart of :meth:`OneTimeSigner.sign_with_checkpoint` and
+    :meth:`WOTSOneTimeSigner.sign_with_checkpoint` for callers that keep the
+    two one-time keys in lockstep: ``lamport`` must be a
+    :class:`OneTimeSigner` and ``wots`` a :class:`WOTSOneTimeSigner`, and the
+    single ``message`` follows the usual ``bytes``/``bytearray``/``str``
+    rules and is signed by both under one joint critical section, so the
+    pair either advances together or not at all. No new wire format,
+    randomness or library state is involved. Returns
+    ``((lamport_signature, wots_signature), (lamport_checkpoint,
+    wots_checkpoint))``: the two ordinary immutable signature tuples, each
+    value-for-value identical to the first half of the corresponding
+    signer's :meth:`~OneTimeSigner.sign_with_checkpoint` on ``message`` from
+    the same state, and the two plaintext v1 checkpoints (``bytes``) of the
+    used states, each byte-for-byte identical to the second half of that
+    same call — and therefore to calling :meth:`checkpoint` immediately
+    after signing. Both checkpoints keep their existing v1 formats, so a
+    signer restored from either has the same public key and restores as
+    used, raising :class:`KeyExhaustedError` on every later call.
+
+    Every argument is validated before either key is spent. A wrong signer
+    or message type raises ``TypeError``; an already used signer on either
+    side raises :class:`KeyExhaustedError` inside the joint critical
+    section, where both ``used`` flags are checked before either signature
+    is produced, so when one side is used neither side is consumed and no
+    passed object is modified. Every failure returns no partial result.
+    Both signing locks are acquired together, Lamport first and W-OTS
+    second, and the whole call — both signatures, both ``used`` flips and
+    both snapshots — linearises with :meth:`OneTimeSigner.sign`,
+    :meth:`WOTSOneTimeSigner.sign`, both :meth:`checkpoint` methods and
+    :func:`sign_ots_pair`, so at most one concurrent caller can succeed and
+    no randomness is drawn. The checkpoints still carry the private keys in
+    the clear; their trailing hashes only detect accidental corruption and
+    provide neither authentication nor encryption, and atomic durable
+    storage, copy and rollback protection remain the caller's
+    responsibility.
+    """
+    if not isinstance(lamport, OneTimeSigner):
+        raise TypeError("lamport must be a OneTimeSigner")
+    if not isinstance(wots, WOTSOneTimeSigner):
+        raise TypeError("wots must be a WOTSOneTimeSigner")
+    message = _as_bytes(message)
+    with lamport._lock, wots._lock:
+        if lamport._used:
+            raise KeyExhaustedError(
+                "this lamport one-time signing key has already been used"
+            )
+        if wots._used:
+            raise KeyExhaustedError(
+                "this wots one-time signing key has already been used"
+            )
+        lamport_signature = sign(message, lamport._private_key)
+        wots_signature = wots_sign(message, wots._private_key)
+        lamport._used = True
+        wots._used = True
+        lamport_checkpoint = lamport._checkpoint_bytes()
+        wots_checkpoint = wots._checkpoint_bytes()
+        return (
+            (lamport_signature, wots_signature),
+            (lamport_checkpoint, wots_checkpoint),
+        )
 
 
 def restore_merkle_claimed(

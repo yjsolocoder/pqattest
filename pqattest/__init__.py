@@ -177,6 +177,13 @@ sign_ots_pair_proof_with_auth_state is the authenticated counterpart of
 that proof-packing entry, returning the same OtsPairProof together with
 the two v2 auth_state_wrap envelopes of the advanced states (Lamport
 first, W-OTS second) in one locked step;
+sign_ots_pair_proof_auth_state is the stateless restore-sign-wrap
+conversion for the pair: it authenticates two same-generation v2
+envelopes (Lamport first, W-OTS second), restores both signers, signs
+one message with each, packs the same OtsPairProof, wraps both advanced
+checkpoints at generation g+1 and, only once every output exists,
+performs one paired claim over the (g, g+1) transition — it keeps no
+hidden state and changes no old interface or wire byte;
 restore_merkle_claimed does the same one-step authenticated restore and
 claim for a Merkle signer v2 envelope.
 sign_merkle_auth_state is the stateless restore-sign-wrap conversion: it
@@ -230,6 +237,8 @@ from typing import Any, Callable, Sequence
 
 from ._errors import KeyExhaustedError
 from .auth import (
+    _auth_state_authenticate,
+    _auth_state_parse,
     _restore_auth_state,
     _restore_auth_state_pair,
     _validate_claim,
@@ -445,6 +454,7 @@ __all__ = [
     "sign_merkle_auth_state_batch",
     "sign_multiproof_merkle_auth_state",
     "sign_ots_pair",
+    "sign_ots_pair_proof_auth_state",
     "sign_ots_pair_proof_with_auth_state",
     "sign_ots_pair_proof_with_checkpoint",
     "sign_ots_pair_with_checkpoint",
@@ -1597,6 +1607,145 @@ def sign_ots_pair_proof_with_auth_state(
             generation=generation_value,
         )
         return pair_proof, (lamport_envelope, wots_envelope)
+
+
+def sign_ots_pair_proof_auth_state(
+    a: Any, b: Any, message: Any, *, key: Any, floor: Any = None, claim: Any
+) -> tuple[OtsPairProof, tuple[bytes, bytes], int]:
+    """Restore a Lamport/W-OTS v2 envelope pair, sign, pack and re-wrap.
+
+    The stateless restore-sign-wrap conversion for the one-time signer pair,
+    combining :func:`restore_ots_pair` and
+    :func:`sign_ots_pair_proof_with_auth_state` in one call without mutating
+    any passed-in object, keeping any library state or introducing a new wire
+    format: ``a`` must be a v2 :func:`auth_state_wrap` envelope with
+    ``scheme="lamport"`` and ``b`` one with ``scheme="wots"``, both carrying
+    the same generation ``g``; the two restored signers each sign the single
+    ``message`` exactly like :func:`sign_ots_pair_proof_with_auth_state`
+    would from the same states. ``key``, ``floor`` and ``claim`` are
+    keyword-only; only ``floor`` has a default (``None``, no floor). Returns
+    ``(pair_proof, (lamport_envelope, wots_envelope), generation)``: an
+    :class:`OtsPairProof` holding the :class:`LamportProof` first and the
+    :class:`WOTSProof` second, each carrying the signature produced by this
+    call together with the corresponding signer's public key (each signature
+    is value-for-value identical to what the matching restored signer's
+    :meth:`sign` returns for ``message`` as its first signature, and the
+    proof verifies ``True`` for ``message``); the two
+    :func:`auth_state_wrap` v2 envelopes (``bytes``) over the v1
+    :meth:`checkpoint` bytes of each used state with ``scheme="lamport"``
+    and ``scheme="wots"`` respectively, the original ``key`` and generation
+    ``g + 1``, in the same Lamport-first order — each byte-for-byte identical
+    to signing with the restored signer and then wrapping an explicit
+    checkpoint; and the new generation ``g + 1`` as a plain ``int``.
+
+    ``a`` and ``b`` must each be ``bytes`` or ``bytearray``; ``key`` must be
+    a non-empty ``bytes``/``bytearray`` shared secret; ``message`` follows
+    the usual ``bytes``/``bytearray``/``str`` rules; ``floor`` must be
+    ``None`` or a non-boolean integer in ``0 .. 2**64 - 1`` and, when given,
+    both generations must be at least that high; ``claim`` must be callable.
+    Every argument's type is validated before anything else: a wrong type
+    (including a boolean floor or a non-callable claim) raises ``TypeError``
+    and neither key is consumed nor the callback invoked. Both envelopes'
+    v2 HMAC tags are then verified with :func:`hmac.compare_digest` —
+    neither envelope's fields are parsed until both tags check out; the
+    fixed schemes, the common generation and the floor are checked next. An
+    empty key, a bad tag or envelope on either side, wrong schemes
+    (including a v1 envelope), differing generations, a generation below the
+    floor, or a common generation ``g`` at the uint64 ceiling (it must be
+    strictly below ``2**64 - 1`` so ``g + 1`` fits) raises ``ValueError``.
+    A restored signer that is already used on either side raises
+    :class:`KeyExhaustedError` and the other side is not consumed either.
+    Both v1 checkpoints are restored and every output — both signatures,
+    both ``used`` flips, the proof packing, both snapshots and both
+    wrappings — is built before the claim, and only then is ``claim``
+    called exactly once with the 2-tuple of the old and new paired tokens
+    ``((("lamport", g), ("wots", g)), (("lamport", g + 1), ("wots", g + 1)))``
+    — each token in the same shape :func:`restore_ots_pair` claims, in that
+    fixed old-then-new order; the call succeeds only when that return value
+    ``is True`` (any other value raises ``ValueError``), and any exception
+    ``claim`` raises propagates untouched. No earlier failure invokes the
+    callback or returns a partial result, no randomness is drawn and the
+    same inputs always produce byte-identical outputs. The envelopes are
+    plaintext and authenticated only; they provide neither encryption nor
+    protection against replay or rollback on their own.
+    """
+    if not isinstance(a, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    if not isinstance(b, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if floor is not None:
+        _validate_generation(floor, "floor")
+    claim_callable = _validate_claim(claim)
+    message = _as_bytes(message)
+
+    # Authenticate both sides first: no field of either envelope is trusted
+    # until both tags check out.
+    body_a = _auth_state_authenticate(bytes(a), key_bytes)
+    body_b = _auth_state_authenticate(bytes(b), key_bytes)
+    _, generation_a, checkpoint_a = _auth_state_parse(
+        body_a, expect="lamport", min_generation=floor
+    )
+    _, generation_b, checkpoint_b = _auth_state_parse(
+        body_b, expect="wots", min_generation=floor
+    )
+    if generation_a != generation_b:
+        raise ValueError(
+            f"lamport generation {generation_a} does not match wots generation {generation_b}"
+        )
+    generation = generation_a
+    if generation >= 2**64 - 1:
+        raise ValueError("generation must be below 2**64-1 so it can advance by one")
+    next_generation = generation + 1
+    lamport = OneTimeSigner.from_checkpoint(checkpoint_a)
+    wots = WOTSOneTimeSigner.from_checkpoint(checkpoint_b)
+    # Build every output before the claim: an exhausted signer on either
+    # side or any failure here must leave no partial result, consume
+    # neither restored key and must not call claim.
+    with lamport._lock, wots._lock:
+        if lamport._used:
+            raise KeyExhaustedError(
+                "this lamport one-time signing key has already been used"
+            )
+        if wots._used:
+            raise KeyExhaustedError(
+                "this wots one-time signing key has already been used"
+            )
+        lamport_signature = sign(message, lamport._private_key)
+        wots_signature = wots_sign(message, wots._private_key)
+        lamport._used = True
+        wots._used = True
+        pair_proof = OtsPairProof(
+            lamport=LamportProof(
+                public_key=lamport._public_key, signature=lamport_signature
+            ),
+            wots=WOTSProof(
+                public_key=wots._public_key, signature=wots_signature
+            ),
+        )
+        envelopes = (
+            auth_state_wrap(
+                lamport._checkpoint_bytes(),
+                scheme="lamport",
+                key=key_bytes,
+                generation=next_generation,
+            ),
+            auth_state_wrap(
+                wots._checkpoint_bytes(),
+                scheme="wots",
+                key=key_bytes,
+                generation=next_generation,
+            ),
+        )
+    result = claim_callable(
+        (
+            (("lamport", generation), ("wots", generation)),
+            (("lamport", next_generation), ("wots", next_generation)),
+        )
+    )
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return pair_proof, envelopes, next_generation
 
 
 def restore_merkle_claimed(

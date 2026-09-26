@@ -48,6 +48,12 @@ Fraction arithmetic,
 recommend_merkle_transport_deployment_weighted_scenarios to rank that same
 frontier by the smallest worst-case regret over a non-empty tuple of such
 five-weight scenarios, again with exact Fraction arithmetic,
+explain_merkle_transport_deployment_weighted to export that same
+single-weight joint-deployment ranking's decision-cost breakdown as a
+tuple of frozen MerkleTransportDeploymentScore rows — one per frontier
+member, in frontier order, each carrying the candidate's deployment
+profile, its five normalised costs, its final score and a selected flag —
+again with exact Fraction arithmetic,
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
 merkle_transport_workload_frontier /
 recommend_merkle_transport_workload_weighted to rank that workload
@@ -218,6 +224,7 @@ from .params import (
     MerkleDeploymentScenarioScore,
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
+    MerkleTransportDeploymentScore,
     MerkleTransportWorkloadProfile,
     MerkleModeCost,
     MerkleModeScore,
@@ -263,6 +270,7 @@ from .params import (
     recommend_merkle_transport_deployment,
     recommend_merkle_transport_deployment_weighted,
     recommend_merkle_transport_deployment_weighted_scenarios,
+    explain_merkle_transport_deployment_weighted,
     recommend_merkle_transport_workload,
     recommend_merkle_transport_workload_weighted,
     recommend_merkle_transport_workload_weighted_scenarios,
@@ -303,6 +311,7 @@ __all__ = [
     "MerkleSigner",
     "MerkleStorageProfile",
     "MerkleTransportDeploymentProfile",
+    "MerkleTransportDeploymentScore",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
     "MerkleModeScore",
@@ -335,6 +344,7 @@ __all__ = [
     "explain_merkle_deployment_weighted_scenarios",
     "explain_merkle_mode_weighted",
     "explain_merkle_mode_weighted_scenarios",
+    "explain_merkle_transport_deployment_weighted",
     "explain_merkle_verify_mode_weighted",
     "explain_merkle_verify_mode_deployment_weighted",
     "keygen",

@@ -36,6 +36,7 @@ __all__ = [
     "ELEMENT_BYTES",
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
+    "WOTSProof",
     "WOTSPublicKey",
     "wots_keygen",
     "wots_sign",
@@ -58,6 +59,10 @@ _PUBLIC_KEY_MAGIC = b"PQAWPUB\0"
 _SIGNATURE_MAGIC = b"PQAWSIG\0"
 _CODEC_VERSION = 1
 _CODEC_HEADER_BYTES = 8 + 1 + 1 + 2
+
+_PROOF_MAGIC = b"PQAWPRF\0"
+_PROOF_VERSION = 1
+_PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
 
 
 def _as_bytes(message: Any) -> bytes:
@@ -667,3 +672,131 @@ def wots_signature_from_bytes(data: Any) -> tuple[int, tuple[bytes, ...]]:
     ready for :func:`wots_verify`.
     """
     return _decode_v1(data, _SIGNATURE_MAGIC, "signature")
+
+
+def _wots_signature_matches_key(signature: Any, public_key: Any) -> bool:
+    """Non-raising parameter/count check for a W-OTS proof pair."""
+    if not isinstance(public_key, WOTSPublicKey):
+        return False
+    try:
+        w = _validate_w(public_key.w)
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(signature, tuple) or len(signature) != _chain_count(w):
+        return False
+    return all(
+        isinstance(element, bytes) and len(element) == ELEMENT_BYTES
+        for element in signature
+    )
+
+
+@dataclass(frozen=True)
+class WOTSProof:
+    """Frozen, self-contained bundle of one W-OTS public key and one signature.
+
+    Unlike a bare signature tuple (whose wire encoding needs ``w`` supplied
+    separately), a proof carries the :class:`WOTSPublicKey` that constrains
+    its signature, so it can be transported on its own as a single byte block
+    and verified with :meth:`verify`. The proof stores no message and is a
+    pure serialisation container: it offers neither authentication nor
+    encryption of the wrapper itself, draws no randomness, generates
+    no keys and keeps no state.
+    """
+
+    public_key: WOTSPublicKey
+    signature: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.public_key, WOTSPublicKey):
+            raise TypeError("public_key must be a WOTSPublicKey")
+        if not isinstance(self.signature, tuple):
+            raise TypeError("signature must be a tuple of 32-byte values")
+        if not all(isinstance(element, bytes) for element in self.signature):
+            raise TypeError("every signature element must be bytes")
+        if not _wots_signature_matches_key(self.signature, self.public_key):
+            raise ValueError(
+                "signature chain count or elements do not match the public key"
+            )
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 proof wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQAWPRF\\0"``; one version byte
+        (1); the public-key and signature lengths as 4 big-endian bytes each;
+        then the existing v1 encodings of the public key and of the signature
+        constrained by that key, in that order (the inner encodings are
+        reused unchanged). Encoding is deterministic: the same proof always
+        produces the same bytes. A field corrupted by bypassing the frozen
+        constructor raises ``ValueError`` instead of producing malformed
+        bytes.
+        """
+        if not isinstance(self, WOTSProof):
+            raise TypeError("to_bytes must be called on a WOTSProof")
+        try:
+            key_bytes = self.public_key.to_bytes()
+            signature_bytes = wots_signature_to_bytes(
+                self.signature, w=self.public_key.w
+            )
+        except (TypeError, AttributeError) as exc:
+            raise ValueError(f"corrupted proof field: {exc}") from exc
+        return (
+            _PROOF_MAGIC
+            + bytes((_PROOF_VERSION,))
+            + len(key_bytes).to_bytes(4, "big")
+            + len(signature_bytes).to_bytes(4, "big")
+            + key_bytes
+            + signature_bytes
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "WOTSProof":
+        """Parse ``to_bytes()`` output back into a :class:`WOTSProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The embedded public key is recovered first and then
+        constrains the signature. A bad magic, an unknown version, a length
+        field that is out of bounds or disagrees with the actual content,
+        truncation, trailing data, an invalid nested encoding, or a signature
+        inconsistent with the key (wrong ``w`` or chain count) raises
+        ``ValueError`` and no half-valid object is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PROOF_HEADER_BYTES:
+            raise ValueError("proof encoding is truncated")
+        if data[:8] != _PROOF_MAGIC:
+            raise ValueError("bad proof magic")
+        if data[8] != _PROOF_VERSION:
+            raise ValueError(f"unsupported proof version: {data[8]}")
+        key_length = int.from_bytes(data[9:13], "big")
+        signature_length = int.from_bytes(data[13:17], "big")
+        key_end = _PROOF_HEADER_BYTES + key_length
+        signature_end = key_end + signature_length
+        if key_length == 0 or signature_length == 0:
+            raise ValueError("a length field must not be zero")
+        if key_end > len(data) or signature_end > len(data):
+            raise ValueError("proof encoding is truncated")
+        if signature_end < len(data):
+            raise ValueError("trailing data after the proof encoding")
+        public_key = WOTSPublicKey.from_bytes(data[_PROOF_HEADER_BYTES:key_end])
+        w, signature = wots_signature_from_bytes(data[key_end:signature_end])
+        if w != public_key.w:
+            raise ValueError("signature w does not match the public key")
+        return cls(public_key=public_key, signature=signature)
+
+    def verify(self, message: Any) -> bool:
+        """Verify the embedded signature against the embedded public key.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like
+        :func:`wots_verify`, to which this call delegates; it returns
+        ``True`` only for the message that was actually signed. Any change to
+        the message, public key or signature, an illegal message type, or
+        fields corrupted by bypassing the frozen constructor returns
+        ``False`` instead of raising. The proof itself carries no message and
+        cannot authenticate its own origin.
+        """
+        try:
+            return wots_verify(message, self.signature, self.public_key)
+        except Exception:
+            return False

@@ -10,6 +10,16 @@ from pqattest import (
 )
 
 
+def counter_tokens(start: int = 0):
+    state = {"value": start}
+
+    def token_bytes(size: int) -> bytes:
+        state["value"] += 1
+        return state["value"].to_bytes(8, "big").rjust(size, b"\x00")
+
+    return token_bytes
+
+
 class ProfileTest(unittest.TestCase):
     def test_lamport(self):
         params = profile("lamport")
@@ -119,7 +129,7 @@ class RecommendTest(unittest.TestCase):
 
 class MerkleVerifyHardeningTest(unittest.TestCase):
     def setUp(self):
-        self.signer = MerkleSigner(height=4, w=4)
+        self.signer = MerkleSigner(height=4, w=4, token_bytes=counter_tokens())
         self.public_key = self.signer.public_key
         self.signature = self.signer.sign(b"message")
 

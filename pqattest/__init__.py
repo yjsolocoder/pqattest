@@ -54,6 +54,12 @@ MerkleTransportDeploymentScore rows — one per frontier member, in frontier
 order, each carrying the candidate's deployment, its five normalised
 costs, its final score and a selected flag — again with exact Fraction
 arithmetic,
+explain_merkle_transport_deployment_weighted_scenarios to export the
+multi-scenario joint-deployment ranking's decision-cost breakdown as a
+tuple of frozen MerkleTransportDeploymentScenarioScore rows — one per
+frontier member, in frontier order, each carrying the candidate's
+deployment, its five normalised costs, its per-scenario scores and
+regrets and a selected flag — again with exact Fraction arithmetic,
 recommend_merkle_transport_workload / MerkleTransportWorkloadProfile /
 merkle_transport_workload_frontier /
 recommend_merkle_transport_workload_weighted to rank that workload
@@ -225,6 +231,7 @@ from .params import (
     MerkleStorageProfile,
     MerkleTransportDeploymentProfile,
     MerkleTransportDeploymentScore,
+    MerkleTransportDeploymentScenarioScore,
     MerkleTransportWorkloadProfile,
     MerkleModeCost,
     MerkleModeScore,
@@ -271,6 +278,7 @@ from .params import (
     recommend_merkle_transport_deployment_weighted,
     recommend_merkle_transport_deployment_weighted_scenarios,
     explain_merkle_transport_deployment_weighted,
+    explain_merkle_transport_deployment_weighted_scenarios,
     recommend_merkle_transport_workload,
     recommend_merkle_transport_workload_weighted,
     recommend_merkle_transport_workload_weighted_scenarios,
@@ -312,6 +320,7 @@ __all__ = [
     "MerkleStorageProfile",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportDeploymentScore",
+    "MerkleTransportDeploymentScenarioScore",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
     "MerkleModeScore",
@@ -345,6 +354,7 @@ __all__ = [
     "explain_merkle_mode_weighted",
     "explain_merkle_mode_weighted_scenarios",
     "explain_merkle_transport_deployment_weighted",
+    "explain_merkle_transport_deployment_weighted_scenarios",
     "explain_merkle_verify_mode_weighted",
     "explain_merkle_verify_mode_deployment_weighted",
     "keygen",

@@ -27,6 +27,13 @@ as a tuple of frozen :class:`MerkleTransportDeploymentScore` rows — one
 per frontier member, in frontier order, each carrying the candidate's
 deployment, its five normalised costs, its final score and a selected
 flag — with the same exact :class:`fractions.Fraction` arithmetic.
+:func:`explain_merkle_transport_deployment_weighted_scenarios` exports
+the decision-cost breakdown behind the multi-scenario joint-deployment
+ranking as a tuple of frozen
+:class:`MerkleTransportDeploymentScenarioScore` rows — one per frontier
+member, in frontier order, each carrying the candidate's deployment, its
+five normalised costs, its per-scenario scores and regrets and a selected
+flag — with the same exact :class:`fractions.Fraction` arithmetic.
 :func:`recommend_merkle_transport_workload`
 extends that joint choice to several independent leaf-index groups, each carried
 in its own transport, under checkpoint, per-group, aggregate and verifier-step
@@ -170,7 +177,7 @@ Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All forty
+All forty-one
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -192,6 +199,7 @@ __all__ = [
     "MerkleDeploymentScenarioScore",
     "MerkleTransportDeploymentProfile",
     "MerkleTransportDeploymentScore",
+    "MerkleTransportDeploymentScenarioScore",
     "MerkleTransportWorkloadProfile",
     "MerkleModeCost",
     "MerkleModeScore",
@@ -220,6 +228,7 @@ __all__ = [
     "recommend_merkle_transport_deployment_weighted",
     "recommend_merkle_transport_deployment_weighted_scenarios",
     "explain_merkle_transport_deployment_weighted",
+    "explain_merkle_transport_deployment_weighted_scenarios",
     "recommend_merkle_transport_workload",
     "merkle_transport_workload_frontier",
     "recommend_merkle_transport_workload_weighted",
@@ -2212,6 +2221,193 @@ def explain_merkle_transport_deployment_weighted(
             deployment, *costs, score, deployment is chosen
         )
         for deployment, costs, score in entries
+    )
+
+
+@dataclass(frozen=True)
+class MerkleTransportDeploymentScenarioScore:
+    """Frozen multi-scenario breakdown for one joint Merkle deployment.
+
+    One row of
+    :func:`explain_merkle_transport_deployment_weighted_scenarios`'s
+    result. Fields, in positional order:
+
+    - ``deployment``: the candidate's
+      :class:`MerkleTransportDeploymentProfile`;
+    - ``batch_cost`` / ``multi_cost`` / ``nodes_cost`` /
+      ``checkpoint_cost`` / ``steps_cost``: the candidate's five
+      min-max-normalised costs, in the same order as the weights —
+      batch-proof wire bytes, multi-proof wire bytes, carried multi-proof
+      nodes, checkpoint bytes and per-signature verifier chain steps —
+      each ``(x - min) / (max - min)`` over the whole frontier, with a
+      zero span scoring ``0``;
+    - ``scores``: the per-scenario weighted scores, in the same order as
+      the input scenarios — each the five normalised costs times that
+      scenario's weights, summed and divided by the scenario's weight
+      total;
+    - ``regrets``: the per-scenario regrets, in the same order — each
+      score minus that scenario's best score over the whole frontier;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_merkle_transport_deployment_weighted_scenarios`
+      would pick.
+
+    Every normalised cost, score and regret is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    deployment: MerkleTransportDeploymentProfile
+    batch_cost: Fraction
+    multi_cost: Fraction
+    nodes_cost: Fraction
+    checkpoint_cost: Fraction
+    steps_cost: Fraction
+    scores: tuple[Fraction, ...]
+    regrets: tuple[Fraction, ...]
+    selected: bool
+
+
+def explain_merkle_transport_deployment_weighted_scenarios(
+    capacity: Any,
+    indices: Any,
+    budgets: Any,
+    scenarios: Any,
+) -> tuple[MerkleTransportDeploymentScenarioScore, ...]:
+    """Export the multi-scenario breakdown of the joint-deployment ranking.
+
+    The explanatory counterpart of
+    :func:`recommend_merkle_transport_deployment_weighted_scenarios`: it
+    computes :func:`merkle_transport_deployment_frontier` exactly once
+    and, instead of returning only the winning profile, returns one frozen
+    :class:`MerkleTransportDeploymentScenarioScore` row per frontier
+    member, in the frontier's own order. Each row carries the candidate's
+    :class:`MerkleTransportDeploymentProfile` deployment, its five
+    min-max-normalised costs in the same order as the weights — the
+    batch-proof wire bytes (:attr:`MerkleTransportDeploymentProfile.batch`),
+    the multi-proof wire bytes
+    (:attr:`MerkleTransportDeploymentProfile.multi`), the carried
+    multi-proof node count (:attr:`MerkleTransportDeploymentProfile.nodes`),
+    the checkpoint bytes (:attr:`MerkleStorageProfile.checkpoint_bytes`)
+    and the per-signature verifier hash-chain step count
+    (``profile("merkle", ...)``'s ``steps``) — the per-scenario weighted
+    scores, the per-scenario regrets and a ``selected`` flag.
+
+    ``scenarios`` must be a non-empty tuple; each member must itself be a
+    five-tuple in that same order — batch-proof bytes, multi-proof bytes,
+    carried nodes, checkpoint bytes and per-signature chain steps. Every
+    weight must be a non-boolean, non-negative integer and at least one
+    weight of each scenario must be positive; repeated scenarios are
+    counted separately. Each of the five costs is min-max normalised over
+    the whole frontier as ``(x - min) / (max - min)``, with a zero span
+    scoring ``0``. For each scenario, a candidate's score is the weighted
+    sum of its five normalised costs divided by the scenario's weight
+    total, and its regret is that score minus the scenario's best score
+    over the whole frontier — all exact rationals
+    (``fractions.Fraction``) with no floating point anywhere. Exactly one
+    row is selected: the one whose deployment
+    :func:`recommend_merkle_transport_deployment_weighted_scenarios`
+    returns for the same arguments, field for field — the smallest worst
+    regret, with ties broken by the regret sum, then the per-scenario
+    score tuple, then ascending by checkpoint bytes, leaf count, ``w``
+    and ``height``.
+
+    ``capacity``, ``indices`` and the four-tuple ``budgets`` follow
+    :func:`merkle_transport_deployment_frontier`'s types, ranges,
+    inclusive-budget, exception and no-feasible-candidate rules exactly,
+    so a violation raises exactly as that function does (and is screened
+    before ``scenarios``). A non-tuple ``scenarios`` or scenario member,
+    or a non-integer weight, raises ``TypeError``; an empty scenario
+    tuple, a wrong-length scenario, or a boolean, negative or all-zero
+    weight raises ``ValueError``. The function is pure: it draws no
+    randomness, generates no keys and changes no state.
+    """
+    frontier = merkle_transport_deployment_frontier(capacity, indices, budgets)
+    validated_scenarios = _validate_weight_scenarios(scenarios)
+
+    def metrics(
+        deployment: MerkleTransportDeploymentProfile,
+    ) -> tuple[int, int, int, int, int]:
+        return (
+            deployment.batch,
+            deployment.multi,
+            deployment.nodes,
+            deployment.config.checkpoint_bytes,
+            profile(
+                "merkle",
+                w=deployment.config.w,
+                height=deployment.config.height,
+            ).steps,
+        )
+
+    metric_rows = tuple(metrics(deployment) for deployment in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
+
+    entries = []
+    for deployment, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        scores = tuple(
+            sum(
+                (weight * component for weight, component in zip(weights, costs)),
+                Fraction(0),
+            )
+            / weight_total
+            for weights, weight_total in zip(validated_scenarios, scenario_totals)
+        )
+        entries.append((deployment, costs, scores))
+
+    scenario_best = tuple(
+        min(entry[2][scenario_index] for entry in entries)
+        for scenario_index in range(len(validated_scenarios))
+    )
+    entries = [
+        (deployment, costs, scores, tuple(
+            score - best for score, best in zip(scores, scenario_best)
+        ))
+        for deployment, costs, scores in entries
+    ]
+
+    def ranking(
+        entry: tuple[
+            MerkleTransportDeploymentProfile,
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+        ],
+    ) -> tuple[
+        Fraction,
+        Fraction,
+        tuple[Fraction, ...],
+        int,
+        int,
+        int,
+        int,
+    ]:
+        deployment, _costs, scores, regrets = entry
+        config = deployment.config
+        return (
+            max(regrets),
+            sum(regrets, Fraction(0)),
+            scores,
+            config.checkpoint_bytes,
+            config.leaf_count,
+            config.w,
+            config.height,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        MerkleTransportDeploymentScenarioScore(
+            deployment, *costs, scores, regrets, deployment is chosen
+        )
+        for deployment, costs, scores, regrets in entries
     )
 
 

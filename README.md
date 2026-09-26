@@ -522,6 +522,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `merkle_transport_workload_frontier(capacity, groups, budgets)` — 与 `recommend_merkle_transport_workload` 同一工作负载，但**不排序取首项**，而是返回全部可行且非支配的部署，类型为 `tuple[MerkleTransportWorkloadProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组；`budgets` 必须为四元组，按顺序分别为检查点字节、单组传输字节、总传输字节及单签验签步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选，配置与步数取 `merkle_storage_profile` 与 `profile`，逐组以 `merkle_transport_profile` 取批次/多证明中更短的线长、等长取 `"multiproof"`，四项预算均须满足。支配判定：A 的 `config.checkpoint_bytes`、`total`、单签 `steps` 均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重。结果按步数、总量、检查点、叶数、`w`、`height` 稳定升序排列。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_transport_workload_weighted(capacity, groups, budgets, weights)` — 在 `merkle_transport_workload_frontier` 的非支配结果上**按四元组权重的归一化加权评分选出一个多组工作负载方案**，返回该前沿成员（现有的 `MerkleTransportWorkloadProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与四元组 `budgets` 完全沿用 `merkle_transport_workload_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且先于 `weights` 筛查。`weights` 必须为四元组，依次对应检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）与单签验签链步数（`profile("merkle", ...).steps`）；每个成员只能是非布尔非负整数且至少一项为正。对前沿四项成本分别按 `(x-min)/(max-min)` 归一化（零跨度记 0），四项归一化成本乘对应权重后求和再除以权重总和，以精确有理数（`fractions.Fraction`，无浮点）取评分最小者；评分相同时按检查点字节、叶数、`w`、`height`、逐组模式（`modes`）字典序升序取首项。`groups`/`budgets`/`weights` 非元组或权重含非整数成员抛 `TypeError`；权重长度错误、含布尔、负数或全零抛 `ValueError`；无可行方案也抛 `ValueError`
 - `recommend_merkle_transport_workload_weighted_scenarios(capacity, groups, budgets, scenarios)` — 为多组工作负载前沿 `merkle_transport_workload_frontier` 补上**抗偏好漂移的多情景版本**（基线已有按偏好取一项的 `recommend_merkle_transport_workload` 与单一固定权重的 `recommend_merkle_transport_workload_weighted`）：同时评估多组权重情景，从同一次工作负载前沿中选择最坏后悔值最小的方案，返回该前沿成员（现有的 `MerkleTransportWorkloadProfile`），不新增值类型、不重复枚举或筛选候选、不改变既有前沿、两个现有推荐入口及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项相同；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与四元组 `budgets` 先按 `merkle_transport_workload_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `scenarios` 筛查）。`scenarios` 必须为**非空元组**，每项是覆盖检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）与单签链步（`profile("merkle", ...).steps`）的四元权重；权重只能是非布尔非负整数，每个情景至少一项为正，重复情景分别计入（权重总和参与归一化）。四项成本按全前沿各自的最小值与最大值归一化（零跨度记 0），全程为精确有理数（`fractions.Fraction`，禁止浮点）；每个情景的加权和除以该情景自身的权重总和作为该情景下的得分。先求每个情景在全前沿上的最优得分，候选得分减去它即为该情景下的后悔值；按各情景最大后悔值（最坏后悔）升序、再按后悔值总和、再按各情景得分元组排序，完全平局时按检查点字节、叶数、`w`、`height` 与逐组模式（`modes`）的字典序取首项。`scenarios` 或其成员非元组、权重成员非整数抛 `TypeError`；空元组、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；无可行方案也抛 `ValueError`
+- `explain_merkle_transport_workload_weighted(capacity, groups, budgets, weights)` — 为多组工作负载前沿的单一权重推荐 `recommend_merkle_transport_workload_weighted` 补上**决策成本明细的导出入口**（基线已有该前沿与按偏好、单权重、多情景三类推荐，却没有明细入口，本次从零新增单权重版）：在同一次 `merkle_transport_workload_frontier` 前沿上逐项给出每个候选的归一化成本与最终评分，返回冻结的 `MerkleTransportWorkloadScore` 行元组，行序与同参数前沿一次调用的成员顺序完全一致，不重复枚举或筛选候选、不改变既有前沿、各族推荐入口及任何旧接口与线格式；多情景明细本次不做。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与四元组 `budgets` 先按 `merkle_transport_workload_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为四元组，依次对应检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）与单签验签链步数（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且四项中至少一项为正。每行依次携带该候选的工作负载方案对象（`MerkleTransportWorkloadProfile`）、与权重逐位对应的四项归一化成本（各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、最终评分（归一化成本乘各自权重求和再除以权重总和）与唯一为真的选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点；行对象冻结、可位置构造、按值相等且可哈希。恰好一行被选中，其方案与同参数调用 `recommend_merkle_transport_workload_weighted` 的结果逐字段相同；评分完全相同时沿用其决胜尾序（检查点字节、叶数、`w`、`height` 与逐组模式 `modes` 字典序升序取首项）。全前沿零跨度时各行评分都是零，选中项由决胜尾序决定，明细如实反映。`groups`/`budgets`/`weights` 非元组或权重成员非整数抛 `TypeError`；权重长度不符、含布尔或负数、整组全零、或预算下无可行方案抛 `ValueError`，不返回任何明细行；前沿规则之外的非法输入沿用其异常口径
+- `MerkleTransportWorkloadScore` — 冻结的决策成本明细行值对象，七个字段按位置依次为 `workload, checkpoint_cost, peak_cost, transport_cost, steps_cost, score, selected`：候选的工作负载方案对象（`MerkleTransportWorkloadProfile`）、与权重逐位对应的四项归一化成本（检查点字节、单组峰值、总传输字节、单签链步，均为 `Fraction`）、最终评分（`Fraction`）与选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
 - `merkle_mode_frontier(capacity, groups, budgets)` — 与 `merkle_transport_workload_frontier` 同一工作负载，但**逐组枚举全部 `batch`/`multiproof` 模式组合**（每组两种，共 `2**len(groups)` 种，均参与预算筛选），返回全部可行且非支配的模式选择，类型为 `tuple[MerkleTransportWorkloadProfile, ...]`，各项沿用 `config, modes, sizes, total` 字段，`modes` 与 `sizes` 按组对齐，`total` 为各组线长之和，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`groups` 必须为非空元组，每个成员本身也是非空、严格递增的非负非布尔整数元组；`budgets` 必须为**五元组**，按顺序分别为检查点字节、单组峰值（`sizes` 中的最大值）、总传输字节、单签验签步数（`profile("merkle", ...).steps`）及**节点总数**（仅累加 multiproof 组的规范节点数，batch 组计 0）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 与各组最大索引的全部候选，尺寸、节点数与步数均复用 `merkle_storage_profile`、`merkle_transport_profile` 与 `profile`。支配判定：A 在检查点字节、单组峰值、总量、单签步数、节点总数五项成本上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配项并按值去重，不因偏好预先舍弃尺寸与节点数形成取舍的组合。结果按单签步数、总量、单组峰值、节点总数、检查点字节、叶数、`w`、`height`、`modes` 字典序稳定升序排列。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_mode_deployment(capacity, groups, budgets, prefer="compact")` — 在 `merkle_mode_frontier` 的非支配结果上**按业务偏好选出一个模式组合**，返回现有的 `MerkleTransportWorkloadProfile`，不新增值类型、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态。前三参数无默认值；`capacity`、`groups` 与五元组 `budgets` 完全沿用 `merkle_mode_frontier` 的类型、范围、预算及异常规则，无可行项抛 `ValueError`。`prefer` 仅取 `"compact"`（默认）、`"nodes"` 或 `"speed"`，其他值抛 `ValueError`。排序键：`"compact"` 依次按 `total`、单组峰值（`max(sizes)`）、节点总数、单签步数升序；`"nodes"` 依次按节点总数、`total`、单组峰值、单签步数升序；节点总数沿用模式前沿定义，仅累加 multiproof 组的规范节点数；`"speed"` 依次按单签步数、`total`、单组峰值、节点总数升序。三种策略末段统一按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`groups`/`budgets`（含成员组本身）容器类型错抛 `TypeError`，其余非法输入抛 `ValueError`
 - `recommend_merkle_mode_weighted(capacity, groups, budgets, weights)` — 在 `merkle_mode_frontier` 的非支配结果上**按五元组权重的归一化加权评分选出一个模式组合**，返回该前沿成员（现有的 `MerkleTransportWorkloadProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变任何线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。四参数均无默认值；`capacity`、`groups` 与五元组 `budgets` 完全沿用 `merkle_mode_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且先于 `weights` 筛查。`weights` 必须为五元组，依次对应检查点字节（`config.checkpoint_bytes`）、单组峰值（`max(sizes)`）、总传输字节（`total`）、单签验签链步数（`profile("merkle", ...).steps`）与节点总数，节点总数沿用模式前沿口径，只累计 multiproof 组的规范节点、batch 组计零；每个成员只能是非布尔非负整数且至少一项为正。对前沿五项成本分别按 `(x-min)/(max-min)` 归一化（零跨度记 0），五项归一化成本乘对应权重后求和再除以权重总和，以精确有理数（`fractions.Fraction`，无浮点）取评分最小者；评分相同时按检查点字节、叶数、`w`、`height`、`modes` 字典序升序取首项。`groups`/`budgets`/`weights` 非元组或权重含非整数成员抛 `TypeError`；权重长度错误、含布尔、负数或全零抛 `ValueError`；无可行方案也抛 `ValueError`
@@ -580,6 +582,8 @@ from pqattest import (
     merkle_transport_workload_frontier,
     recommend_merkle_transport_workload_weighted,
     recommend_merkle_transport_workload_weighted_scenarios,
+    MerkleTransportWorkloadScore,
+    explain_merkle_transport_workload_weighted,
     merkle_mode_frontier,
     recommend_merkle_mode_deployment,
     recommend_merkle_mode_weighted,
@@ -797,6 +801,28 @@ recommend_merkle_transport_workload_weighted_scenarios(
     ((1, 0, 0, 0), (0, 0, 0, 1)),
 )
 # MerkleTransportWorkloadProfile(..., modes=(...), sizes=(...), total=...)
+
+# 工作负载前沿单一权重推荐的决策成本明细：每个前沿候选一行，行序与
+# merkle_transport_workload_frontier 一致，依次为工作负载方案、四项归一化
+# 成本（检查点、单组峰值、总传输、单签链步）、最终评分与选中标志；恰好一行
+# selected=True，其方案与 recommend_merkle_transport_workload_weighted
+# 同参数的结果逐字段相同
+explain_merkle_transport_workload_weighted(
+    16,
+    ((0, 1), (3, 5), (8, 9, 10)),
+    (None, None, None, 10**9),
+    (1, 1, 1, 1),
+)
+# (MerkleTransportWorkloadScore(workload=MerkleTransportWorkloadProfile(...,
+#   w=4, height=4, modes=('multiproof', ...), total=15601),
+#   checkpoint_cost=Fraction(1, 1), peak_cost=Fraction(1, 1),
+#   transport_cost=Fraction(1, 1), steps_cost=Fraction(0, 1),
+#   score=Fraction(3, 4), selected=False),
+#  MerkleTransportWorkloadScore(workload=MerkleTransportWorkloadProfile(...,
+#   w=8, height=4, modes=('multiproof', ...), total=8209),
+#   checkpoint_cost=Fraction(0, 1), peak_cost=Fraction(0, 1),
+#   transport_cost=Fraction(0, 1), steps_cost=Fraction(1, 1),
+#   score=Fraction(1, 4), selected=True))
 
 # 模式前沿：逐组枚举全部 batch/multiproof 组合，预算顺序为
 # (检查点, 单组峰值, 总传输, 步数, 节点总数)，节点总数只累加 multiproof 组；

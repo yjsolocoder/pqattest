@@ -191,7 +191,11 @@ Merkle ``w`` choices at every tree height — keeps those covering the
 requested signature count and fitting a two-tuple of signature-size and
 chain-step budgets, and ranks the feasible set by a ``"size"`` or
 ``"speed"`` preference, returning one :class:`Params`.
-All forty-three
+:func:`scheme_frontier` keeps the same candidate set, metrics and budget
+semantics but returns the whole non-dominated frontier as a tuple of
+:class:`Params`, trading single-signature size against verifier chain
+steps without any preference pre-filter.
+All forty-four
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -229,6 +233,7 @@ __all__ = [
     "profile",
     "recommend",
     "recommend_scheme",
+    "scheme_frontier",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
@@ -386,6 +391,53 @@ def recommend(capacity: Any, prefer: str = "size") -> Params:
     return profile("merkle", w=w, height=height)
 
 
+def _validate_scheme_capacity(capacity: Any) -> int:
+    """Validate the cross-scheme selector's requested signature count."""
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not 1 <= capacity <= _MAX_CAPACITY
+    ):
+        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
+    return capacity
+
+
+def _validate_scheme_budgets(budgets: Any) -> tuple[int | None, int | None]:
+    """Validate the selector/frontier two-tuple of inclusive cost budgets."""
+    if not isinstance(budgets, tuple):
+        raise TypeError("budgets must be a 2-tuple of budget limits")
+    if len(budgets) != 2:
+        raise ValueError("budgets must contain exactly two entries")
+
+    labels = ("signature", "steps")
+    limits: list[int | None] = []
+    for label, budget in zip(labels, budgets):
+        if budget is None:
+            limits.append(None)
+        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError(f"{label} budget must be None or a positive integer")
+        else:
+            limits.append(budget)
+    if all(limit is None for limit in limits):
+        raise ValueError("at least one budget must be set")
+    return limits[0], limits[1]
+
+
+def _scheme_candidates(capacity: int) -> list[Params]:
+    """Enumerate every profile() configuration covering ``capacity``."""
+    candidates: list[Params] = []
+    if capacity == 1:
+        candidates.append(profile("lamport"))
+        for w in (4, 8):
+            candidates.append(profile("wots", w=w))
+    for w in (4, 8):
+        for height in range(1, 9):
+            candidate = profile("merkle", w=w, height=height)
+            if candidate.capacity >= capacity:
+                candidates.append(candidate)
+    return candidates
+
+
 def recommend_scheme(capacity: Any, budgets: Any, prefer: Any = "size") -> Params:
     """Return the :class:`Params` of the scheme best fitting capacity/budgets.
 
@@ -422,42 +474,12 @@ def recommend_scheme(capacity: Any, budgets: Any, prefer: Any = "size") -> Param
     ``ValueError``. The function is pure: it draws no randomness, generates
     no keys and changes no state.
     """
-    if (
-        isinstance(capacity, bool)
-        or not isinstance(capacity, int)
-        or not 1 <= capacity <= _MAX_CAPACITY
-    ):
-        raise ValueError(f"capacity must be an integer between 1 and {_MAX_CAPACITY}")
-    if not isinstance(budgets, tuple):
-        raise TypeError("budgets must be a 2-tuple of budget limits")
-    if len(budgets) != 2:
-        raise ValueError("budgets must contain exactly two entries")
-
-    labels = ("signature", "steps")
-    limits = []
-    for label, budget in zip(labels, budgets):
-        if budget is None:
-            limits.append(None)
-        elif isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
-            raise ValueError(f"{label} budget must be None or a positive integer")
-        else:
-            limits.append(budget)
-    if all(limit is None for limit in limits):
-        raise ValueError("at least one budget must be set")
+    capacity = _validate_scheme_capacity(capacity)
+    signature_limit, steps_limit = _validate_scheme_budgets(budgets)
     if prefer not in ("size", "speed"):
         raise ValueError('prefer must be "size" or "speed"')
-    signature_limit, steps_limit = limits
 
-    candidates: list[Params] = []
-    if capacity == 1:
-        candidates.append(profile("lamport"))
-        for w in (4, 8):
-            candidates.append(profile("wots", w=w))
-    for w in (4, 8):
-        for height in range(1, 9):
-            candidate = profile("merkle", w=w, height=height)
-            if candidate.capacity >= capacity:
-                candidates.append(candidate)
+    candidates = _scheme_candidates(capacity)
 
     feasible = []
     for candidate in candidates:
@@ -483,6 +505,96 @@ def recommend_scheme(capacity: Any, budgets: Any, prefer: Any = "size") -> Param
         return (candidate.sig_bytes, candidate.steps) + tail
 
     return min(feasible, key=ranking)
+
+
+def scheme_frontier(capacity: Any, budgets: Any) -> tuple[Params, ...]:
+    """Return every feasible, non-dominated scheme configuration as a tuple.
+
+    The non-dominated-frontier counterpart of :func:`recommend_scheme`:
+    instead of ranking the feasible configs and returning one preference's
+    winner, this function keeps the whole Pareto frontier so a caller can
+    inspect the trade-off between one-signature size and verifier chain
+    steps. The candidate set is exactly the one :func:`recommend_scheme`
+    documents — the two one-time schemes (Lamport, and W-OTS with ``w`` 4
+    and 8) at ``capacity == 1`` and every Merkle configuration with ``w``
+    in ``(4, 8)`` times ``height`` from 1 to 8 whose capacity covers the
+    requested count — and the capacity, one-signature serialised-size
+    (:attr:`Params.sig_bytes`) and verifier hash-chain step
+    (:attr:`Params.steps`) metrics are field-for-field the values
+    :func:`profile` reports.
+
+    ``capacity`` must be a non-boolean integer from 1 to 256. ``budgets``
+    must be a two-tuple, in order: an inclusive upper bound on one
+    signature's serialised size and on the verifier hash-chain step count.
+    Each entry is either ``None`` (no bound) or a positive, non-boolean
+    integer, and at least one entry must be set; a candidate exceeding
+    either bound is excluded. There is no preference parameter: no
+    configuration trading chain steps for signature size (or the reverse)
+    is discarded ahead of the dominance test, so both the speed and the
+    size end of the trade-off survive.
+
+    A feasible candidate *A* dominates another feasible candidate *B*
+    when ``A`` is no greater than ``B`` on both costs — signature bytes
+    and verifier steps — and strictly smaller on at least one. Every
+    dominated candidate is dropped and the survivors are deduplicated by
+    value. The returned tuple is sorted stably and ascending by verifier
+    steps, signature bytes, spare capacity (candidate capacity minus the
+    requested count), scheme name, ``w`` and ``height``; a missing
+    parameter sorts ahead of any value at its position.
+
+    Validation reuses :func:`recommend_scheme`'s rules in its capacity-
+    then-budgets order: a non-tuple ``budgets`` raises ``TypeError``; a
+    boolean, non-integer or out-of-range ``capacity``, a wrong-length or
+    otherwise illegal ``budgets`` tuple (including both entries ``None``)
+    or the absence of any feasible candidate raises ``ValueError`` — an
+    empty tuple is never returned. The function is pure: it draws no
+    randomness, generates no keys and changes no state, and repeated calls
+    with the same inputs return item-for-item identical results.
+    """
+    capacity = _validate_scheme_capacity(capacity)
+    signature_limit, steps_limit = _validate_scheme_budgets(budgets)
+
+    feasible: list[Params] = []
+    for candidate in _scheme_candidates(capacity):
+        if signature_limit is not None and candidate.sig_bytes > signature_limit:
+            continue
+        if steps_limit is not None and candidate.steps > steps_limit:
+            continue
+        feasible.append(candidate)
+    if not feasible:
+        raise ValueError("no scheme fits the requested capacity and budgets")
+
+    def dominates(a: Params, b: Params) -> bool:
+        no_worse = a.sig_bytes <= b.sig_bytes and a.steps <= b.steps
+        strictly_better = a.sig_bytes < b.sig_bytes or a.steps < b.steps
+        return no_worse and strictly_better
+
+    non_dominated = [
+        candidate
+        for candidate in feasible
+        if not any(dominates(other, candidate) for other in feasible)
+    ]
+
+    unique: list[Params] = []
+    seen: set[Params] = set()
+    for candidate in non_dominated:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+
+    unique.sort(
+        key=lambda candidate: (
+            candidate.steps,
+            candidate.sig_bytes,
+            candidate.capacity - capacity,
+            candidate.scheme,
+            candidate.w is not None,
+            candidate.w,
+            candidate.height is not None,
+            candidate.height,
+        )
+    )
+    return tuple(unique)
 
 
 def recommend_merkle_deployment(

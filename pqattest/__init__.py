@@ -170,6 +170,9 @@ all; sign_with_checkpoint on each one-time signer and
 sign_ots_pair_with_checkpoint for the pair are the plaintext atomic
 counterparts, returning the signature(s) together with the raw v1
 checkpoint bytes of the advanced state(s) in one locked step;
+sign_ots_pair_proof_with_checkpoint is its proof-packing counterpart,
+returning the OtsPairProof of the two fresh signatures together with the
+two raw v1 checkpoint bytes in one locked step;
 restore_merkle_claimed does the same one-step authenticated restore and
 claim for a Merkle signer v2 envelope.
 sign_merkle_auth_state is the stateless restore-sign-wrap conversion: it
@@ -438,6 +441,7 @@ __all__ = [
     "sign_merkle_auth_state_batch",
     "sign_multiproof_merkle_auth_state",
     "sign_ots_pair",
+    "sign_ots_pair_proof_with_checkpoint",
     "sign_ots_pair_with_checkpoint",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
@@ -912,13 +916,20 @@ class OtsPairProof:
         to the message, to a public-key branch or signature element used
         by the message bits, an illegal message type, or fields corrupted
         by bypassing the frozen constructor returns ``False`` instead of
-        raising. Lamport public-key branches not selected by the message
+        raising — including a member field replaced by a wrong-type
+        object, even one whose own ``verify`` would return ``True``. Lamport public-key branches not selected by the message
         bits are outside this guarantee — binding the pair to expected
         public keys with :meth:`verify_bound` closes that gap. The pair
         itself carries no message and cannot authenticate its own origin.
         """
         try:
-            return self.lamport.verify(message) and self.wots.verify(message)
+            lamport = self.lamport
+            wots = self.wots
+            if not isinstance(lamport, LamportProof):
+                return False
+            if not isinstance(wots, WOTSProof):
+                return False
+            return lamport.verify(message) and wots.verify(message)
         except Exception:
             return False
 
@@ -1413,6 +1424,79 @@ def sign_ots_pair_with_checkpoint(
         lamport._used = True
         wots._used = True
         return (lamport_signature, wots_signature), (
+            lamport._checkpoint_bytes(),
+            wots._checkpoint_bytes(),
+        )
+
+
+def sign_ots_pair_proof_with_checkpoint(
+    lamport: Any, wots: Any, message: Any
+) -> tuple[OtsPairProof, tuple[bytes, bytes]]:
+    """Sign one message with a Lamport/W-OTS pair, pack the proof, snapshot both.
+
+    Proof-packing counterpart of :func:`sign_ots_pair_with_checkpoint` for
+    callers that keep the two one-time keys in lockstep: ``lamport`` must be
+    a :class:`OneTimeSigner` and ``wots`` a :class:`WOTSOneTimeSigner`, and
+    the single ``message`` is signed by both under one joint critical
+    section, so the pair either advances together or not at all. No new
+    wire format, randomness or library state is involved. Returns
+    ``(pair_proof, (lamport_checkpoint, wots_checkpoint))``: an
+    :class:`OtsPairProof` holding the :class:`LamportProof` first and the
+    :class:`WOTSProof` second, each carrying the signature produced by this
+    call together with the corresponding signer's public key, and the two
+    v1 :meth:`checkpoint` byte strings of the used states in the same
+    Lamport-first order. The proof encodes byte-for-byte identically to an
+    :class:`OtsPairProof` assembled by hand from the same two signatures
+    and public keys, verifies ``True`` for ``message``, and each signature
+    is value-for-value identical to what the matching signer's
+    :meth:`sign` returns for ``message`` from the same state. Each
+    checkpoint is byte-for-byte identical to the one the matching
+    :meth:`checkpoint` returns immediately after the call.
+
+    Every argument is validated before either key is spent: ``message``
+    follows the usual ``bytes``/``bytearray``/``str`` rules. A wrong
+    signer or message type raises ``TypeError``; an already used signer on
+    either side raises :class:`KeyExhaustedError`. Every failure leaves
+    both ``used`` flags untouched and returns no partial result — when
+    either side is already used, neither side is consumed. Both signing
+    locks are acquired together, Lamport first and W-OTS second, and the
+    whole call — both signatures, both ``used`` flips, the proof packing
+    and both snapshots — linearises with :meth:`OneTimeSigner.sign`,
+    :meth:`WOTSOneTimeSigner.sign` and both :meth:`checkpoint` methods, so
+    at most one concurrent caller can succeed and no randomness is drawn.
+    The returned checkpoints still carry the private keys in the clear and
+    their trailing hashes only detect accidental corruption — they offer
+    no authentication, encryption or atomic persistence, so
+    confidentiality, durable storage and rollback protection remain the
+    caller's responsibility.
+    """
+    if not isinstance(lamport, OneTimeSigner):
+        raise TypeError("lamport must be a OneTimeSigner")
+    if not isinstance(wots, WOTSOneTimeSigner):
+        raise TypeError("wots must be a WOTSOneTimeSigner")
+    message = _as_bytes(message)
+    with lamport._lock, wots._lock:
+        if lamport._used:
+            raise KeyExhaustedError(
+                "this lamport one-time signing key has already been used"
+            )
+        if wots._used:
+            raise KeyExhaustedError(
+                "this wots one-time signing key has already been used"
+            )
+        lamport_signature = sign(message, lamport._private_key)
+        wots_signature = wots_sign(message, wots._private_key)
+        lamport._used = True
+        wots._used = True
+        pair_proof = OtsPairProof(
+            lamport=LamportProof(
+                public_key=lamport._public_key, signature=lamport_signature
+            ),
+            wots=WOTSProof(
+                public_key=wots._public_key, signature=wots_signature
+            ),
+        )
+        return pair_proof, (
             lamport._checkpoint_bytes(),
             wots._checkpoint_bytes(),
         )

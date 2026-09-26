@@ -401,6 +401,33 @@ class OtsPairProofVerifyTest(unittest.TestCase):
         object.__setattr__(pair2, "wots", object())
         self.assertFalse(pair2.verify(b"position claim"))
 
+    def test_wrong_type_field_with_always_true_verify_returns_false(self):
+        class AlwaysTrue:
+            def verify(self, message):
+                return True
+
+        _, pair = make_pair()
+        object.__setattr__(pair, "lamport", AlwaysTrue())
+        self.assertFalse(pair.verify(b"position claim"))
+        _, pair2 = make_pair()
+        object.__setattr__(pair2, "wots", AlwaysTrue())
+        self.assertFalse(pair2.verify(b"position claim"))
+
+    def test_hostile_field_objects_do_not_leak_exceptions_from_verify(self):
+        class Boom:
+            def verify(self, message):
+                raise RuntimeError("boom")
+
+        _, pair = make_pair()
+        object.__setattr__(pair, "lamport", Boom())
+        self.assertFalse(pair.verify(b"position claim"))
+        _, pair2 = make_pair()
+        object.__setattr__(pair2, "wots", Boom())
+        self.assertFalse(pair2.verify(b"position claim"))
+        # Fields missing entirely.
+        rogue = object.__new__(OtsPairProof)
+        self.assertFalse(rogue.verify(b"position claim"))
+
     def test_pair_does_not_store_message(self):
         _, pair = make_pair(message=b"the message")
         self.assertFalse(hasattr(pair, "message"))

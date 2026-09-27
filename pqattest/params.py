@@ -195,7 +195,12 @@ chain-step budgets, and ranks the feasible set by a ``"size"`` or
 semantics but returns the whole non-dominated frontier as a tuple of
 :class:`Params`, trading single-signature size against verifier chain
 steps without any preference pre-filter.
-All forty-four
+:func:`recommend_scheme_weighted` ranks that same cross-scheme frontier by
+a caller-supplied two-tuple of non-negative weights over its two
+min-max-normalised costs — single-signature serialised size and verifier
+chain steps — the weighted sum divided by the weight total, with exact
+:class:`fractions.Fraction` arithmetic, and returns one :class:`Params`.
+All forty-five
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -234,6 +239,7 @@ __all__ = [
     "recommend",
     "recommend_scheme",
     "scheme_frontier",
+    "recommend_scheme_weighted",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
@@ -595,6 +601,93 @@ def scheme_frontier(capacity: Any, budgets: Any) -> tuple[Params, ...]:
         )
     )
     return tuple(unique)
+
+
+def _validate_scheme_weights(weights: Any) -> tuple[int, int]:
+    """Validate the two-tuple of non-negative scheme cost weights."""
+    if not isinstance(weights, tuple):
+        raise TypeError("weights must be a 2-tuple of non-negative integer weights")
+    if len(weights) != 2:
+        raise ValueError("weights must contain exactly two entries")
+    for weight in weights:
+        if isinstance(weight, bool):
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+        if not isinstance(weight, int):
+            raise TypeError("every weight must be an integer")
+        if weight < 0:
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("at least one weight must be positive")
+    return weights
+
+
+def recommend_scheme_weighted(capacity: Any, budgets: Any, weights: Any) -> Params:
+    """Pick one non-dominated scheme configuration by weighted normalised costs.
+
+    Computes :func:`scheme_frontier` exactly once and ranks the returned
+    feasible, non-dominated cross-scheme configurations by a
+    caller-supplied linear score over two costs: one signature's
+    serialised size (:attr:`Params.sig_bytes`) and the verifier
+    hash-chain step count (:attr:`Params.steps`).
+
+    ``weights`` must be a two-tuple in that same order — single-signature
+    serialised size and verifier chain steps. Every weight must be a
+    non-boolean, non-negative integer and at least one must be positive.
+    Each of the two costs is min-max normalised over the whole frontier
+    as ``(x - min) / (max - min)``, with a zero span scoring ``0``; the
+    weighted score is the sum of the two normalised costs times their
+    weights, divided by the weight total, all compared as exact rationals
+    (``fractions.Fraction``) with no floating point anywhere. The survivor
+    with the smallest score is returned; equal scores use
+    :func:`recommend_scheme`'s existing tie-break tail: spare capacity
+    (candidate capacity minus the requested signature count), scheme name,
+    then ``w`` and ``height``, with a missing parameter sorted ahead of any
+    value. The candidate enumeration and Pareto filtering are not
+    duplicated: the frontier is the only source of candidates and is
+    called exactly once, so the returned :class:`Params` is field-for-field
+    a member of the tuple one same-argument :func:`scheme_frontier` call
+    returns.
+
+    ``capacity`` and ``budgets`` follow :func:`scheme_frontier`'s types,
+    ranges, inclusive-budget, exception and no-feasible-candidate rules
+    exactly, so a violation raises exactly as that function does (and is
+    screened before ``weights``). A non-tuple ``weights`` or a
+    non-integer member raises ``TypeError``; a wrong-length tuple or a
+    boolean, negative or all-zero weight raises ``ValueError``. The
+    function is pure: it draws no randomness, generates no keys and
+    changes no state.
+    """
+    frontier = scheme_frontier(capacity, budgets)
+    validated_weights = _validate_scheme_weights(weights)
+
+    metric_rows = tuple(
+        (candidate.sig_bytes, candidate.steps) for candidate in frontier
+    )
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(2)
+    )
+    weight_total = sum(validated_weights)
+
+    def ranking(candidate: Params) -> tuple:
+        score = Fraction(0)
+        for value, weight, (low, high) in zip(
+            (candidate.sig_bytes, candidate.steps), validated_weights, spans
+        ):
+            if high > low:
+                score += weight * Fraction(value - low, high - low)
+        score /= weight_total
+        return (
+            score,
+            candidate.capacity - capacity,
+            candidate.scheme,
+            candidate.w is not None,
+            candidate.w,
+            candidate.height is not None,
+            candidate.height,
+        )
+
+    return min(frontier, key=ranking)
 
 
 def recommend_merkle_deployment(

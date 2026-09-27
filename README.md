@@ -598,6 +598,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_scheme(capacity, budgets, prefer="size")` — **跨 Lamport、W-OTS 与 Merkle 三方案的统一推荐入口**，返回所选配置的 `Params`。候选覆盖 `profile` 接受的全部方案与参数组合：容量为 1 时含 Lamport 与 W-OTS（`w=4/8`）两个一次性方案，以及 `w=4/8` × `height=1..8` 的全部 Merkle 配置；请求条数大于 1 时一次性方案只签一条，候选只剩 Merkle 配置。纯函数：不取随机数、不生成密钥、不改状态。前两参数无默认值；`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为**二元组**，依次为单签序列化尺寸（`Params.sig_bytes`）与验签链步上界（`Params.steps`）的含边界上限，口径与 `profile` 指标完全一致，每项为 `None`（不限）或正的非布尔整数，且至少一项非空；叶数不覆盖 `capacity` 或超出预算的候选一律排除。`prefer` 仅取 `"size"`（默认）或 `"speed"`：前者先最小化 `sig_bytes` 再看 `steps`，后者次序相反；两者决胜尾序相同，依次为容量余量（候选容量减请求条数）、方案名字典序、`w` 升序、`height` 升序，无该参数者（`None`）排在最前，取排序首项。校验次序固定为容量、预算、偏好：`budgets` 非元组抛 `TypeError`；容量为布尔、非整数或越界抛 `ValueError`；预算长度不符、成员为布尔/非正/非整数或两项全空同样抛 `ValueError`；偏好取值之外或无任何可行候选也抛 `ValueError` 且不返回结果。同一输入重复调用结果逐项相同
 - `scheme_frontier(capacity, budgets)` — **跨三方案的呈现尺寸与验签成本取舍的非支配前沿入口**，与 `recommend_scheme` 同一组候选、指标口径与预算语义，但不按偏好取一项，而是返回全部可行且非支配的配置，类型为 `tuple[Params, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无偏好参数、无默认参数。候选集合（容量为 1 时含 Lamport 与 W-OTS `w=4/8`，否则仅 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 的 Merkle 配置）与每个候选的容量、单签尺寸、验签链步都与静态指标分析逐字段相同。`budgets` 仍为二元组，依次限制单签序列化尺寸与验签链步，都是含边界上限，每项为 `None`（不限）或正的非布尔整数且至少给出一项，超出任一上限的候选一律排除。支配判定固定为：A 的单签尺寸与验签链步都不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配候选并按值去重，不因偏好预先舍弃尺寸与链步形成取舍的配置，速度端（Lamport，链步 0）与尺寸端（最短单签）都保留。结果按验签链步、单签尺寸、容量余量（候选容量减请求条数）、方案名、`w`、`height` 稳定升序排列，无该参数的候选排在同位最前。`budgets` 非元组抛 `TypeError`；条数为布尔、非整数或越界，预算长度不符、成员非法或两项全空，以及预算下无任何可行候选，均抛 `ValueError`（不返回空元组或半成品）。同一输入重复调用结果逐项相同
 - `recommend_scheme_weighted(capacity, budgets, weights)` — 在 `scheme_frontier` 的非支配结果上**按二元组权重的归一化加权评分选出一个跨方案配置**，返回该前沿成员（现有的 `Params` 静态指标对象），不新增值类型、不重复枚举或自行筛选候选、不改变既有前沿、按偏好取一项的 `recommend_scheme` 与静态指标分析。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与二元组 `budgets` 完全沿用 `scheme_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且一律先于 `weights` 筛查。`weights` 必须为二元组，依次对应单签序列化尺寸（`Params.sig_bytes`）与验签链步数（`Params.steps`），每项只能是非布尔非负整数且两项中至少一项为正。两项成本各自按整个前沿的最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0），两项归一化成本乘各自权重求和后除以权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小的前沿成员，只点亮其中一维时返回的即该维成本最小的前沿成员。评分完全相同时沿用该族既有决胜尾序：容量余量（候选容量减请求条数）、方案名字典序、`w` 升序、`height` 升序，无该参数者排在最前，取首项。`weights` 不是元组或其成员不是整数抛 `TypeError`；权重长度不符、含布尔或负数、或两项全零抛 `ValueError`；条数越界、预算取值非法或预算下无任何可行候选同样抛 `ValueError` 且不返回结果
+- `explain_scheme_weighted(capacity, budgets, weights)` — 为单权重跨方案推荐 `recommend_scheme_weighted` 补上**决策成本明细的导出入口**（基线已有该族的静态指标、非支配前沿与按权重取一项的推荐，唯独没有明细，本次从零新增）：在同一次 `scheme_frontier` 前沿上逐项给出每个候选的两项归一化成本与最终评分，返回冻结的 `SchemeScore` 行元组，行序与同参数一次前沿调用的成员顺序完全一致，不新增除明细行外的其他值类型、不重复枚举或筛选候选、不改变既有前沿、两类既有推荐与静态指标分析及任何旧接口。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与二元组 `budgets` 先按该前沿原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且校验一律先于 `weights` 筛查）。`weights` 必须为二元组，依次对应单签序列化尺寸（`Params.sig_bytes`）与验签链步数（`Params.steps`），成员只能是非布尔非负整数且两项中至少一项为正。每行依次携带该候选的指标（`Params`）、与权重逐位对应的两项归一化成本（各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、最终评分（两项归一化成本乘各自权重求和再除以权重总和）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点；行对象可位置构造、按值相等且可哈希。选中标志恰好落在一行，其指标与同参数调用 `recommend_scheme_weighted` 的结果逐字段相同；评分完全相同时沿用该族既有决胜尾序（容量余量、方案名字典序、`w`、`height` 升序取首，无该参数者排在最前）；只点亮一维时选中该维最小者。全前沿零跨度时各行评分都是零，选中项由决胜尾序决定，明细如实反映。`weights` 容器或其成员不是元组、不是整数一律抛 `TypeError`；权重长度不符、含布尔或负数、或两项全零抛 `ValueError`；条数越界、预算取值非法或预算下无任何可行候选同样抛 `ValueError`，不返回任何明细行
+- `SchemeScore` — 冻结的决策成本明细行值对象，五个字段按位置依次为 `candidate, signature_cost, steps_cost, score, selected`：候选指标（`Params`，与前沿成员逐字段相同）、与权重逐位对应的两项归一化成本（单签序列化尺寸、验签链步，均为 `Fraction`）、最终评分（`Fraction`）与选中标志（`bool`，恰好一行为真）；冻结、可位置构造、按值相等（可哈希）
 - `recommend_merkle_deployment(capacity, budgets, prefer="size")` — 在部署预算内选可行 Merkle 参数，返回 `MerkleStorageProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（对应 `checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）、验签链步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须覆盖 `capacity`，字节上限按 `merkle_storage_profile` 字段比较，步数上限按 `profile` 返回的 `steps` 比较。`size` 依次最小化签名线长、证明线长、检查点、步数、叶数、`w`、`height`；`speed` 先最小化步数，再沿用前述其余顺序；取排序首项。`budgets` 非元组抛 `TypeError`；其长度或成员非法、`capacity`/`prefer` 非法、无可行候选均抛 `ValueError`
 - `merkle_deployment_frontier(capacity, budgets)` — 与 `recommend_merkle_deployment` 同一组候选与预算，但**不排序取首项**，而是返回全部可行且非支配的普通 Merkle 部署，类型为 `tuple[MerkleStorageProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）及单签验签步数（`profile("merkle", ...).steps`）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 的全部候选，配置取 `merkle_storage_profile`、步数取 `profile` 的 Merkle 结果。支配判定固定为：A 在检查点字节、签名线长、证明线长、单签步数四项上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配候选并按值去重，不因偏好预先舍弃速度与尺寸形成取舍的配置。结果按单签步数、签名线长、证明线长、检查点字节、叶数、`w`、`height` 稳定升序排列。`budgets` 非元组抛 `TypeError`；其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_deployment_weighted(capacity, budgets, weights)` — 在 `merkle_deployment_frontier` 的非支配结果上**按四元组权重的归一化加权评分选出一个普通 Merkle 部署方案**，返回该前沿成员（现有的 `MerkleStorageProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变既有前沿与按偏好取一项的推荐入口。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与四元组 `budgets` 先按 `merkle_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为四元组，依次对应检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）与单签验签链步数（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且四项中至少一项为正。四项成本各自按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0），四项归一化成本乘对应权重求和后除以权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小的前沿成员，评分完全相同时按检查点字节、叶数、`w`、`height` 升序取首项。`weights` 非元组或权重成员非整数抛 `TypeError`；权重长度错误、含布尔或负数、整组全零抛 `ValueError`；无可行方案同样抛 `ValueError`
@@ -665,6 +667,8 @@ from pqattest import (
     recommend_scheme,
     scheme_frontier,
     recommend_scheme_weighted,
+    SchemeScore,
+    explain_scheme_weighted,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
@@ -752,6 +756,22 @@ recommend_scheme_weighted(1, (None, 10**9), (1, 0))
 # Params(scheme='wots', w=8, ..., sig_bytes=1088, steps=8670)；只看单签尺寸
 recommend_scheme_weighted(1, (None, 10**9), (0, 1))
 # Params(scheme='lamport', ..., sig_bytes=8192, steps=0)；只看验签链步
+
+# 同一加权推荐的决策成本明细：每个前沿候选一行 SchemeScore，行序与
+# scheme_frontier 一致，依次为候选指标（Params）、两项归一化成本
+# （单签序列化尺寸、验签链步）、最终评分与选中标志；各成本与评分均为
+# Fraction 精确有理数；恰好一行 selected=True，其指标与
+# recommend_scheme_weighted 同参数的结果逐字段相同
+explain_scheme_weighted(1, (None, 10**9), (2, 3))
+# (SchemeScore(candidate=Params(scheme='lamport', ..., sig_bytes=8192, steps=0),
+#   signature_cost=Fraction(1, 1), steps_cost=Fraction(0, 1),
+#   score=Fraction(2, 5), selected=False),
+#  SchemeScore(candidate=Params(scheme='wots', w=4, ..., sig_bytes=2144, steps=1005),
+#   signature_cost=Fraction(11, 74), steps_cost=Fraction(67, 578),
+#   score=Fraction(2759, 21386), selected=True),
+#  SchemeScore(candidate=Params(scheme='wots', w=8, ..., sig_bytes=1088, steps=8670),
+#   signature_cost=Fraction(0, 1), steps_cost=Fraction(1, 1),
+#   score=Fraction(3, 5), selected=False))
 
 merkle_storage_profile(8, 7)
 # MerkleStorageProfile(w=8, height=7, leaf_count=128, signature_wire_bytes=1328,

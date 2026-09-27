@@ -200,7 +200,13 @@ a caller-supplied two-tuple of non-negative weights over its two
 min-max-normalised costs — single-signature serialised size and verifier
 chain steps — the weighted sum divided by the weight total, with exact
 :class:`fractions.Fraction` arithmetic, and returns one :class:`Params`.
-All forty-five
+:func:`explain_scheme_weighted` exports the decision-cost breakdown
+behind that same weighted cross-scheme ranking as a tuple of frozen
+:class:`SchemeScore` rows — one per frontier member, in frontier order,
+each carrying the candidate's metrics, its two normalised costs, its
+final score and a selected flag — with the same exact
+:class:`fractions.Fraction` arithmetic.
+All forty-six
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -217,6 +223,7 @@ from .wots import ELEMENT_BYTES, _params, _validate_w
 
 __all__ = [
     "Params",
+    "SchemeScore",
     "MerkleStorageProfile",
     "MerkleDeploymentScore",
     "MerkleDeploymentScenarioScore",
@@ -240,6 +247,7 @@ __all__ = [
     "recommend_scheme",
     "scheme_frontier",
     "recommend_scheme_weighted",
+    "explain_scheme_weighted",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
@@ -688,6 +696,130 @@ def recommend_scheme_weighted(capacity: Any, budgets: Any, weights: Any) -> Para
         )
 
     return min(frontier, key=ranking)
+
+
+@dataclass(frozen=True)
+class SchemeScore:
+    """Frozen decision-cost breakdown for one cross-scheme configuration.
+
+    One row of :func:`explain_scheme_weighted`'s result. Fields, in
+    positional order:
+
+    - ``candidate``: the row's :class:`Params`, field-for-field the
+      member of the tuple one same-argument :func:`scheme_frontier` call
+      returns;
+    - ``signature_cost`` / ``steps_cost``: the candidate's two
+      min-max-normalised costs, in the same order as the weights — one
+      signature's serialised size (:attr:`Params.sig_bytes`) and the
+      verifier hash-chain step count (:attr:`Params.steps`) — each
+      ``(x - min) / (max - min)`` over the whole frontier, with a zero
+      span scoring ``0``;
+    - ``score``: the final weighted score — the two normalised costs
+      times their weights, summed and divided by the weight total;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_scheme_weighted` would pick.
+
+    Every normalised cost and the score is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    candidate: Params
+    signature_cost: Fraction
+    steps_cost: Fraction
+    score: Fraction
+    selected: bool
+
+
+def explain_scheme_weighted(
+    capacity: Any,
+    budgets: Any,
+    weights: Any,
+) -> tuple[SchemeScore, ...]:
+    """Export the decision-cost breakdown of the weighted scheme ranking.
+
+    The explanatory counterpart of :func:`recommend_scheme_weighted`: it
+    computes :func:`scheme_frontier` exactly once and, instead of
+    returning only the winning :class:`Params`, returns one frozen
+    :class:`SchemeScore` row per frontier member, in the frontier's own
+    order. Each row carries the candidate's :class:`Params`, its two
+    min-max-normalised costs in the same order as the weights — one
+    signature's serialised size (:attr:`Params.sig_bytes`) and the
+    verifier hash-chain step count (:attr:`Params.steps`) — the final
+    weighted score and a ``selected`` flag.
+
+    ``weights`` must be a two-tuple in that same order — single-signature
+    serialised size and verifier chain steps. Every weight must be a
+    non-boolean, non-negative integer and at least one must be positive.
+    Each of the two costs is min-max normalised over the whole frontier
+    as ``(x - min) / (max - min)``, with a zero span scoring ``0``; the
+    score is the sum of the two normalised costs times their weights,
+    divided by the weight total, all exact rationals
+    (``fractions.Fraction``) with no floating point anywhere. Exactly
+    one row is selected: the one whose candidate
+    :func:`recommend_scheme_weighted` returns for the same arguments,
+    field for field — the smallest score, with equal scores broken
+    ascending by :func:`recommend_scheme`'s existing tie-break tail:
+    spare capacity (candidate capacity minus the requested signature
+    count), scheme name, then ``w`` and ``height``, with a missing
+    parameter sorted ahead of any value. When every span is zero every
+    row scores ``0`` and the tie-break tail alone decides; the rows
+    report exactly that, and a lone positive weight lights the
+    frontier member minimising that one dimension.
+
+    ``capacity`` and ``budgets`` follow :func:`scheme_frontier`'s types,
+    ranges, inclusive-budget, exception and no-feasible-candidate rules
+    exactly, so a violation raises exactly as that function does (and is
+    screened before ``weights``). A non-tuple ``weights`` or a
+    non-integer member raises ``TypeError``; a wrong-length tuple or a
+    boolean, negative or all-zero weight raises ``ValueError``. The
+    function is pure: it draws no randomness, generates no keys and
+    changes no state.
+    """
+    frontier = scheme_frontier(capacity, budgets)
+    validated_weights = _validate_scheme_weights(weights)
+
+    metric_rows = tuple(
+        (candidate.sig_bytes, candidate.steps) for candidate in frontier
+    )
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(2)
+    )
+    weight_total = sum(validated_weights)
+
+    entries = []
+    for candidate, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        score = sum(
+            (weight * cost for weight, cost in zip(validated_weights, costs)),
+            Fraction(0),
+        ) / weight_total
+        entries.append((candidate, costs, score))
+
+    def ranking(
+        entry: tuple[Params, tuple[Fraction, Fraction], Fraction],
+    ) -> tuple:
+        candidate, _costs, score = entry
+        return (
+            score,
+            candidate.capacity - capacity,
+            candidate.scheme,
+            candidate.w is not None,
+            candidate.w,
+            candidate.height is not None,
+            candidate.height,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        SchemeScore(candidate, *costs, score, candidate is chosen)
+        for candidate, costs, score in entries
+    )
 
 
 def recommend_merkle_deployment(

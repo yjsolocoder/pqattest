@@ -698,6 +698,150 @@ def recommend_scheme_weighted(capacity: Any, budgets: Any, weights: Any) -> Para
     return min(frontier, key=ranking)
 
 
+def _validate_scheme_weight_scenarios(
+    scenarios: Any,
+) -> tuple[tuple[int, int], ...]:
+    """Validate the non-empty tuple of two-weight scenarios."""
+    if not isinstance(scenarios, tuple):
+        raise TypeError("scenarios must be a tuple of two-tuples of weights")
+    if not scenarios:
+        raise ValueError("scenarios must not be empty")
+    validated = []
+    for scenario in scenarios:
+        if not isinstance(scenario, tuple):
+            raise TypeError("every scenario must be a two-tuple of weights")
+        if len(scenario) != 2:
+            raise ValueError("every scenario must contain exactly two entries")
+        for weight in scenario:
+            if isinstance(weight, bool):
+                raise ValueError(
+                    "every weight must be a non-boolean non-negative integer"
+                )
+            if not isinstance(weight, int):
+                raise TypeError("every weight must be an integer")
+            if weight < 0:
+                raise ValueError(
+                    "every weight must be a non-boolean non-negative integer"
+                )
+        if not any(weight > 0 for weight in scenario):
+            raise ValueError(
+                "every scenario must contain at least one positive weight"
+            )
+        validated.append(scenario)
+    return tuple(validated)
+
+
+def recommend_scheme_weighted_scenarios(
+    capacity: Any,
+    budgets: Any,
+    scenarios: Any,
+) -> Params:
+    """Pick one non-dominated scheme minimising worst regret over scenarios.
+
+    The preference-drift-robust counterpart of
+    :func:`recommend_scheme_weighted`: instead of trusting one fixed
+    two-tuple of cost weights, it evaluates several weight scenarios at
+    once and picks the member of :func:`scheme_frontier`'s returned
+    feasible, non-dominated cross-scheme frontier with the smallest
+    worst-case regret — the maximum, over scenarios, of how much worse
+    the chosen configuration scores than the best configuration for that
+    scenario. The two weighted costs, in order, are one signature's
+    serialised size (:attr:`Params.sig_bytes`) and the verifier
+    hash-chain step count (:attr:`Params.steps`).
+
+    ``scenarios`` must be a non-empty tuple; each member must itself be a
+    two-tuple in that same order — single-signature serialised size and
+    verifier chain steps. Every weight must be a non-boolean,
+    non-negative integer and at least one weight of each scenario must be
+    positive; repeated scenarios are counted separately.
+
+    The frontier is computed exactly once and is the only source of
+    candidates — the candidate enumeration and Pareto filtering are not
+    duplicated, no randomness is drawn and no keys are generated. Each of
+    the two costs is min-max normalised over the whole frontier as
+    ``(x - min) / (max - min)``, with a zero span scoring ``0``. For each
+    scenario, a candidate's score is the weighted sum of its two
+    normalised costs divided by the scenario's weight total, all compared
+    as exact rationals (``fractions.Fraction``) with no floating point
+    anywhere. Each scenario's own minimum score is then subtracted from
+    every candidate's score to give that scenario's regret; candidates
+    are ranked first by the greatest regret over the scenarios (the
+    minimax-regret choice), then by the sum of the regrets, then by the
+    tuple of per-scenario scores, all ascending. Every ranking finishes
+    with the same ascending tie-break as every other cross-scheme
+    ranking — spare capacity (candidate capacity minus the requested
+    signature count), scheme name, then ``w`` and ``height``, with a
+    missing parameter sorted ahead of any value — and the first survivor
+    is returned as a :class:`Params`, field-for-field a member of the
+    tuple one same-argument :func:`scheme_frontier` call returns.
+
+    ``capacity`` and the two-tuple ``budgets`` follow
+    :func:`scheme_frontier`'s types, ranges, inclusive-budget, exception
+    and no-feasible-candidate rules exactly, so a violation raises
+    exactly as that function does (and is screened before ``scenarios``).
+    A non-tuple ``scenarios`` or scenario member, or a non-integer
+    weight, raises ``TypeError``; an empty scenario tuple, a
+    wrong-length scenario, or a boolean, negative or all-zero weight
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state, and repeated calls with the
+    same inputs return item-for-item identical results.
+    """
+    frontier = scheme_frontier(capacity, budgets)
+    validated_scenarios = _validate_scheme_weight_scenarios(scenarios)
+
+    metric_rows = tuple(
+        (candidate.sig_bytes, candidate.steps) for candidate in frontier
+    )
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(2)
+    )
+
+    def normalised(row: tuple[int, int]) -> tuple[Fraction, Fraction]:
+        return tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+
+    normalised_rows = tuple(normalised(row) for row in metric_rows)
+    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
+
+    def scenario_scores(row: tuple[Fraction, Fraction]) -> tuple[Fraction, ...]:
+        return tuple(
+            sum(
+                (weight * component for weight, component in zip(weights, row)),
+                Fraction(0),
+            )
+            / weight_total
+            for weights, weight_total in zip(validated_scenarios, scenario_totals)
+        )
+
+    score_rows = tuple(scenario_scores(row) for row in normalised_rows)
+    scenario_best = tuple(
+        min(row[scenario_index] for row in score_rows)
+        for scenario_index in range(len(validated_scenarios))
+    )
+
+    def ranking(entry: tuple[Params, tuple[Fraction, ...]]) -> tuple:
+        candidate, scores = entry
+        regrets = tuple(
+            score - best for score, best in zip(scores, scenario_best)
+        )
+        return (
+            max(regrets),
+            sum(regrets, Fraction(0)),
+            scores,
+            candidate.capacity - capacity,
+            candidate.scheme,
+            candidate.w is not None,
+            candidate.w,
+            candidate.height is not None,
+            candidate.height,
+        )
+
+    return min(zip(frontier, score_rows), key=ranking)[0]
+
+
 @dataclass(frozen=True)
 class SchemeScore:
     """Frozen decision-cost breakdown for one cross-scheme configuration.

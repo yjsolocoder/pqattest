@@ -28,6 +28,9 @@ recommend_scheme_weighted to rank that cross-scheme frontier by a
 two-tuple of non-negative weights over min-max-normalised costs (single
 signature serialised size and verifier chain steps), the weighted sum
 divided by the weight total, with exact Fraction arithmetic,
+recommend_scheme_weighted_scenarios to rank that same cross-scheme
+frontier by the smallest worst-case regret over a non-empty tuple of such
+two-weight scenarios, again with exact Fraction arithmetic,
 explain_scheme_weighted to export that same weighted ranking's
 decision-cost breakdown as a tuple of frozen SchemeScore rows — one per
 frontier member, in frontier order, each carrying the candidate's
@@ -317,6 +320,7 @@ from .params import (
     recommend_scheme,
     scheme_frontier,
     recommend_scheme_weighted,
+    recommend_scheme_weighted_scenarios,
     explain_scheme_weighted,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
@@ -454,6 +458,7 @@ __all__ = [
     "recommend",
     "recommend_scheme",
     "recommend_scheme_weighted",
+    "recommend_scheme_weighted_scenarios",
     "restore_lattice_claimed",
     "restore_merkle_claimed",
     "restore_ots_pair",

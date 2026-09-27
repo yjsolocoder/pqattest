@@ -198,6 +198,13 @@ with each throwaway signer, and returns the OtsPairProof, the two
 next-generation envelopes (Lamport first, W-OTS second) and g+1, all
 under one paired claim over the (g, g+1) transition that runs only after
 every output exists and keeps no hidden state;
+sign_lamport_auth_state and sign_wots_auth_state are the one-key
+stateless restore-sign-wrap conversions for the two one-time schemes:
+each authenticates the matching v2 envelope, restores its v1 checkpoint,
+signs one message with the throwaway signer, and returns the signature,
+the used-state envelope at g+1 and g+1 itself under a single
+((scheme, g), (scheme, g+1)) claim that runs only after every output
+exists and keeps no hidden state;
 restore_merkle_claimed does the same one-step authenticated restore and
 claim for a Merkle signer v2 envelope; restore_lattice_claimed does it
 for a toy lattice private key v2 envelope, restoring the key with
@@ -476,6 +483,7 @@ __all__ = [
     "recommend_merkle_mode_weighted",
     "recommend_merkle_mode_weighted_scenarios",
     "sign",
+    "sign_lamport_auth_state",
     "sign_merkle_auth_state",
     "sign_merkle_auth_state_batch",
     "sign_multiproof_merkle_auth_state",
@@ -484,6 +492,7 @@ __all__ = [
     "sign_ots_pair_proof_with_auth_state",
     "sign_ots_pair_proof_with_checkpoint",
     "sign_ots_pair_with_checkpoint",
+    "sign_wots_auth_state",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
     "toy_lattice_keygen",
@@ -1803,6 +1812,191 @@ def sign_ots_pair_proof_auth_state(
     if result is not True:
         raise ValueError("claim callback did not return True")
     return pair_proof, (lamport_envelope, wots_envelope), next_generation
+
+
+def sign_lamport_auth_state(
+    data: Any, message: Any, *, key: Any, min_generation: Any = None, claim: Any
+) -> tuple[tuple[bytes, ...], bytes, int]:
+    """Restore a Lamport v2 envelope, sign once, and wrap the used state.
+
+    The stateless restore-sign-wrap conversion for a one-time Lamport key:
+    combines authenticated v2 restore, a single ordinary Lamport signature
+    and wrapping of the used v1 checkpoint in one call without mutating any
+    object, keeping any library state or introducing a new wire format. The
+    envelope in ``data`` is authenticated and restored exactly like
+    :meth:`OneTimeSigner.from_auth_state`; the restored throwaway signer then
+    signs ``message`` exactly once, exactly like :meth:`OneTimeSigner.sign`
+    on a fresh signer. ``key``, ``min_generation`` and ``claim`` are
+    keyword-only; only ``min_generation`` has a default (``None``, no floor).
+    Returns ``(signature, envelope, generation)``: the ordinary immutable
+    signature tuple the first :meth:`OneTimeSigner.sign` returns, value-for-
+    value identical to signing the same message from the same starting
+    state; the :func:`auth_state_wrap` v2 envelope (``bytes``) over the
+    post-sign v1 :meth:`OneTimeSigner.checkpoint` bytes with
+    ``scheme="lamport"``, the original ``key`` and generation ``g + 1`` —
+    byte-for-byte identical to calling :func:`auth_state_wrap` on the
+    checkpoint a signer returns immediately after signing — and the new
+    generation ``g + 1``.
+
+    ``data`` must be ``bytes`` or ``bytearray`` holding a v2 envelope;
+    ``key`` must be a non-empty ``bytes``/``bytearray`` shared secret;
+    ``message`` follows the usual ``bytes``/``bytearray``/``str`` rules;
+    ``min_generation`` must be ``None`` or a non-boolean integer in
+    ``0 .. 2**64 - 1``; ``claim`` must be callable. A wrong type (including a
+    boolean floor or a non-callable claim) raises ``TypeError``. The input
+    generation ``g`` must be strictly below ``2**64 - 1`` so the advanced
+    generation fits a uint64; an envelope at ``2**64 - 1`` raises
+    ``ValueError``. A restored signer that is already used raises
+    :class:`KeyExhaustedError` without consuming the key or leaving a
+    partial result. The v2 HMAC tag is verified first with
+    :func:`hmac.compare_digest`, the envelope is fixed to ``"lamport"`` and
+    the generation floor applied, the v1 checkpoint is restored only
+    afterwards, the signature and the candidate used checkpoint/envelope
+    are built, and only once every output exists is ``claim`` called exactly
+    once with the paired token ``(("lamport", g), ("lamport", g + 1))``, old
+    generation first; the call succeeds only when that return value ``is
+    True`` — an empty key, a bad tag or envelope, a non-lamport scheme
+    (including a v1 envelope), a generation below the floor or at the uint64
+    ceiling, an invalid checkpoint, or a claim that is not ``True`` raises
+    ``ValueError`` — and any exception ``claim`` raises propagates untouched.
+    No earlier failure invokes the callback or returns a partial result. The
+    same inputs always produce byte-identical outputs, no randomness is
+    drawn, no input object is mutated, and no state is kept. The envelope is
+    plaintext and authenticated only; it provides neither encryption nor
+    protection against replay or rollback on its own.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+    message = _as_bytes(message)
+
+    # Authenticate first: no field (including the generation) is trusted
+    # until the HMAC tag over the whole body checks out.
+    _, generation, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect="lamport",
+        min_generation=min_generation,
+    )
+    if generation >= 2**64 - 1:
+        raise ValueError("generation must be below 2**64-1 so it can advance by one")
+    next_generation = generation + 1
+    signer = OneTimeSigner.from_checkpoint(checkpoint)
+    # Build every output before the claim: a used state or any failure here
+    # must leave no partial result and must not call claim. The restored
+    # signer is throwaway, so spending it consumes no caller-held key.
+    with signer._lock:
+        if signer._used:
+            raise KeyExhaustedError("this one-time signing key has already been used")
+        signature = sign(message, signer._private_key)
+        signer._used = True
+        used_checkpoint = signer._checkpoint_bytes()
+    envelope = auth_state_wrap(
+        used_checkpoint,
+        scheme="lamport",
+        key=key_bytes,
+        generation=next_generation,
+    )
+    result = claim_callable((("lamport", generation), ("lamport", next_generation)))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return signature, envelope, next_generation
+
+
+def sign_wots_auth_state(
+    data: Any, message: Any, *, key: Any, min_generation: Any = None, claim: Any
+) -> tuple[tuple[bytes, ...], bytes, int]:
+    """Restore a W-OTS v2 envelope, sign once, and wrap the used state.
+
+    The stateless restore-sign-wrap conversion for a one-time W-OTS key:
+    combines authenticated v2 restore, a single ordinary W-OTS signature and
+    wrapping of the used v1 checkpoint in one call without mutating any
+    object, keeping any library state or introducing a new wire format. The
+    envelope in ``data`` is authenticated and restored exactly like
+    :meth:`WOTSOneTimeSigner.from_auth_state`; the restored throwaway signer
+    then signs ``message`` exactly once, exactly like
+    :meth:`WOTSOneTimeSigner.sign` on a fresh signer. ``key``,
+    ``min_generation`` and ``claim`` are keyword-only; only
+    ``min_generation`` has a default (``None``, no floor). Returns
+    ``(signature, envelope, generation)``: the ordinary immutable W-OTS
+    signature tuple the first :meth:`WOTSOneTimeSigner.sign` returns,
+    value-for-value identical to signing the same message from the same
+    starting state; the :func:`auth_state_wrap` v2 envelope (``bytes``) over
+    the post-sign v1 :meth:`WOTSOneTimeSigner.checkpoint` bytes with
+    ``scheme="wots"``, the original ``key`` and generation ``g + 1`` —
+    byte-for-byte identical to calling :func:`auth_state_wrap` on the
+    checkpoint a signer returns immediately after signing — and the new
+    generation ``g + 1``.
+
+    ``data`` must be ``bytes`` or ``bytearray`` holding a v2 envelope;
+    ``key`` must be a non-empty ``bytes``/``bytearray`` shared secret;
+    ``message`` follows the usual ``bytes``/``bytearray``/``str`` rules;
+    ``min_generation`` must be ``None`` or a non-boolean integer in
+    ``0 .. 2**64 - 1``; ``claim`` must be callable. A wrong type (including a
+    boolean floor or a non-callable claim) raises ``TypeError``. The input
+    generation ``g`` must be strictly below ``2**64 - 1`` so the advanced
+    generation fits a uint64; an envelope at ``2**64 - 1`` raises
+    ``ValueError``. A restored signer that is already used raises
+    :class:`KeyExhaustedError` without consuming the key or leaving a
+    partial result. The v2 HMAC tag is verified first with
+    :func:`hmac.compare_digest`, the envelope is fixed to ``"wots"`` and the
+    generation floor applied, the v1 checkpoint is restored only afterwards,
+    the signature and the candidate used checkpoint/envelope are built, and
+    only once every output exists is ``claim`` called exactly once with the
+    paired token ``(("wots", g), ("wots", g + 1))``, old generation first;
+    the call succeeds only when that return value ``is True`` — an empty
+    key, a bad tag or envelope, a non-wots scheme (including a v1
+    envelope), a generation below the floor or at the uint64 ceiling, an
+    invalid checkpoint, or a claim that is not ``True`` raises
+    ``ValueError`` — and any exception ``claim`` raises propagates
+    untouched. No earlier failure invokes the callback or returns a partial
+    result. The same inputs always produce byte-identical outputs, no
+    randomness is drawn, no input object is mutated, and no state is kept.
+    The envelope is plaintext and authenticated only; it provides neither
+    encryption nor protection against replay or rollback on its own.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
+    key_bytes = _validate_key(key)
+    if min_generation is not None:
+        _validate_generation(min_generation, "min_generation")
+    claim_callable = _validate_claim(claim)
+    message = _as_bytes(message)
+
+    # Authenticate first: no field (including the generation) is trusted
+    # until the HMAC tag over the whole body checks out.
+    _, generation, checkpoint = auth_state_unwrap(
+        data,
+        key=key_bytes,
+        expect="wots",
+        min_generation=min_generation,
+    )
+    if generation >= 2**64 - 1:
+        raise ValueError("generation must be below 2**64-1 so it can advance by one")
+    next_generation = generation + 1
+    signer = WOTSOneTimeSigner.from_checkpoint(checkpoint)
+    # Build every output before the claim: a used state or any failure here
+    # must leave no partial result and must not call claim. The restored
+    # signer is throwaway, so spending it consumes no caller-held key.
+    with signer._lock:
+        if signer._used:
+            raise KeyExhaustedError("this one-time signing key has already been used")
+        signature = wots_sign(message, signer._private_key)
+        signer._used = True
+        used_checkpoint = signer._checkpoint_bytes()
+    envelope = auth_state_wrap(
+        used_checkpoint,
+        scheme="wots",
+        key=key_bytes,
+        generation=next_generation,
+    )
+    result = claim_callable((("wots", generation), ("wots", next_generation)))
+    if result is not True:
+        raise ValueError("claim callback did not return True")
+    return signature, envelope, next_generation
 
 
 def restore_merkle_claimed(

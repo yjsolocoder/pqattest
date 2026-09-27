@@ -154,7 +154,8 @@ Fraction arithmetic,
 and
 the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
 toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
-ToyLatticeCiphertext. The three plaintext signer checkpoints can be sealed
+ToyLatticeCiphertext. The three plaintext signer checkpoints and the toy
+lattice private key's own versioned encoding can be sealed
 in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; a v2
 envelope with auth_state_wrap / auth_state_unwrap additionally binds a
 uint64 generation so an externally tracked floor can detect rollback.
@@ -185,7 +186,8 @@ next-generation envelopes (Lamport first, W-OTS second) and g+1, all
 under one paired claim over the (g, g+1) transition that runs only after
 every output exists and keeps no hidden state;
 restore_merkle_claimed does the same one-step authenticated restore and
-claim for a Merkle signer v2 envelope.
+claim for a Merkle signer v2 envelope; restore_lattice_claimed does it for
+a toy lattice private key wrapped with scheme "lattice".
 sign_merkle_auth_state is the stateless restore-sign-wrap conversion: it
 authenticates a Merkle v2 envelope and restores its v1 payload, signs the
 restored signer's current minimum leaf, wraps the advanced checkpoint at
@@ -435,6 +437,7 @@ __all__ = [
     "public_key_from",
     "recommend",
     "recommend_scheme",
+    "restore_lattice_claimed",
     "restore_merkle_claimed",
     "restore_ots_pair",
     "scheme_frontier",
@@ -1822,6 +1825,53 @@ def restore_merkle_claimed(
         min_generation=floor,
         claim=claim,
         restore=MerkleSigner.from_checkpoint,
+    )
+
+
+def restore_lattice_claimed(
+    data: Any, *, key: Any, floor: Any = None, claim: Any
+) -> tuple["ToyLatticePrivateKey", int]:
+    """Restore a toy lattice private key from a v2 envelope and claim it once.
+
+    The lattice counterpart of :func:`restore_merkle_claimed`: combines v2
+    verification, the generation floor and the private-key parse in one call
+    without drawing randomness or generating keys, and — only once everything
+    has succeeded — performs the external monotonic claim so a caller can
+    never accept a restored key without also claiming its generation. Only an
+    envelope produced by :func:`auth_state_wrap` with ``scheme="lattice"``
+    (whose payload is the key's own versioned
+    :meth:`ToyLatticePrivateKey.to_bytes` encoding) is accepted; no new wire
+    format or library state is introduced. ``key``, ``floor`` and ``claim``
+    are keyword-only; only ``floor`` has a default (``None``, no floor).
+    Returns ``(private_key, generation)``: the restored
+    :class:`ToyLatticePrivateKey` (equal by value to
+    :meth:`ToyLatticePrivateKey.from_bytes` on the embedded payload) and the
+    non-negative uint64 generation carried in the envelope.
+
+    ``data`` must be ``bytes`` or ``bytearray``; ``key`` must be a
+    non-empty ``bytes``/``bytearray`` shared secret; ``floor`` must be
+    ``None`` or a non-boolean integer in ``0 .. 2**64 - 1``; ``claim`` must
+    be callable. A wrong type (including a boolean floor or a non-callable
+    claim) raises ``TypeError``. The v2 HMAC tag is verified first with
+    :func:`hmac.compare_digest`; the envelope scheme is then fixed to
+    ``"lattice"``, the payload magic checked and the generation floor
+    applied; only afterwards is the untouched payload handed to
+    :meth:`ToyLatticePrivateKey.from_bytes`. Once the key is fully restored,
+    ``claim`` is called exactly once with the single token
+    ``("lattice", generation)``; the restore succeeds only when that call
+    returns ``True`` (compared by identity), and any exception it raises
+    propagates untouched. An empty key, a bad tag or envelope, a non-lattice
+    scheme (including a v1 envelope), a generation below the floor, an
+    invalid private-key encoding, or a claim that is not ``True`` raises
+    ``ValueError`` and the callback is never invoked on such a failure.
+    """
+    return _restore_auth_state(
+        "lattice",
+        data,
+        key=key,
+        min_generation=floor,
+        claim=claim,
+        restore=ToyLatticePrivateKey.from_bytes,
     )
 
 

@@ -4,10 +4,13 @@ The Lamport (:meth:`pqattest.OneTimeSigner.checkpoint`), W-OTS
 (:meth:`pqattest.WOTSOneTimeSigner.checkpoint`) and Merkle
 (:meth:`pqattest.MerkleSigner.checkpoint`) checkpoints all serialise the
 signing key in the clear and end in a plain SHA-256 checksum that only
-detects accidental corruption. :func:`auth_wrap` adds an outer
+detects accidental corruption, and the toy lattice private key's own
+versioned encoding (:meth:`pqattest.ToyLatticePrivateKey.to_bytes`) is
+likewise plaintext. :func:`auth_wrap` adds an outer
 HMAC-SHA-256 envelope so a party holding the shared key can tell whether a
-checkpoint was altered by someone without the key; :func:`auth_unwrap`
-verifies the tag and hands the original checkpoint bytes back.
+checkpoint or key encoding was altered by someone without the key;
+:func:`auth_unwrap` verifies the tag and hands the original payload bytes
+back.
 
 :func:`auth_state_wrap` / :func:`auth_state_unwrap` are the version 2
 envelope: the same magic, authentication and v1 parameter rules, plus an
@@ -47,14 +50,16 @@ _AUTH_V1_HEADER_BYTES = 8 + 1 + 1 + 4
 _AUTH_V2_VERSION = 2
 _AUTH_V2_HEADER_BYTES = 8 + 1 + 1 + 8 + 4
 
-# Scheme name -> (envelope identifier, magic prefix of the wrapped checkpoint).
+# Scheme name -> (envelope identifier, magic prefix of the wrapped payload).
 # The magic bytes match the v1 checkpoint codecs in the lamport, wots and
-# merkle modules; they are restated here so this module owns the envelope's
+# merkle modules and the versioned private-key encoding in the toy_lattice
+# module; they are restated here so this module owns the envelope's
 # scheme table without importing the package init.
 _SCHEMES: dict[str, tuple[int, bytes]] = {
     "lamport": (1, b"PQALCP\0\0"),
     "wots": (2, b"PQAWCP\0\0"),
     "merkle": (3, b"PQAMSCP\0"),
+    "lattice": (4, b"PQALSK\0\0"),
 }
 _SCHEME_IDS: dict[int, tuple[str, bytes]] = {
     identifier: (name, magic) for name, (identifier, magic) in _SCHEMES.items()
@@ -103,16 +108,18 @@ def auth_wrap(checkpoint: Any, *, scheme: Any, key: Any) -> bytes:
     """Wrap a plaintext v1 signer checkpoint in a keyed authenticated envelope.
 
     ``checkpoint`` must be ``bytes`` or ``bytearray`` holding the output of
-    one of the three existing checkpoint serialisers; ``key`` must be a
+    one of the three existing checkpoint serialisers or the toy lattice
+    private key's versioned encoding; ``key`` must be a
     non-empty ``bytes``/``bytearray`` shared secret; ``scheme`` is
-    keyword-only and one of ``"lamport"``, ``"wots"`` or ``"merkle"``.
+    keyword-only and one of ``"lamport"``, ``"wots"``, ``"merkle"`` or
+    ``"lattice"``.
     A non-bytes ``checkpoint``/``key`` or a non-str ``scheme`` raises
     ``TypeError``; an empty key, an unknown scheme or a checkpoint whose
     magic does not match the named scheme raises ``ValueError``.
 
     The v1 envelope layout is: the 8-byte magic ``b"PQAAUTH\\0"``; one byte
     each for the version (1) and the scheme identifier (lamport=1, wots=2,
-    merkle=3); the payload length as 4 big-endian bytes; the original
+    merkle=3, lattice=4); the payload length as 4 big-endian bytes; the original
     checkpoint payload unchanged; and finally the 32-byte
     ``HMAC-SHA-256(key, all preceding bytes)`` tag. Encoding is
     deterministic: the same checkpoint, scheme and key always produce the
@@ -143,8 +150,8 @@ def auth_unwrap(data: Any, *, key: Any, expect: Any = None) -> tuple[str, bytes]
     ``data`` must be ``bytes`` or ``bytearray`` produced by
     :func:`auth_wrap` and ``key`` a non-empty ``bytes``/``bytearray`` shared
     secret; the keyword-only ``expect`` may name a scheme
-    (``"lamport"``/``"wots"``/``"merkle"``) that the envelope identifier
-    must then match. Wrong parameter types raise ``TypeError``; an empty
+    (``"lamport"``/``"wots"``/``"merkle"``/``"lattice"``) that the envelope
+    identifier must then match. Wrong parameter types raise ``TypeError``; an empty
     key, an unknown ``expect`` scheme, a bad envelope magic, version or
     scheme identifier, a length field that does not match the content,
     truncation, trailing data, a payload magic that does not match its
@@ -207,7 +214,7 @@ def auth_state_wrap(
 
     The v2 envelope layout is: the 8-byte magic ``b"PQAAUTH\\0"``; one byte
     each for the version (2) and the scheme identifier (lamport=1, wots=2,
-    merkle=3); the generation as 8 big-endian bytes; the payload length as
+    merkle=3, lattice=4); the generation as 8 big-endian bytes; the payload length as
     4 big-endian bytes; the original checkpoint payload unchanged; and
     finally the 32-byte ``HMAC-SHA-256(key, all preceding bytes)`` tag.
     Encoding is deterministic: identical inputs produce identical bytes.

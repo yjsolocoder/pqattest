@@ -234,6 +234,7 @@ __all__ = [
     "recommend",
     "recommend_scheme",
     "scheme_frontier",
+    "recommend_scheme_weighted",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
@@ -595,6 +596,89 @@ def scheme_frontier(capacity: Any, budgets: Any) -> tuple[Params, ...]:
         )
     )
     return tuple(unique)
+
+
+def _validate_scheme_weights(weights: Any) -> tuple[int, int]:
+    """Validate the two-tuple of non-negative scheme cost weights."""
+    if not isinstance(weights, tuple):
+        raise TypeError("weights must be a 2-tuple of non-negative integer weights")
+    if len(weights) != 2:
+        raise ValueError("weights must contain exactly two entries")
+    for weight in weights:
+        if isinstance(weight, bool):
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+        if not isinstance(weight, int):
+            raise TypeError("every weight must be an integer")
+        if weight < 0:
+            raise ValueError("every weight must be a non-boolean non-negative integer")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("at least one weight must be positive")
+    return weights
+
+
+def recommend_scheme_weighted(capacity: Any, budgets: Any, weights: Any) -> Params:
+    """Pick one non-dominated scheme configuration by weighted normalised costs.
+
+    Computes :func:`scheme_frontier` exactly once and ranks the returned
+    feasible, non-dominated configurations by a caller-supplied linear score
+    over two costs: one signature's serialised size
+    (:attr:`Params.sig_bytes`) and the verifier hash-chain step count
+    (:attr:`Params.steps`). The survivor is returned as the frontier's own
+    :class:`Params` member; the candidate enumeration and Pareto filtering
+    are not duplicated — the frontier is the only source of candidates.
+
+    ``weights`` must be a two-tuple in that same order — signature bytes,
+    then verifier steps. Every weight must be a non-boolean, non-negative
+    integer and at least one must be positive. Each of the two costs is
+    min-max normalised over the whole frontier as ``(x - min) / (max -
+    min)``, with a zero span scoring ``0``; the weighted score is the sum of
+    the two normalised costs times their weights, divided by the weight
+    total, all compared as exact rationals (``fractions.Fraction``) with no
+    floating point anywhere. The member with the smallest score is
+    returned; equal scores are broken with the family's usual ascending
+    tie-break tail — spare capacity (candidate capacity minus the requested
+    signature count), the scheme name lexicographically, then ``w`` and
+    ``height``, with a missing parameter sorted ahead of any value — and
+    the first candidate wins.
+
+    ``capacity`` and the two-tuple ``budgets`` follow
+    :func:`scheme_frontier`'s types, ranges, inclusive-budget, exception
+    and no-feasible-candidate rules exactly, so a violation raises exactly
+    as that function does (and is screened before ``weights``). A non-tuple
+    ``weights`` or a non-integer member raises ``TypeError``; a
+    wrong-length tuple or a boolean, negative or all-zero weight raises
+    ``ValueError``. The function is pure: it draws no randomness, generates
+    no keys and changes no state.
+    """
+    frontier = scheme_frontier(capacity, budgets)
+    validated_weights = _validate_scheme_weights(weights)
+
+    metric_rows = tuple((member.sig_bytes, member.steps) for member in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(2)
+    )
+    weight_total = sum(validated_weights)
+
+    def ranking(member: Params) -> tuple:
+        score = Fraction(0)
+        for value, weight, (low, high) in zip(
+            (member.sig_bytes, member.steps), validated_weights, spans
+        ):
+            if high > low:
+                score += weight * Fraction(value - low, high - low)
+        score /= weight_total
+        return (
+            score,
+            member.capacity - capacity,
+            member.scheme,
+            member.w is not None,
+            member.w,
+            member.height is not None,
+            member.height,
+        )
+
+    return min(frontier, key=ranking)
 
 
 def recommend_merkle_deployment(

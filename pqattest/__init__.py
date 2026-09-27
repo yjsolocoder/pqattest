@@ -23,7 +23,11 @@ multiproof_verify_bound (the two proof classes' verify_bound and this
 function bind a proof to the receiver's expected public key and,
 optionally, an explicit leaf-index selection), static
 parameter analysis: Params / profile / recommend / recommend_scheme /
-scheme_frontier / recommend_merkle_deployment /
+scheme_frontier / recommend_scheme_weighted to rank that cross-scheme
+frontier by a two-tuple of non-negative weights over min-max-normalised
+costs (one-signature serialised size and verifier chain steps), the
+weighted sum divided by the weight total, with exact Fraction arithmetic,
+recommend_merkle_deployment /
 merkle_deployment_frontier /
 recommend_merkle_deployment_weighted to rank that ordinary-deployment
 frontier by a four-tuple of non-negative weights over min-max-normalised
@@ -305,6 +309,7 @@ from .params import (
     recommend,
     recommend_scheme,
     scheme_frontier,
+    recommend_scheme_weighted,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
@@ -438,6 +443,7 @@ __all__ = [
     "public_key_from",
     "recommend",
     "recommend_scheme",
+    "recommend_scheme_weighted",
     "restore_lattice_claimed",
     "restore_merkle_claimed",
     "restore_ots_pair",

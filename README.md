@@ -597,6 +597,7 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend(capacity, prefer="size")` — 为期望的签名条数选 Merkle 配置并返回其 `Params`。`capacity` 限 1 至 256 的非布尔整数；`height` 取满足 `2**height >= capacity` 的最小值且至少为 1；`prefer="size"` 选 `w=8`（签名更短），`prefer="speed"` 选 `w=4`（链步更少、验签更快）。非法输入抛 `ValueError`
 - `recommend_scheme(capacity, budgets, prefer="size")` — **跨 Lamport、W-OTS 与 Merkle 三方案的统一推荐入口**，返回所选配置的 `Params`。候选覆盖 `profile` 接受的全部方案与参数组合：容量为 1 时含 Lamport 与 W-OTS（`w=4/8`）两个一次性方案，以及 `w=4/8` × `height=1..8` 的全部 Merkle 配置；请求条数大于 1 时一次性方案只签一条，候选只剩 Merkle 配置。纯函数：不取随机数、不生成密钥、不改状态。前两参数无默认值；`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为**二元组**，依次为单签序列化尺寸（`Params.sig_bytes`）与验签链步上界（`Params.steps`）的含边界上限，口径与 `profile` 指标完全一致，每项为 `None`（不限）或正的非布尔整数，且至少一项非空；叶数不覆盖 `capacity` 或超出预算的候选一律排除。`prefer` 仅取 `"size"`（默认）或 `"speed"`：前者先最小化 `sig_bytes` 再看 `steps`，后者次序相反；两者决胜尾序相同，依次为容量余量（候选容量减请求条数）、方案名字典序、`w` 升序、`height` 升序，无该参数者（`None`）排在最前，取排序首项。校验次序固定为容量、预算、偏好：`budgets` 非元组抛 `TypeError`；容量为布尔、非整数或越界抛 `ValueError`；预算长度不符、成员为布尔/非正/非整数或两项全空同样抛 `ValueError`；偏好取值之外或无任何可行候选也抛 `ValueError` 且不返回结果。同一输入重复调用结果逐项相同
 - `scheme_frontier(capacity, budgets)` — **跨三方案的呈现尺寸与验签成本取舍的非支配前沿入口**，与 `recommend_scheme` 同一组候选、指标口径与预算语义，但不按偏好取一项，而是返回全部可行且非支配的配置，类型为 `tuple[Params, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无偏好参数、无默认参数。候选集合（容量为 1 时含 Lamport 与 W-OTS `w=4/8`，否则仅 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 的 Merkle 配置）与每个候选的容量、单签尺寸、验签链步都与静态指标分析逐字段相同。`budgets` 仍为二元组，依次限制单签序列化尺寸与验签链步，都是含边界上限，每项为 `None`（不限）或正的非布尔整数且至少给出一项，超出任一上限的候选一律排除。支配判定固定为：A 的单签尺寸与验签链步都不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配候选并按值去重，不因偏好预先舍弃尺寸与链步形成取舍的配置，速度端（Lamport，链步 0）与尺寸端（最短单签）都保留。结果按验签链步、单签尺寸、容量余量（候选容量减请求条数）、方案名、`w`、`height` 稳定升序排列，无该参数的候选排在同位最前。`budgets` 非元组抛 `TypeError`；条数为布尔、非整数或越界，预算长度不符、成员非法或两项全空，以及预算下无任何可行候选，均抛 `ValueError`（不返回空元组或半成品）。同一输入重复调用结果逐项相同
+- `recommend_scheme_weighted(capacity, budgets, weights)` — 为跨三方案的 `scheme_frontier` 非支配前沿补上**按二元组权重的归一化加权评分选出单一方案**的推荐入口（基线已有该前沿与按偏好取一项的 `recommend_scheme`，本次只新增单权重版本）：从同一次前沿调用得到的非支配结果中选评分最小的一个方案，返回该前沿成员（现有的 `Params`），不新增值类型、不重复枚举或自行筛选候选、不改变既有前沿、按偏好取一项的选择器与静态指标分析。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与二元组 `budgets` 先按 `scheme_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且一律先于 `weights` 筛查）。`weights` 必须为二元组，依次对应单签序列化尺寸（`Params.sig_bytes`）与验签链步数（`Params.steps`）两项成本；每项权重只能是非布尔非负整数，且两项中至少一项为正。两项成本各自按全前沿的最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0），归一化成本乘各自权重求和后除以权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小的前沿成员，评分完全相同时沿用该族既有决胜尾序（容量余量、方案名、`w`、`height` 升序，无该参数者排在同位最前）取首项。`weights` 非元组或权重成员非整数抛 `TypeError`；权重长度不符、含布尔或负数、或两项全零抛 `ValueError`；条数越界、预算取值非法或没有任何可行候选同样抛 `ValueError` 且不返回结果
 - `recommend_merkle_deployment(capacity, budgets, prefer="size")` — 在部署预算内选可行 Merkle 参数，返回 `MerkleStorageProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（对应 `checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）、验签链步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须覆盖 `capacity`，字节上限按 `merkle_storage_profile` 字段比较，步数上限按 `profile` 返回的 `steps` 比较。`size` 依次最小化签名线长、证明线长、检查点、步数、叶数、`w`、`height`；`speed` 先最小化步数，再沿用前述其余顺序；取排序首项。`budgets` 非元组抛 `TypeError`；其长度或成员非法、`capacity`/`prefer` 非法、无可行候选均抛 `ValueError`
 - `merkle_deployment_frontier(capacity, budgets)` — 与 `recommend_merkle_deployment` 同一组候选与预算，但**不排序取首项**，而是返回全部可行且非支配的普通 Merkle 部署，类型为 `tuple[MerkleStorageProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）及单签验签步数（`profile("merkle", ...).steps`）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 的全部候选，配置取 `merkle_storage_profile`、步数取 `profile` 的 Merkle 结果。支配判定固定为：A 在检查点字节、签名线长、证明线长、单签步数四项上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配候选并按值去重，不因偏好预先舍弃速度与尺寸形成取舍的配置。结果按单签步数、签名线长、证明线长、检查点字节、叶数、`w`、`height` 稳定升序排列。`budgets` 非元组抛 `TypeError`；其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_deployment_weighted(capacity, budgets, weights)` — 在 `merkle_deployment_frontier` 的非支配结果上**按四元组权重的归一化加权评分选出一个普通 Merkle 部署方案**，返回该前沿成员（现有的 `MerkleStorageProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变既有前沿与按偏好取一项的推荐入口。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与四元组 `budgets` 先按 `merkle_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为四元组，依次对应检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）与单签验签链步数（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且四项中至少一项为正。四项成本各自按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0），四项归一化成本乘对应权重求和后除以权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小的前沿成员，评分完全相同时按检查点字节、叶数、`w`、`height` 升序取首项。`weights` 非元组或权重成员非整数抛 `TypeError`；权重长度错误、含布尔或负数、整组全零抛 `ValueError`；无可行方案同样抛 `ValueError`
@@ -663,6 +664,7 @@ from pqattest import (
     recommend,
     recommend_scheme,
     scheme_frontier,
+    recommend_scheme_weighted,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
@@ -739,6 +741,16 @@ frontier = scheme_frontier(1, (None, 10**9))
 #  ...,
 #  Params(scheme='wots', w=8, ..., sig_bytes=1088, steps=8670))
 # 行序按链步、单签尺寸、容量余量、方案名、w、height 稳定升序
+
+# 跨方案前沿的加权选型：给二元组权重（单签序列化字节, 验签链步），对同一
+# 前沿两项成本 min-max 归一化后加权求和并除以权重总和，Fraction 精确取最小，
+# 平局按容量余量、方案名、w、height 决胜；权重须为二元组非布尔非负整数且至少一项为正
+recommend_scheme_weighted(1, (None, 10**9), (1, 1))
+# Params(scheme='wots', w=4, ..., sig_bytes=2144, steps=1005)：两项折中最小
+recommend_scheme_weighted(1, (None, 10**9), (0, 1))
+# Params(scheme='lamport', ..., sig_bytes=8192, steps=0)；只压链步时选 Lamport
+recommend_scheme_weighted(1, (None, 10**9), (1, 0))
+# Params(scheme='wots', w=8, ..., sig_bytes=1088, steps=8670)；只压尺寸选最短单签
 
 merkle_storage_profile(8, 7)
 # MerkleStorageProfile(w=8, height=7, leaf_count=128, signature_wire_bytes=1328,

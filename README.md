@@ -189,6 +189,8 @@ Winternitz（W-OTS）：
 - `sign_ots_pair_with_checkpoint(lamport, wots, message)` — 成对快照入口：用一把 `OneTimeSigner` 与一把 `WOTSOneTimeSigner` 在同一临界区对同一条消息各签名，返回 `((lamport_signature, wots_signature), (lamport_checkpoint, wots_checkpoint))`；两份签名分别等于各自 `sign(message)` 的产出，两份检查点分别等于签后各自 `checkpoint()` 的字节（即分别调用两个 `sign_with_checkpoint` 的两半）。两侧锁按先 Lamport 后 W-OTS 的顺序一起获取，整对要么一起推进要么都不推进；任一签名器已用抛 `KeyExhaustedError` 且两侧都不消耗，消息类型非法抛 `TypeError`，不取随机数。返回的检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_checkpoint(lamport, wots, message)` — 成对证明快照入口：`sign_ots_pair_with_checkpoint` 的证明打包对应物，返回 `(pair_proof, (lamport_checkpoint, wots_checkpoint))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`；两份检查点按先 Lamport 后 W-OTS 排列，逐字节等于签后各自 `checkpoint()` 的字节。签名器或消息类型错抛 `TypeError`、任一侧已用抛 `KeyExhaustedError`，失败时两侧密钥都不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，并发下至多一个调用成功，不取随机数。检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_auth_state(lamport, wots, message, *, key, generation)` — 成对证明认证封装入口：`sign_ots_pair` 的证明打包对应物、`sign_ots_pair_proof_with_checkpoint` 的认证对应物，在同一临界区内对同一条消息两侧各签名、打包证明并把两份签后状态封装，返回 `(pair_proof, (lamport_envelope, wots_envelope))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`，两份签名分别等于两个签名器对同一消息首次 `sign(message)` 的产出；两份 v2 封装按先 Lamport 后 W-OTS 排列（`scheme="lamport"` / `scheme="wots"`，同一 `key` 与 `generation`），各等于签后检查点直接经 `auth_state_wrap` 所得字节（即与签后各自 `checkpoint()` 再封装逐字节相同）。`key` 与 `generation` 仅限关键字：`key` 须为非空 `bytes`/`bytearray`，`generation` 须为 `0..2**64-1` 的非布尔整数。全部参数在花费密钥前验证：签名器或消息类型错抛 `TypeError`，空 key 或代次越界抛 `ValueError`，任一侧已用抛 `KeyExhaustedError` 且另一侧同样不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，整对要么一起推进要么都不推进，并发下至多一个调用成功，其余得到用尽异常，不取随机数、不修改传入对象，同一初始状态重复调用输出逐字节确定。封装仅防无密钥篡改、不加密，也不防复制、重放或回滚；封装内检查点含明文私钥，落盘与防回滚均由调用方负责
+- `ots_pair_checkpoint(lamport, wots)` — 成对**明文状态块**入口：依次接收一把 `OneTimeSigner` 与一把 `WOTSOneTimeSigner`（顺序固定为先 Lamport 后 W-OTS，互换或任一参数类型不符抛 `TypeError`），在两把签名锁按先 Lamport 后 W-OTS 一起取得的同一临界区内取两份既有 v1 检查点并返回一个确定性 v1 字节块；并发快照对每一侧都只会落在某次签名之前或之后，不会落在签名中途。同一对状态重复编码逐字节相同，不取随机数、不修改传入签名器。字节块含两份明文私钥，末尾 SHA-256 只防意外损坏，不提供认证或加密，须当秘密保管；落盘原子性、防复制与防回滚由调用方负责
+- `ots_pair_restore(data)` — 成对状态块还原入口，与 `ots_pair_checkpoint` 对应：`data` 只接受 `bytes`/`bytearray`，其他类型抛 `TypeError`，全程不取随机数。成功返回二元组 `(lamport_signer, wots_signer)`，Lamport 在前；两把公钥逐值等于打包时的公钥，用尽状态逐值一致——未用一侧恢复后仍只许签一次，已用一侧恢复后任何 `sign` 都抛 `KeyExhaustedError`。坏魔数、未知版本、长度字段为零或与内容不符、截断、尾随数据或外层校验值不符一律抛 `ValueError`；内嵌任一段检查点自身 v1 解析失败（含两侧字节被互换）同样抛 `ValueError` 且不返回任何实例
 
 构造细节（域串 `b"pqattest/wots/v1"`）：令 `B = 2**w`，SHA-256 摘要按大端拆成 `256/w` 个基 `B` 数字；校验和为 `sum(B-1-d)`，取满足 `B**l2 > (256/w)*(B-1)` 的最小 `l2`（w=4 时 l2=3，w=8 时 l2=2），并编码为固定 `l2` 位的大端基 `B` 数字（保留前导零）。每条链始于一个随机值，链步为 `H(x) = SHA256(b"pqattest/wots/v1" + x)`；签名依次给出消息数字与校验和数字对应的第 `d` 步值（w=4 共 67 个元素、2144 字节；w=8 共 34 个元素、1088 字节），公钥保存第 `B-1` 步端点；验证时补足剩余步数并逐条比对端点。无效 `w`、令牌长度错误或元素数量/长度错误抛 `ValueError`。
 
@@ -226,6 +228,8 @@ W-OTS 一次性签名器检查点 v1 二进制格式（`WOTSOneTimeSigner.checkp
 Lamport 密钥与签名 v1 线格式（`PrivateKey.to_bytes` / `PublicKey.to_bytes` / `lamport_signature_to_bytes`）：三种格式结构相同——8 字节魔数（私钥 `b"PQALPRV\0"`、公钥 `b"PQALPUB\0"`、签名 `b"PQALSIG\0"`）；1 字节版本（1）；两个 2 字节大端无符号整数依次为 `bits`（1..256）与元素计数（密钥严格等于 `2 * bits`，签名严格等于 `bits`）；随后按原序拼接全部 32 字节元素。总长度为 `13 + 元素计数 × 32` 字节（默认 bits=256 时：密钥 16397 字节，签名 8205 字节）。编码确定、同值同字节；私钥编码含明文秘密。
 
 Lamport 一次性签名器检查点 v1 二进制格式（`OneTimeSigner.checkpoint`）：8 字节魔数 `b"PQALCP\0\0"`；各 1 字节的版本（1）与 `used`（仅 0 或 1）；4 字节大端无符号嵌套私钥编码长度；随后是完整的 `PrivateKey.to_bytes()` 输出（即上面的 Lamport 私钥 v1 编码原样嵌入）；最后为此前全部内容的 SHA-256。总长度为 `14 + 私钥编码长度 + 32` 字节（默认 bits=256 时 16443 字节）。编码确定、同状态同字节；检查点含明文秘密，末尾校验值只发现意外损坏，不提供认证或加密。
+
+Lamport/W-OTS 成对状态块 v1 二进制格式（`ots_pair_checkpoint` / `ots_pair_restore`）：8 字节魔数 `b"PQAOPCP\0"`；1 字节版本（1）；两个 4 字节大端长度依次为内嵌 Lamport 检查点与 W-OTS 检查点的字节数；随后按此次序原样嵌入两份**既有 v1 签名器检查点**（`OneTimeSigner.checkpoint` 在前、`WOTSOneTimeSigner.checkpoint` 在后，均逐字节不改动）；最后为此前全部内容的 SHA-256。总长度为 `17 + Lamport 检查点长度 + W-OTS 检查点长度 + 32` 字节（默认参数、w=4、两侧均未用时 18681 字节）。编码确定、同状态同字节；两个长度字段都必须非零且与实际内容严格一致，坏魔数、未知版本、长度不符、截断、尾随、外层校验值不符或任一段内嵌检查点自身解析失败，一律抛 `ValueError` 且不返回实例。该块仍是含两份明文私钥的检查点，校验值既不认证也不加密，方案集合不因此扩展。
 
 Lamport 证明包 v1 线格式（`LamportProof.to_bytes`）：8 字节魔数 `b"PQALPRF\0"`；1 字节版本（1）；4 字节大端公钥长度；4 字节大端签名长度；随后先拼接完整的 `PublicKey.to_bytes()` 公钥 v1 编码，再拼接以该公钥 `bits` 约束的 `lamport_signature_to_bytes` 签名 v1 编码（两种既有编码原样串联，证明包不另造单体编码）。长度字段必须与各自编码的实际内容一致；解析顺序固定为先公钥、后签名，签名始终由同包内刚恢复的公钥约束。总长度为 `17 + 公钥编码长度 + 签名编码长度` 字节。
 
@@ -313,6 +317,30 @@ restored = OneTimeSigner.from_checkpoint(blob)
 assert restored.public_key == one_time.public_key
 restored.sign(b"position claim")           # 成功；此后任何 sign 都抛 KeyExhaustedError
 ```
+
+需要把成对使用的 Lamport 与 W-OTS 签名器作为**一个**整体状态搬移时，用 `ots_pair_checkpoint` / `ots_pair_restore`，得到的是一个统一字节块而非两份分离检查点；打包与两侧签名共用两把锁并按先 Lamport 后 W-OTS 的同一次序取得：
+
+```python
+from pqattest import (
+    OneTimeSigner, WOTSOneTimeSigner, keygen, wots_keygen,
+    ots_pair_checkpoint, ots_pair_restore,
+)
+
+lamport = OneTimeSigner(keygen()[0])
+wots = WOTSOneTimeSigner(wots_keygen()[0])
+
+blob = ots_pair_checkpoint(lamport, wots)  # 参数顺序固定：先 Lamport 后 W-OTS
+assert ots_pair_checkpoint(lamport, wots) == blob   # 同一状态逐字节相同
+
+restored_lamport, restored_wots = ots_pair_restore(blob)
+assert restored_lamport.public_key == lamport.public_key
+assert restored_wots.public_key == wots.public_key
+restored_lamport.sign(b"position claim")             # 未用一侧仍只许签一次
+restored_wots.sign(b"position claim")
+# restored_lamport.sign(b"again") -> KeyExhaustedError
+```
+
+**成对状态块安全须知**：该块与三份明文检查点同级——里面是两份明文私钥，末尾 SHA-256 只发现意外损坏，**不提供认证或加密**，也不扩展两代认证封装的方案集合；原子落盘、防复制与防回滚仍由调用方负责（回滚到旧块等于把一次性密钥对整体回退）。`ots_pair_restore` 只做解析与既有 v1 检查点恢复，不取随机数、不修改传入对象。
 
 **检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
 

@@ -183,6 +183,11 @@ authenticates and restores a v2 envelope and then invokes a caller-supplied
 monotonic claim callback exactly once; restore_ots_pair restores a
 same-generation Lamport/W-OTS pair and claims both sides with a single
 callback, so a claim can never succeed for only one side;
+ots_pair_checkpoint snapshots a Lamport/W-OTS pair (Lamport first, W-OTS
+second) into one deterministic plaintext v1 byte block under both signing
+locks and ots_pair_restore parses that block back into the signer pair
+without randomness (the block is plaintext and its checksum neither
+authenticates nor encrypts);
 sign_ots_pair signs one message with a Lamport/W-OTS signer pair under a
 joint lock and returns both signatures together with the v2 envelopes of
 the two advanced states, so the pair either advances together or not at
@@ -470,6 +475,8 @@ __all__ = [
     "multiproof_encode",
     "multiproof_verify",
     "multiproof_verify_bound",
+    "ots_pair_checkpoint",
+    "ots_pair_restore",
     "profile",
     "public_key_from",
     "recommend",
@@ -536,6 +543,11 @@ _PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
 _PAIR_PROOF_MAGIC = b"PQAOPRF\0"
 _PAIR_PROOF_VERSION = 1
 _PAIR_PROOF_HEADER_BYTES = 8 + 1 + 4 + 4
+
+_PAIR_CHECKPOINT_MAGIC = b"PQAOPCP\0"
+_PAIR_CHECKPOINT_VERSION = 1
+_PAIR_CHECKPOINT_HEADER_BYTES = 8 + 1 + 4 + 4
+_PAIR_CHECKPOINT_CHECKSUM_BYTES = 32
 
 
 def _validate_bits(bits: Any) -> int:
@@ -1383,6 +1395,106 @@ def restore_ots_pair(
         restore_a=OneTimeSigner.from_checkpoint,
         restore_b=WOTSOneTimeSigner.from_checkpoint,
     )
+
+
+def ots_pair_checkpoint(lamport: Any, wots: Any) -> bytes:
+    """Snapshot a Lamport/W-OTS signer pair as one deterministic v1 block.
+
+    Paired plaintext counterpart of :meth:`OneTimeSigner.checkpoint` and
+    :meth:`WOTSOneTimeSigner.checkpoint` for callers that keep the two
+    one-time keys in lockstep: ``lamport`` must be a :class:`OneTimeSigner`
+    and ``wots`` a :class:`WOTSOneTimeSigner`, in that fixed order (a
+    swapped or otherwise wrong type raises ``TypeError``). Both signing
+    locks are acquired together, Lamport first and W-OTS second — the same
+    order every paired operation uses — and both existing v1 checkpoints
+    are taken inside that joint critical section, so a concurrent snapshot
+    reflects each state either immediately before or immediately after an
+    in-flight signature, never part-way through one. No randomness is drawn
+    and neither signer is mutated.
+
+    The v1 layout is: the 8-byte magic ``b"PQAOPCP\\0"``; the version byte
+    (1); the Lamport checkpoint length and the W-OTS checkpoint length as 4
+    big-endian bytes each; then the complete existing v1
+    :meth:`OneTimeSigner.checkpoint` bytes, followed by the complete
+    existing v1 :meth:`WOTSOneTimeSigner.checkpoint` bytes, each embedded
+    unchanged in that order; and finally the SHA-256 of all preceding
+    content. Encoding is deterministic: the same pair state always produces
+    the same bytes. The block contains both private keys in the clear and
+    the trailing hash only detects accidental corruption — it provides
+    neither authentication nor encryption, so store it as a secret;
+    atomic persistence, copy protection and rollback protection are the
+    caller's responsibility.
+    """
+    if not isinstance(lamport, OneTimeSigner):
+        raise TypeError("lamport must be a OneTimeSigner")
+    if not isinstance(wots, WOTSOneTimeSigner):
+        raise TypeError("wots must be a WOTSOneTimeSigner")
+    with lamport._lock, wots._lock:
+        lamport_checkpoint = lamport._checkpoint_bytes()
+        wots_checkpoint = wots._checkpoint_bytes()
+        body = (
+            _PAIR_CHECKPOINT_MAGIC
+            + bytes((_PAIR_CHECKPOINT_VERSION,))
+            + len(lamport_checkpoint).to_bytes(4, "big")
+            + len(wots_checkpoint).to_bytes(4, "big")
+            + lamport_checkpoint
+            + wots_checkpoint
+        )
+        return body + hashlib.sha256(body).digest()
+
+
+def ots_pair_restore(data: Any) -> tuple["OneTimeSigner", "WOTSOneTimeSigner"]:
+    """Restore a Lamport/W-OTS signer pair from :func:`ots_pair_checkpoint`.
+
+    ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+    ``TypeError``. No randomness is drawn and no input object is mutated.
+    The trailing SHA-256 is checked against everything before it, and the
+    two embedded v1 checkpoints are then restored by
+    :meth:`OneTimeSigner.from_checkpoint` and
+    :meth:`WOTSOneTimeSigner.from_checkpoint` respectively, Lamport first.
+    A bad magic, an unknown version, a zero or otherwise mismatching length
+    field, truncation, trailing data or a checksum mismatch raises
+    ``ValueError``; a checkpoint segment that fails its own v1 parsing also
+    raises ``ValueError`` and no signer is returned.
+
+    On success returns ``(lamport_signer, wots_signer)`` in the same fixed
+    order: each rebuilt signer's public key is value-equal to the packed
+    signer's and its exhausted state matches too — a side packed unused
+    still allows exactly one signature after restore, and a side packed
+    used raises :class:`KeyExhaustedError` on every signing attempt.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("pair checkpoint data must be bytes or bytearray")
+    data = bytes(data)
+    header = _PAIR_CHECKPOINT_HEADER_BYTES
+    if len(data) < header + _PAIR_CHECKPOINT_CHECKSUM_BYTES:
+        raise ValueError("pair checkpoint is too short")
+    body, checksum = (
+        data[: -_PAIR_CHECKPOINT_CHECKSUM_BYTES],
+        data[-_PAIR_CHECKPOINT_CHECKSUM_BYTES:],
+    )
+    if body[:8] != _PAIR_CHECKPOINT_MAGIC:
+        raise ValueError("bad pair checkpoint magic")
+    if body[8] != _PAIR_CHECKPOINT_VERSION:
+        raise ValueError(f"unsupported pair checkpoint version: {body[8]}")
+    lamport_length = int.from_bytes(body[9:13], "big")
+    wots_length = int.from_bytes(body[13:17], "big")
+    lamport_end = header + lamport_length
+    wots_end = lamport_end + wots_length
+    if lamport_length == 0 or wots_length == 0:
+        raise ValueError("a length field must not be zero")
+    if len(body) != wots_end:
+        raise ValueError(
+            "pair checkpoint length fields do not match the content"
+        )
+    if hashlib.sha256(body).digest() != checksum:
+        raise ValueError("pair checkpoint checksum mismatch")
+    try:
+        lamport = OneTimeSigner.from_checkpoint(body[header:lamport_end])
+        wots = WOTSOneTimeSigner.from_checkpoint(body[lamport_end:wots_end])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid nested checkpoint encoding: {exc}") from exc
+    return lamport, wots
 
 
 def sign_ots_pair(

@@ -158,6 +158,13 @@ costs, its final score and a selected flag — with the same exact
 at once, minimising the worst per-scenario regret (then regret sum, then
 per-scenario scores) with the same exact :class:`fractions.Fraction`
 arithmetic, and returns one :class:`MerkleModeCost`.
+:func:`explain_merkle_verify_mode_weighted` exports the decision-cost
+breakdown behind that same multi-scenario fixed-position ranking as a
+tuple of frozen :class:`MerkleVerifyModeScore` rows — one per frontier
+member, in frontier order, each carrying the candidate's plan/cost
+pairing, its five normalised costs, its per-scenario scores and regrets
+and a selected flag — with the same exact
+:class:`fractions.Fraction` arithmetic.
 :func:`recommend_merkle_cardinality_weighted_scenarios` applies that same
 preference-drift-robust multi-scenario minimax-regret ranking to the
 worst-case-position :func:`merkle_cardinality_frontier` frontier.
@@ -200,13 +207,24 @@ a caller-supplied two-tuple of non-negative weights over its two
 min-max-normalised costs — single-signature serialised size and verifier
 chain steps — the weighted sum divided by the weight total, with exact
 :class:`fractions.Fraction` arithmetic, and returns one :class:`Params`.
+:func:`recommend_scheme_weighted_scenarios` ranks that same cross-scheme
+frontier against several such two-weight scenarios at once, minimising
+the worst per-scenario regret (then regret sum, then per-scenario
+scores) with the same exact :class:`fractions.Fraction` arithmetic, and
+returns one :class:`Params`.
 :func:`explain_scheme_weighted` exports the decision-cost breakdown
 behind that same weighted cross-scheme ranking as a tuple of frozen
 :class:`SchemeScore` rows — one per frontier member, in frontier order,
 each carrying the candidate's metrics, its two normalised costs, its
 final score and a selected flag — with the same exact
 :class:`fractions.Fraction` arithmetic.
-All forty-six
+:func:`explain_scheme_weighted_scenarios` exports the decision-cost
+breakdown behind that same multi-scenario cross-scheme ranking as a
+tuple of frozen :class:`SchemeScenarioScore` rows — one per frontier
+member, in frontier order, each carrying the candidate's metrics, its
+two normalised costs, its per-scenario scores and regrets and a selected
+flag — with the same exact :class:`fractions.Fraction` arithmetic.
+All forty-eight
 are pure functions: no randomness, no
 state, no I/O, no keys are generated.
 """
@@ -224,6 +242,7 @@ from .wots import ELEMENT_BYTES, _params, _validate_w
 __all__ = [
     "Params",
     "SchemeScore",
+    "SchemeScenarioScore",
     "MerkleStorageProfile",
     "MerkleDeploymentScore",
     "MerkleDeploymentScenarioScore",
@@ -247,7 +266,9 @@ __all__ = [
     "recommend_scheme",
     "scheme_frontier",
     "recommend_scheme_weighted",
+    "recommend_scheme_weighted_scenarios",
     "explain_scheme_weighted",
+    "explain_scheme_weighted_scenarios",
     "recommend_merkle_deployment",
     "merkle_deployment_frontier",
     "recommend_merkle_deployment_weighted",
@@ -961,6 +982,166 @@ def explain_scheme_weighted(
     return tuple(
         SchemeScore(candidate, *costs, score, candidate is chosen)
         for candidate, costs, score in entries
+    )
+
+
+@dataclass(frozen=True)
+class SchemeScenarioScore:
+    """Frozen multi-scenario decision-cost breakdown for one scheme config.
+
+    One row of :func:`explain_scheme_weighted_scenarios`'s result. Fields,
+    in positional order:
+
+    - ``params``: the candidate's :class:`Params` static metrics;
+    - ``signature_cost`` / ``steps_cost``: the candidate's two
+      min-max-normalised costs, in the same order as the weights — one
+      signature's serialised size (:attr:`Params.sig_bytes`) and the
+      verifier hash-chain step count (:attr:`Params.steps`) — each
+      ``(x - min) / (max - min)`` over the whole frontier, with a zero
+      span scoring ``0``;
+    - ``scores``: the per-scenario weighted scores, in the same order as
+      the input scenarios — each the two normalised costs times that
+      scenario's weights, summed and divided by the scenario's weight
+      total;
+    - ``regrets``: the per-scenario regrets, in the same order — each
+      score minus that scenario's best score over the whole frontier;
+    - ``selected``: ``True`` on exactly the one row
+      :func:`recommend_scheme_weighted_scenarios` would pick.
+
+    Every normalised cost, score and regret is an exact
+    :class:`fractions.Fraction`. Instances are frozen, support positional
+    construction and compare (and hash) by value; no key material or
+    randomness is involved.
+    """
+
+    params: Params
+    signature_cost: Fraction
+    steps_cost: Fraction
+    scores: tuple[Fraction, ...]
+    regrets: tuple[Fraction, ...]
+    selected: bool
+
+
+def explain_scheme_weighted_scenarios(
+    capacity: Any,
+    budgets: Any,
+    scenarios: Any,
+) -> tuple[SchemeScenarioScore, ...]:
+    """Export the multi-scenario breakdown of the weighted scheme ranking.
+
+    The explanatory counterpart of
+    :func:`recommend_scheme_weighted_scenarios`: it computes
+    :func:`scheme_frontier` exactly once and, instead of returning only
+    the winning configuration, returns one frozen
+    :class:`SchemeScenarioScore` row per frontier member, in the
+    frontier's own order. Each row carries the candidate's :class:`Params`
+    static metrics, its two min-max-normalised costs in the same order as
+    the weights — one signature's serialised size
+    (:attr:`Params.sig_bytes`) and the verifier hash-chain step count
+    (:attr:`Params.steps`) — its per-scenario scores, its per-scenario
+    regrets and a ``selected`` flag.
+
+    ``scenarios`` must be a non-empty tuple; each member must itself be a
+    two-tuple in that same order — single-signature serialised size and
+    verifier chain steps. Every weight must be a non-boolean,
+    non-negative integer and at least one weight of each scenario must be
+    positive; repeated scenarios are counted separately. Each of the two
+    costs is min-max normalised over the whole frontier as
+    ``(x - min) / (max - min)``, with a zero span scoring ``0``. For each
+    scenario, a candidate's score is the weighted sum of its two
+    normalised costs divided by the scenario's weight total, and its
+    regret is that score minus the scenario's best score over the whole
+    frontier — all exact rationals (``fractions.Fraction``) with no
+    floating point anywhere. Exactly one row is selected: the one whose
+    :class:`Params` :func:`recommend_scheme_weighted_scenarios` returns
+    for the same arguments, field for field — the smallest worst regret,
+    with ties broken by the regret sum, then the per-scenario score
+    tuple, then ascending by spare capacity (candidate capacity minus the
+    requested signature count), scheme name, then ``w`` and ``height``, a
+    missing parameter sorting ahead of any value. When every span is zero
+    every row scores ``0`` in every scenario and the tie-break tail alone
+    decides, which the rows report exactly.
+
+    ``capacity`` and the two-tuple ``budgets`` follow
+    :func:`scheme_frontier`'s types, ranges, inclusive-budget, exception
+    and no-feasible-candidate rules exactly, so a violation raises
+    exactly as that function does (and is screened before
+    ``scenarios``). A non-tuple ``scenarios`` or scenario member, or a
+    non-integer weight, raises ``TypeError``; an empty scenario tuple, a
+    wrong-length scenario, or a boolean, negative or all-zero weight
+    raises ``ValueError``. The function is pure: it draws no randomness,
+    generates no keys and changes no state, and repeated calls with the
+    same inputs return item-for-item identical results.
+    """
+    frontier = scheme_frontier(capacity, budgets)
+    validated_scenarios = _validate_scheme_weight_scenarios(scenarios)
+
+    metric_rows = tuple(
+        (candidate.sig_bytes, candidate.steps) for candidate in frontier
+    )
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(2)
+    )
+    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
+
+    entries = []
+    for candidate, row in zip(frontier, metric_rows):
+        costs = tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        scores = tuple(
+            sum(
+                (weight * component for weight, component in zip(weights, costs)),
+                Fraction(0),
+            )
+            / weight_total
+            for weights, weight_total in zip(validated_scenarios, scenario_totals)
+        )
+        entries.append((candidate, costs, scores))
+
+    scenario_best = tuple(
+        min(entry[2][scenario_index] for entry in entries)
+        for scenario_index in range(len(validated_scenarios))
+    )
+    entries = [
+        (
+            candidate,
+            costs,
+            scores,
+            tuple(score - best for score, best in zip(scores, scenario_best)),
+        )
+        for candidate, costs, scores in entries
+    ]
+
+    def ranking(
+        entry: tuple[
+            Params,
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+            tuple[Fraction, ...],
+        ],
+    ) -> tuple:
+        candidate, _costs, scores, regrets = entry
+        return (
+            max(regrets),
+            sum(regrets, Fraction(0)),
+            scores,
+            candidate.capacity - capacity,
+            candidate.scheme,
+            candidate.w is not None,
+            candidate.w,
+            candidate.height is not None,
+            candidate.height,
+        )
+
+    chosen = min(entries, key=ranking)[0]
+    return tuple(
+        SchemeScenarioScore(
+            candidate, *costs, scores, regrets, candidate is chosen
+        )
+        for candidate, costs, scores, regrets in entries
     )
 
 

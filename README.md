@@ -189,6 +189,8 @@ Winternitz（W-OTS）：
 - `sign_ots_pair_with_checkpoint(lamport, wots, message)` — 成对快照入口：用一把 `OneTimeSigner` 与一把 `WOTSOneTimeSigner` 在同一临界区对同一条消息各签名，返回 `((lamport_signature, wots_signature), (lamport_checkpoint, wots_checkpoint))`；两份签名分别等于各自 `sign(message)` 的产出，两份检查点分别等于签后各自 `checkpoint()` 的字节（即分别调用两个 `sign_with_checkpoint` 的两半）。两侧锁按先 Lamport 后 W-OTS 的顺序一起获取，整对要么一起推进要么都不推进；任一签名器已用抛 `KeyExhaustedError` 且两侧都不消耗，消息类型非法抛 `TypeError`，不取随机数。返回的检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_checkpoint(lamport, wots, message)` — 成对证明快照入口：`sign_ots_pair_with_checkpoint` 的证明打包对应物，返回 `(pair_proof, (lamport_checkpoint, wots_checkpoint))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`；两份检查点按先 Lamport 后 W-OTS 排列，逐字节等于签后各自 `checkpoint()` 的字节。签名器或消息类型错抛 `TypeError`、任一侧已用抛 `KeyExhaustedError`，失败时两侧密钥都不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，并发下至多一个调用成功，不取随机数。检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_auth_state(lamport, wots, message, *, key, generation)` — 成对证明认证封装入口：`sign_ots_pair` 的证明打包对应物、`sign_ots_pair_proof_with_checkpoint` 的认证对应物，在同一临界区内对同一条消息两侧各签名、打包证明并把两份签后状态封装，返回 `(pair_proof, (lamport_envelope, wots_envelope))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`，两份签名分别等于两个签名器对同一消息首次 `sign(message)` 的产出；两份 v2 封装按先 Lamport 后 W-OTS 排列（`scheme="lamport"` / `scheme="wots"`，同一 `key` 与 `generation`），各等于签后检查点直接经 `auth_state_wrap` 所得字节（即与签后各自 `checkpoint()` 再封装逐字节相同）。`key` 与 `generation` 仅限关键字：`key` 须为非空 `bytes`/`bytearray`，`generation` 须为 `0..2**64-1` 的非布尔整数。全部参数在花费密钥前验证：签名器或消息类型错抛 `TypeError`，空 key 或代次越界抛 `ValueError`，任一侧已用抛 `KeyExhaustedError` 且另一侧同样不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，整对要么一起推进要么都不推进，并发下至多一个调用成功，其余得到用尽异常，不取随机数、不修改传入对象，同一初始状态重复调用输出逐字节确定。封装仅防无密钥篡改、不加密，也不防复制、重放或回滚；封装内检查点含明文私钥，落盘与防回滚均由调用方负责
+- `ots_pair_checkpoint(lamport, wots)` — 成对状态检查点入口：依次接收一把 `OneTimeSigner`（Lamport）与一把 `WOTSOneTimeSigner`，顺序固定，互换或以其他类型占位均抛 `TypeError`；返回单个确定编码的 v1 字节块，把两份既有 v1 检查点（先 Lamport 后 W-OTS）连同各自 4 字节大端长度原样嵌入并追加整体 SHA-256 校验值，任一单签检查点格式都不改变。打包时两把签名锁按先 Lamport 后 W-OTS 的固定次序一起取得（与所有成对签名入口同序），每份快照又各自与本侧 `sign` 共用锁，故并发快照只会落在成对（或单侧）操作之前或之后，不会落在中途；不取随机数、不修改传入签名器，同一成对状态重复编码逐字节相同。字节块含两份明文私钥，末尾校验值只发现意外损坏，不提供认证或加密，落盘原子性、防复制与防回滚均由调用方负责
+- `ots_pair_restore(data)` — 成对状态还原入口：只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），不取随机数；先核对魔数、版本、两个长度字段与末尾 SHA-256，再把两段内嵌检查点原样交给 `OneTimeSigner.from_checkpoint` 与 `WOTSOneTimeSigner.from_checkpoint`（先 Lamport 后 W-OTS）。成功返回 `(lamport_signer, wots_signer)`：两把签名器公钥与打包时逐值相等、`used` 状态逐值保留——未用一侧恢复后仍只许签一次，已用一侧恢复后任何 `sign` 都抛 `KeyExhaustedError`。坏魔数、未知版本、长度字段与内容不符、截断、尾随数据、校验值不符，或任一段内嵌检查点自身解析失败（含两段顺序互换），一律抛 `ValueError` 且不返回实例
 
 构造细节（域串 `b"pqattest/wots/v1"`）：令 `B = 2**w`，SHA-256 摘要按大端拆成 `256/w` 个基 `B` 数字；校验和为 `sum(B-1-d)`，取满足 `B**l2 > (256/w)*(B-1)` 的最小 `l2`（w=4 时 l2=3，w=8 时 l2=2），并编码为固定 `l2` 位的大端基 `B` 数字（保留前导零）。每条链始于一个随机值，链步为 `H(x) = SHA256(b"pqattest/wots/v1" + x)`；签名依次给出消息数字与校验和数字对应的第 `d` 步值（w=4 共 67 个元素、2144 字节；w=8 共 34 个元素、1088 字节），公钥保存第 `B-1` 步端点；验证时补足剩余步数并逐条比对端点。无效 `w`、令牌长度错误或元素数量/长度错误抛 `ValueError`。
 
@@ -234,6 +236,8 @@ W-OTS 密钥与签名 v1 线格式（`WOTSPrivateKey.to_bytes` / `WOTSPublicKey.
 W-OTS 证明包 v1 线格式（`WOTSProof.to_bytes`）：8 字节魔数 `b"PQAWPRF\0"`；1 字节版本（1）；4 字节大端公钥长度；4 字节大端签名长度；随后先拼接完整的 `WOTSPublicKey.to_bytes()` 公钥 v1 编码，再拼接以该公钥 `w` 约束的 `wots_signature_to_bytes` 签名 v1 编码（两种既有编码原样串联，证明包不另造单体编码）。长度字段必须与各自编码的实际内容一致；解析顺序固定为先公钥、后签名，签名始终由同包内刚恢复的公钥约束。总长度为 `17 + 公钥编码长度 + 签名编码长度` 字节。
 
 成对证明包 v1 线格式（`OtsPairProof.to_bytes`）：8 字节魔数 `b"PQAOPRF\0"`；1 字节版本（1）；4 字节大端 Lamport 证明包长度；4 字节大端 W-OTS 证明包长度；随后按先 Lamport 后 W-OTS 的顺序原样串联两份既有 v1 证明包编码（`LamportProof.to_bytes()` 与 `WOTSProof.to_bytes()` 的输出原样嵌入，成对包不另造单体编码）。长度字段必须与各自证明包的实际内容一致；解析顺序固定为先 Lamport、后 W-OTS，两份证明各自由同包内刚恢复的对应编码重建。总长度为 `17 + Lamport 证明包长度 + W-OTS 证明包长度` 字节。
+
+Lamport/W-OTS 成对状态检查点 v1 线格式（`ots_pair_checkpoint`）：8 字节魔数 `b"PQAOPCP\0"`；1 字节版本（1）；4 字节大端 Lamport 检查点长度；4 字节大端 W-OTS 检查点长度；随后按先 Lamport 后 W-OTS 的顺序原样串联两份既有 v1 一次性签名器检查点（`OneTimeSigner.checkpoint()` 与 `WOTSOneTimeSigner.checkpoint()` 的输出原样嵌入，成对块不另造单体编码，也不扩展两类认证封装的方案集合——该块不是任何 auth 封装的合法载荷）；最后为此前全部内容的 SHA-256。总长度为 `17 + Lamport 检查点长度 + W-OTS 检查点长度 + 32` 字节。长度字段必须与各自检查点实际内容一致；解析顺序固定为先 Lamport、后 W-OTS，两把签名器各自由同块内刚恢复的对应检查点重建。编码确定、同状态同字节；成块含两份明文私钥，末尾校验值只发现意外损坏，不提供认证或加密。
 
 公钥 v1 线格式（`MerklePublicKey.to_bytes`，固定 43 字节）：8 字节魔数 `b"PQAMPK\0\0"`；各 1 字节的版本（1）、`w`、`height`；32 字节 Merkle 根。
 
@@ -314,7 +318,29 @@ assert restored.public_key == one_time.public_key
 restored.sign(b"position claim")           # 成功；此后任何 sign 都抛 KeyExhaustedError
 ```
 
-**检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。
+两把一次性密钥锁步使用时，用 `ots_pair_checkpoint` 打包成单块、`ots_pair_restore` 整块恢复（先 Lamport 后 W-OTS，公钥与用尽状态逐值保留）：
+
+```python
+from pqattest import (
+    OneTimeSigner, WOTSOneTimeSigner,
+    keygen, wots_keygen,
+    ots_pair_checkpoint, ots_pair_restore,
+)
+
+lamport = OneTimeSigner(keygen()[0])
+wots = WOTSOneTimeSigner(wots_keygen()[0])
+blob = ots_pair_checkpoint(lamport, wots)   # 一份成对状态块，含两份明文私钥
+restored_lamport, restored_wots = ots_pair_restore(blob)
+assert restored_lamport.public_key == lamport.public_key
+assert restored_wots.public_key == wots.public_key
+restored_lamport.sign(b"position claim")    # 未用一侧恢复后仍可签一次
+restored_wots.sign(b"position claim")
+# 一侧已用后再打包：恢复出的该侧任何 sign 都抛 KeyExhaustedError
+used_blob = ots_pair_checkpoint(restored_lamport, restored_wots)
+assert ots_pair_restore(used_blob)[0].used
+```
+
+**检查点安全须知**：检查点明文包含私钥（Merkle 为整棵树的全部 W-OTS 私钥，`ots_pair_checkpoint` 成对块则一次包含 Lamport 与 W-OTS 两份私钥），末尾的 SHA-256 校验值只能发现意外损坏，**不提供认证或加密**——任何拿到检查点的人都能伪造签名。调用方必须把它当私钥一样安全存储，并在每次成功签名后**原子地**持久化新检查点（如写临时文件再 rename）；复制检查点或在不同进程间共享会让同一把一次性私钥被多次使用，风险由调用方承担。回滚到旧检查点会让状态倒退：对 `OneTimeSigner`/`WOTSOneTimeSigner` 是已用标志复位、对 `MerkleSigner` 是 `next_index` 倒退、已消耗的叶子被再次分配，二者都造成一次性密钥重用，签名即可被伪造。成对状态块同样不防回滚：旧块恢复出的两侧 `used` 一起复位，等于两把一次性密钥同时可被重用。
 
 ### 带密钥的认证封装 `auth_wrap` / `auth_unwrap`
 

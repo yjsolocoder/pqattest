@@ -36,6 +36,12 @@ decision-cost breakdown as a tuple of frozen SchemeScore rows — one per
 frontier member, in frontier order, each carrying the candidate's
 metrics, its two normalised costs, its final score and a selected flag —
 again with exact Fraction arithmetic,
+explain_scheme_weighted_scenarios to export the multi-scenario
+cross-scheme ranking's decision-cost breakdown as a tuple of frozen
+SchemeScenarioScore rows — one per frontier member, in frontier order,
+each carrying the candidate's metrics, its two normalised costs, its
+per-scenario scores and regrets and a selected flag — again with exact
+Fraction arithmetic,
 recommend_merkle_deployment /
 merkle_deployment_frontier /
 recommend_merkle_deployment_weighted to rank that ordinary-deployment
@@ -303,6 +309,7 @@ from .params import (
     MerkleVerifyModeDeploymentScore,
     Params,
     SchemeScore,
+    SchemeScenarioScore,
     merkle_storage_profile,
     merkle_transport_profile,
     merkle_transport_deployment_frontier,
@@ -329,6 +336,7 @@ from .params import (
     recommend_scheme_weighted,
     recommend_scheme_weighted_scenarios,
     explain_scheme_weighted,
+    explain_scheme_weighted_scenarios,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
@@ -407,6 +415,7 @@ __all__ = [
     "PrivateKey",
     "PublicKey",
     "SchemeScore",
+    "SchemeScenarioScore",
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
     "ToyLatticePublicKey",
@@ -435,6 +444,7 @@ __all__ = [
     "explain_merkle_verify_mode_weighted",
     "explain_merkle_verify_mode_deployment_weighted",
     "explain_scheme_weighted",
+    "explain_scheme_weighted_scenarios",
     "keygen",
     "lamport_signature_from_bytes",
     "lamport_signature_to_bytes",

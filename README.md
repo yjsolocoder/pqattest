@@ -189,7 +189,6 @@ Winternitz（W-OTS）：
 - `sign_ots_pair_with_checkpoint(lamport, wots, message)` — 成对快照入口：用一把 `OneTimeSigner` 与一把 `WOTSOneTimeSigner` 在同一临界区对同一条消息各签名，返回 `((lamport_signature, wots_signature), (lamport_checkpoint, wots_checkpoint))`；两份签名分别等于各自 `sign(message)` 的产出，两份检查点分别等于签后各自 `checkpoint()` 的字节（即分别调用两个 `sign_with_checkpoint` 的两半）。两侧锁按先 Lamport 后 W-OTS 的顺序一起获取，整对要么一起推进要么都不推进；任一签名器已用抛 `KeyExhaustedError` 且两侧都不消耗，消息类型非法抛 `TypeError`，不取随机数。返回的检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_checkpoint(lamport, wots, message)` — 成对证明快照入口：`sign_ots_pair_with_checkpoint` 的证明打包对应物，返回 `(pair_proof, (lamport_checkpoint, wots_checkpoint))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`；两份检查点按先 Lamport 后 W-OTS 排列，逐字节等于签后各自 `checkpoint()` 的字节。签名器或消息类型错抛 `TypeError`、任一侧已用抛 `KeyExhaustedError`，失败时两侧密钥都不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，并发下至多一个调用成功，不取随机数。检查点含明文私钥，仅校验值防意外损坏，须按私钥保管
 - `sign_ots_pair_proof_with_auth_state(lamport, wots, message, *, key, generation)` — 成对证明认证封装入口：`sign_ots_pair` 的证明打包对应物、`sign_ots_pair_proof_with_checkpoint` 的认证对应物，在同一临界区内对同一条消息两侧各签名、打包证明并把两份签后状态封装，返回 `(pair_proof, (lamport_envelope, wots_envelope))`；`pair_proof` 为 `OtsPairProof`，先 Lamport 后 W-OTS 两份证明各带本次签名与对应公钥，编码后与手工组装同内容证明包逐字节相同，对原消息 `verify` 返回 `True`，两份签名分别等于两个签名器对同一消息首次 `sign(message)` 的产出；两份 v2 封装按先 Lamport 后 W-OTS 排列（`scheme="lamport"` / `scheme="wots"`，同一 `key` 与 `generation`），各等于签后检查点直接经 `auth_state_wrap` 所得字节（即与签后各自 `checkpoint()` 再封装逐字节相同）。`key` 与 `generation` 仅限关键字：`key` 须为非空 `bytes`/`bytearray`，`generation` 须为 `0..2**64-1` 的非布尔整数。全部参数在花费密钥前验证：签名器或消息类型错抛 `TypeError`，空 key 或代次越界抛 `ValueError`，任一侧已用抛 `KeyExhaustedError` 且另一侧同样不消耗、不留部分结果；两侧锁按先 Lamport 后 W-OTS 一起获取，整对要么一起推进要么都不推进，并发下至多一个调用成功，其余得到用尽异常，不取随机数、不修改传入对象，同一初始状态重复调用输出逐字节确定。封装仅防无密钥篡改、不加密，也不防复制、重放或回滚；封装内检查点含明文私钥，落盘与防回滚均由调用方负责
-- `sign_ots_pair_proof_auth_state(a, b, message, *, key, min_generation=None, claim) -> (pair_proof, (lamport_envelope, wots_envelope), generation)` — **无隐藏状态**的「成对认证恢复 + 两侧各签一条 + 成对证明 + 下一代封装」转换，是 `sign_ots_pair_proof_with_auth_state` 的无状态对应物，把 `restore_ots_pair` 的成对恢复换成「恢复并两侧各签一条」：`a` 必须是 `scheme="lamport"`、`b` 必须是 `scheme="wots"` 的既有 v2 封装（位置固定，互换即方案不符），两者携带同一代次 `g`，`g` 必须严格小于 `2**64-1`；`message` 沿用 `bytes`/`bytearray`/`str` 规则。处理顺序固定：类型校验先于一切，随后以 `hmac.compare_digest` **常量时间验证两侧标签**（两侧标签都通过前不解析任一封装字段），再核对固定方案、载荷魔数、同代与下限，最后恢复两份 v1 检查点；恢复出的任一签名器已用尽即抛 `KeyExhaustedError`，另一侧同样不被消耗。返回固定三元组：`pair_proof` 为先 Lamport 后 W-OTS 的 `OtsPairProof`（各带本次签名与对应公钥，对原消息 `verify` 返回 `True`，两份签名分别等于两把恢复签名器对该消息各自首次 `sign(message)` 的产出，逐值相同）；两份下一代 v2 封装按先 Lamport 后 W-OTS 排列，各认证签后检查点并绑定 `g+1`，与对签后检查点直接 `auth_state_wrap` 逐字节相同；`generation` 为 `g+1`。**全部输出生成后**才以旧令牌与新令牌组成的二元组 `((("lamport", g), ("wots", g)), (("lamport", g+1), ("wots", g+1)))` **恰好调用一次** `claim`——两枚令牌沿用 `restore_ots_pair` 的成对令牌形态、代次依次为 `g` 与 `g+1`、顺序不可换——仅返回值按身份 `is True` 时成功（否则抛 `ValueError`），回调异常原样透传；任何先前失败（错型、空 key、标签/方案不符、两侧代次不一致、低于下限、代次触顶、检查点非法、任一侧用尽、认领拒绝）都**不调用** `claim`、不返回部分结果。错型（封装/密钥非 `bytes`/`bytearray`、`min_generation` 为布尔或非整数、`claim` 不可调用、消息类型非法）抛 `TypeError`；全程不取随机数、不修改传入对象、不新增线格式或库内状态，同一输入重复调用逐字节相同。封装仅认证不加密，本身不防重放/回滚
 
 构造细节（域串 `b"pqattest/wots/v1"`）：令 `B = 2**w`，SHA-256 摘要按大端拆成 `256/w` 个基 `B` 数字；校验和为 `sum(B-1-d)`，取满足 `B**l2 > (256/w)*(B-1)` 的最小 `l2`（w=4 时 l2=3，w=8 时 l2=2），并编码为固定 `l2` 位的大端基 `B` 数字（保留前导零）。每条链始于一个随机值，链步为 `H(x) = SHA256(b"pqattest/wots/v1" + x)`；签名依次给出消息数字与校验和数字对应的第 `d` 步值（w=4 共 67 个元素、2144 字节；w=8 共 34 个元素、1088 字节），公钥保存第 `B-1` 步端点；验证时补足剩余步数并逐条比对端点。无效 `w`、令牌长度错误或元素数量/长度错误抛 `ValueError`。
 
@@ -620,6 +619,8 @@ toy_lattice_decapsulate(tampered, private_key)   # ValueError
 - `recommend_scheme_weighted_scenarios(capacity, budgets, scenarios)` — 为跨三方案的签名选型补上**按多组权重情景选出单一方案的推荐入口**（基线已有该族的静态指标、非支配前沿、按偏好取一项和单权重推荐，缺的正是多情景版本，本次从零新增）：在 `scheme_frontier` 的非支配结果上同时评估多组权重情景，选出最坏后悔值最小的一个跨方案配置，返回该前沿成员（现有的 `Params` 静态指标对象），不新增值类型、不重复枚举或自行筛选候选、不改变既有前沿、各族推荐与静态指标分析。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项确定；前沿在函数内恰好调用一次，返回值必为同参数前沿一次调用得到的成员。三参数均无默认值；`capacity` 与二元组 `budgets` 完全沿用 `scheme_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且一律先于 `scenarios` 筛查。`scenarios` 必须是非空元组，每项是覆盖单签序列化尺寸（`Params.sig_bytes`）与验签链步数（`Params.steps`）的二元权重组；每项权重只接受非布尔非负整数，每个情景至少一项为正，重复情景分别计入。两项成本各自按整个前沿的最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0）；每个情景下，候选的得分是两项归一化成本乘各自权重求和后除以该情景自身权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）。候选得分减去该情景在全前沿上的最优得分即为该情景下的后悔值；先按最大后悔值最小选，再按后悔值总和、各情景得分元组依次决胜，完全平局时按容量余量（候选容量减请求条数）、方案名、`w`、`height` 升序取首项，无该参数者排最前。`scenarios` 或其成员不是元组、权重成员不是整数抛 `TypeError`；情景集为空、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；条数越界、预算取值非法或预算下没有任何可行候选同样抛 `ValueError`
 - `explain_scheme_weighted(capacity, budgets, weights)` — 为跨方案加权推荐 `recommend_scheme_weighted` 补上**决策成本明细的导出入口**（基线已有该族静态指标、非支配前沿与按权重取一项的推荐，唯独没有明细，本次从零新增）：在同一次 `scheme_frontier` 前沿上逐项给出每个候选的归一化成本与最终评分，返回冻结的 `SchemeScore` 行元组，行序与同参数前沿一次调用的成员顺序完全一致，不新增其他值类型、不重复枚举或筛选候选、不改变既有前沿、两类既有推荐（按偏好与按权重）、静态指标分析与任何旧接口的行为。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与二元组 `budgets` 先按 `scheme_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查），`weights` 规则与 `recommend_scheme_weighted` 完全一致：二元组，依次对应单签序列化尺寸（`Params.sig_bytes`）与验签链步（`Params.steps`），成员只能是非布尔非负整数、两项中至少一项为正。每行依次携带该候选的静态指标（`Params`）、与权重逐位对应的两项归一化成本（单签序列化尺寸、验签链步，各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、最终评分（两项归一化成本乘各自权重求和再除以权重总和）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点；行对象可位置构造、按值相等且可哈希。选中标志恰好落在一行，其指标与同参数调用 `recommend_scheme_weighted` 的结果逐字段相同；评分完全相同时沿用该族既有决胜尾序（容量余量、方案名、`w`、`height` 升序、无参数者在前，取首项），只点亮一维时选中该维最小者。全前沿零跨度时各行评分都是零，选中项由决胜尾序决定，明细如实反映。`weights` 容器或其成员不是元组、不是整数抛 `TypeError`；权重长度不符、含布尔或负数、或两项全零抛 `ValueError`；条数越界、预算取值非法或预算下无可行候选同样抛 `ValueError`，不返回任何明细行
 - `SchemeScore` — 冻结的决策成本明细行值对象，五个字段按位置依次为 `params, signature_cost, steps_cost, score, selected`：候选的静态指标（`Params`）、与权重逐位对应的两项归一化成本（`Fraction`：单签序列化尺寸、验签链步）、最终评分（`Fraction`）与选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
+- `explain_scheme_weighted_scenarios(capacity, budgets, scenarios)` — 为跨三方案签名选型的多情景加权推荐 `recommend_scheme_weighted_scenarios` 补上**决策成本明细的导出入口**（基线已有该族的静态指标、非支配前沿与两类推荐及单权重明细，缺的正是多情景明细，本次从零新增）：在同一次 `scheme_frontier` 前沿上逐项给出每个候选的两项归一化成本、各情景得分与后悔值，返回冻结的 `SchemeScenarioScore` 行元组，行序与同参数前沿恰好一次调用的成员顺序完全一致，不重复枚举或筛选候选、不改变既有前沿、各族推荐、单权重明细及任何旧接口与线格式。纯函数：不取随机数、不生成密钥、不改状态，同一输入结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与二元组 `budgets` 完全沿用 `scheme_frontier` 的类型、范围、含边界预算、异常与无可行项规则，且一律先于 `scenarios` 筛查；`scenarios` 规则与 `recommend_scheme_weighted_scenarios` 完全一致：非空元组，每项是覆盖单签序列化尺寸（`Params.sig_bytes`）与验签链步（`Params.steps`）的二元权重组，权重只能是非布尔非负整数、每个情景至少一项为正，重复情景分别计入。每行依次携带该候选的静态指标（`Params`）、与权重逐位对应的两项归一化成本（单签序列化尺寸、验签链步，各按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化、零跨度一律记 0）、与情景同序的得分元组（两项归一化成本乘该情景权重求和再除以该情景权重总和）、与情景同序的后悔值元组（该行得分减去该情景在全前沿上的最优得分）与选中标志，各数值均为 `fractions.Fraction` 精确有理数、禁止浮点。选中标志唯一为真，其候选指标与同参数调用 `recommend_scheme_weighted_scenarios` 的结果逐字段相同：沿用最坏后悔最小、后悔值总和与各情景得分元组依次决胜，完全平局时按容量余量（候选容量减请求条数）、方案名、`w`、`height` 升序取首项，无该参数者排最前；全前沿零跨度时各行各情景得分都是零，选中项由决胜尾序决定，明细如实反映。`scenarios` 容器或其成员错型、权重成员非整数抛 `TypeError`；情景集为空、权重组长度不符、含布尔或负数权重、或整项全零抛 `ValueError`；条数越界、预算取值非法或预算下无可行候选同样抛 `ValueError`，不返回任何明细行
+- `SchemeScenarioScore` — 冻结的多情景决策成本明细行值对象，六个字段按位置依次为 `params, signature_cost, steps_cost, scores, regrets, selected`：候选的静态指标（`Params`）、与权重逐位对应的两项归一化成本（`Fraction`：单签序列化尺寸、验签链步）、与情景同序的得分元组与后悔值元组（各为 `Fraction` 元组）及选中标志（`bool`）；冻结、可位置构造、按值相等（可哈希）
 - `recommend_merkle_deployment(capacity, budgets, prefer="size")` — 在部署预算内选可行 Merkle 参数，返回 `MerkleStorageProfile`。纯函数：不取随机数、不生成密钥、不改状态。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（对应 `checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）、验签链步数（`profile("merkle", ...).steps`）的上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 全部候选：叶数须覆盖 `capacity`，字节上限按 `merkle_storage_profile` 字段比较，步数上限按 `profile` 返回的 `steps` 比较。`size` 依次最小化签名线长、证明线长、检查点、步数、叶数、`w`、`height`；`speed` 先最小化步数，再沿用前述其余顺序；取排序首项。`budgets` 非元组抛 `TypeError`；其长度或成员非法、`capacity`/`prefer` 非法、无可行候选均抛 `ValueError`
 - `merkle_deployment_frontier(capacity, budgets)` — 与 `recommend_merkle_deployment` 同一组候选与预算，但**不排序取首项**，而是返回全部可行且非支配的普通 Merkle 部署，类型为 `tuple[MerkleStorageProfile, ...]`，不新增值类型。纯函数：不取随机数、不生成密钥、不改状态，且无默认参数。`capacity` 限 1 至 256 的非布尔整数；`budgets` 必须为四元组，按顺序分别为检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）及单签验签步数（`profile("merkle", ...).steps`）的含边界上限，各项为 `None`（不限）或正的非布尔整数，且至少一项非空。枚举 `w=4/8` × `height=1..8` 中叶数覆盖 `capacity` 的全部候选，配置取 `merkle_storage_profile`、步数取 `profile` 的 Merkle 结果。支配判定固定为：A 在检查点字节、签名线长、证明线长、单签步数四项上均不大于 B 且至少一项严格更小，则 A 支配 B；删除全部被支配候选并按值去重，不因偏好预先舍弃速度与尺寸形成取舍的配置。结果按单签步数、签名线长、证明线长、检查点字节、叶数、`w`、`height` 稳定升序排列。`budgets` 非元组抛 `TypeError`；其余非法输入或无可行候选抛 `ValueError`
 - `recommend_merkle_deployment_weighted(capacity, budgets, weights)` — 在 `merkle_deployment_frontier` 的非支配结果上**按四元组权重的归一化加权评分选出一个普通 Merkle 部署方案**，返回该前沿成员（现有的 `MerkleStorageProfile`），不新增值类型、不复制候选枚举与 Pareto 筛选、不改变既有前沿与按偏好取一项的推荐入口。纯函数：不取随机数、不生成密钥、不改状态，同一输入重复调用结果逐项确定；前沿在函数内恰好调用一次。三参数均无默认值；`capacity` 与四元组 `budgets` 先按 `merkle_deployment_frontier` 原规则校验（类型、范围与含边界预算规则、异常与无可行项规则完全沿用，且先于 `weights` 筛查）。`weights` 必须为四元组，依次对应检查点字节（`checkpoint_bytes`）、单签线长（`signature_wire_bytes`）、独立证明线长（`proof_wire_bytes`）与单签验签链步数（`profile("merkle", ...).steps`），每个成员只能是非布尔非负整数且四项中至少一项为正。四项成本各自按全前沿最小值与最大值作 `(x-min)/(max-min)` 归一化（零跨度一律记 0），四项归一化成本乘对应权重求和后除以权重总和，全程精确有理数（`fractions.Fraction`，禁止浮点）；取评分最小的前沿成员，评分完全相同时按检查点字节、叶数、`w`、`height` 升序取首项。`weights` 非元组或权重成员非整数抛 `TypeError`；权重长度错误、含布尔或负数、整组全零抛 `ValueError`；无可行方案同样抛 `ValueError`
@@ -687,8 +688,11 @@ from pqattest import (
     recommend_scheme,
     scheme_frontier,
     recommend_scheme_weighted,
+    recommend_scheme_weighted_scenarios,
     SchemeScore,
     explain_scheme_weighted,
+    SchemeScenarioScore,
+    explain_scheme_weighted_scenarios,
     recommend_merkle_deployment,
     merkle_deployment_frontier,
     recommend_merkle_deployment_weighted,
@@ -788,6 +792,27 @@ explain_scheme_weighted(1, (None, 10**9), (1, 1))
 #  ...,
 #  SchemeScore(params=Params(scheme='wots', w=4, ..., sig_bytes=2144, steps=1005),
 #   ..., score=Fraction(...), selected=True))
+
+# 多情景版明细：情景集是非空二元权重组元组，重复情景分别计入；每行除两项
+# 归一化成本外，再带与情景同序的得分元组与后悔值元组（得分减该情景最优），
+# 恰好一行 selected=True，其 params 与 recommend_scheme_weighted_scenarios
+# 同参数的结果逐字段相同；全程 Fraction 精确，无浮点
+explain_scheme_weighted_scenarios(
+    1, (None, 10**9), ((1, 0), (0, 1), (1, 1))
+)
+# (SchemeScenarioScore(params=Params(scheme='lamport', ..., sig_bytes=8192, steps=0),
+#   signature_cost=Fraction(1, 1), steps_cost=Fraction(0, 1),
+#   scores=(Fraction(1, 1), Fraction(0, 1), Fraction(1, 2)),
+#   regrets=(Fraction(1, 1), Fraction(0, 1), Fraction(3932, 10693)),
+#   selected=False),
+#  ...,
+#  SchemeScenarioScore(params=Params(scheme='wots', w=4, ..., sig_bytes=2144, steps=1005),
+#   signature_cost=Fraction(11, 74), steps_cost=Fraction(67, 578),
+#   scores=(Fraction(11, 74), Fraction(67, 578), Fraction(2829, 21386)),
+#   regrets=(Fraction(11, 74), Fraction(67, 578), Fraction(0, 1)),
+#   selected=True))
+# w=4 行两维后悔都不大，最坏后悔最小；只看尺寸/只看链步的两个极端情景
+# 分别取 w=8 与 lamport，但选中行按全部情景的最坏后悔决胜
 
 merkle_storage_profile(8, 7)
 # MerkleStorageProfile(w=8, height=7, leaf_count=128, signature_wire_bytes=1328,

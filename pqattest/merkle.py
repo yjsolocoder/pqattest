@@ -746,7 +746,7 @@ class MerkleSigner:
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign`, :meth:`sign_batch`,
-    :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
+    :meth:`sign_selected`, :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_multiproof_with_checkpoint`,
     :meth:`sign_proof_with_checkpoint`,
     :meth:`sign_batch_proof_with_checkpoint`,
@@ -1135,6 +1135,85 @@ class MerkleSigner:
                 signatures.append(self._signature_at(index, message))
             self._next_index = base + len(signatures)
             return tuple(signatures)
+
+    def sign_selected(
+        self, indices: Any, messages: Any
+    ) -> tuple[MerkleSignature, ...]:
+        """Sign one message per explicitly chosen leaf, voiding the gaps.
+
+        Unlike :meth:`sign_batch`, which allocates consecutive leaves from the
+        current ``next_index``, this entry spends exactly the leaves named in
+        ``indices``: each message is signed with the leaf at the same tuple
+        position, and every skipped leaf below the last chosen one is voided
+        just like :meth:`advance_to` — it can never be signed again. On
+        success the next usable leaf is the index right after the last chosen
+        leaf, so a signer restored from a checkpoint taken afterwards resumes
+        there.
+
+        ``indices`` and ``messages`` must both be tuples of equal, non-zero
+        length. Validation happens in a fixed order — first the types and
+        structure, then exhaustion, then the index range:
+
+        * a non-tuple ``indices`` or ``messages``, an index member that is not
+          an integer, or an unsupported message member type raises
+          ``TypeError`` (a ``bool`` is an ``int`` subclass, so it survives this
+          bullet and is rejected by the structural one below);
+        * an empty tuple on either side, a length mismatch, a boolean index,
+          a duplicate or non-increasing index raises ``ValueError``;
+        * on an exhausted signer (no leaf left to spend) the call raises
+          :class:`KeyExhaustedError`;
+        * an index below the current ``next_index`` or past the last leaf
+          raises ``ValueError``.
+
+        Only once every check passes does the method enter the signing lock
+        and produce, in tuple order, one signature per chosen leaf, committing
+        the advance exactly once. The whole call shares the same lock as
+        :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to` and
+        :meth:`checkpoint`, so under concurrency a leaf is allocated at most
+        once and no thread ever observes a half-signed selection. A failed
+        call consumes no leaf and returns no partial result. When the chosen
+        indices are exactly consecutive from ``next_index``, the result is
+        value-for-value identical to :meth:`sign_batch` on the same messages
+        from the same state; every signature verifies under the long-term
+        public key, and ``multiproof_encode``/``multiproof_verify`` bind a
+        deduplicated proof for the batch to exactly these leaves. No
+        randomness is drawn.
+        """
+        if not isinstance(indices, tuple):
+            raise TypeError("indices must be a tuple of integers")
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for index in indices:
+            if not isinstance(index, int):
+                raise TypeError("every index must be an integer")
+        for message in messages:
+            _as_bytes(message)
+        if not indices:
+            raise ValueError("indices must not be empty")
+        if len(indices) != len(messages):
+            raise ValueError("indices and messages must have the same length")
+        if any(isinstance(index, bool) for index in indices):
+            raise ValueError("every index must be a non-boolean integer")
+        if any(
+            former >= latter for former, latter in zip(indices, indices[1:])
+        ):
+            raise ValueError("indices must be strictly increasing and unique")
+        with self._lock:
+            if self._next_index >= len(self._private_keys):
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if indices[0] < base or indices[-1] >= leaf_count:
+                raise ValueError(
+                    "every index must be between the current next leaf and "
+                    "the last leaf"
+                )
+            signatures = tuple(
+                self._signature_at(index, message)
+                for index, message in zip(indices, messages)
+            )
+            self._next_index = indices[-1] + 1
+            return signatures
 
     def sign_with_checkpoint(self, message: Any) -> tuple[MerkleSignature, bytes]:
         """Sign ``message`` and snapshot the advanced state in one atomic step.

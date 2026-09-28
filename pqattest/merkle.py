@@ -128,6 +128,35 @@ def _nodes_well_formed(nodes: Any) -> bool:
     )
 
 
+def _validate_selection(indices: Any, messages: Any) -> None:
+    """Validate the argument shape of :meth:`MerkleSigner.sign_selected`.
+
+    Only the types and structure of the two tuples are checked here — the
+    exhaustion and leaf-range checks need the live signer state and run in
+    the locked section afterwards. The order is fixed: container types,
+    member types (index integers first, then the message rules), emptiness
+    and matching lengths, boolean indices, and finally strictly increasing
+    order.
+    """
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of leaf indices")
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    for index in indices:
+        if not isinstance(index, int):
+            raise TypeError("every index must be an integer")
+    for message in messages:
+        _as_bytes(message)
+    if not indices or not messages:
+        raise ValueError("indices and messages must not be empty")
+    if len(indices) != len(messages):
+        raise ValueError("indices must have the same length as messages")
+    if any(isinstance(index, bool) for index in indices):
+        raise ValueError("index members must not be booleans")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+
+
 def _leaf_hash(w: int, elements: tuple[bytes, ...]) -> bytes:
     return hashlib.sha256(_LEAF_DOMAIN + bytes([w]) + b"".join(elements)).digest()
 
@@ -746,7 +775,7 @@ class MerkleSigner:
 
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign`, :meth:`sign_batch`,
-    :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
+    :meth:`sign_selected`, :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_multiproof_with_checkpoint`,
     :meth:`sign_proof_with_checkpoint`,
     :meth:`sign_batch_proof_with_checkpoint`,
@@ -1135,6 +1164,68 @@ class MerkleSigner:
                 signatures.append(self._signature_at(index, message))
             self._next_index = base + len(signatures)
             return tuple(signatures)
+
+    def sign_selected(
+        self, indices: Any, messages: Any
+    ) -> tuple[MerkleSignature, ...]:
+        """Sign one message per explicitly selected leaf, atomically.
+
+        Unlike :meth:`sign_batch` (which always spends the next consecutive
+        leaves), ``indices`` names the exact leaves to use: one strictly
+        increasing leaf index per message, position by position. Every
+        unselected leaf below the last selected index is voided — it can
+        never be signed again — and on success ``next_index`` becomes the
+        last selected index plus one. A signer restored from a
+        :meth:`checkpoint` taken afterwards therefore resumes at exactly
+        that index.
+
+        The returned tuple carries one :class:`MerkleSignature` per
+        selected leaf, in selection order, each bound to its leaf. When the
+        selection is exactly the run of consecutive leaves from the current
+        ``next_index``, the result is value-for-value identical to
+        :meth:`sign_batch` on the same messages from the same state, so
+        every signature verifies under the long-term public key and the
+        tuple can be wrapped by :class:`MerkleBatchProof` or
+        :func:`multiproof_encode` unchanged; the deduplicated multiproof
+        built from it verifies against the original messages and binds to
+        this leaf selection via ``multiproof_verify_bound(..., indices=...)``.
+
+        Validation runs in a fixed order. First the types and structure are
+        checked: both arguments must be non-empty ``tuple`` values of the
+        same length; every index must be a non-boolean integer and every
+        message must follow the usual rules
+        (``bytes``/``bytearray``/``str``); a non-tuple argument, a
+        non-integer index or an unsupported message raises ``TypeError``,
+        and an empty tuple, a length mismatch, a boolean index, a duplicate
+        or an out-of-order value raises ``ValueError``. Only then, under the
+        same lock shared with :meth:`sign`, :meth:`sign_batch`,
+        :meth:`advance_to` and :meth:`checkpoint`, is the state consulted:
+        an exhausted signer (no leaf left at all) raises
+        :class:`KeyExhaustedError`, and only afterwards is an index below
+        the current ``next_index`` or past the last leaf rejected with
+        ``ValueError``. All signatures are built inside the lock and the
+        state advances exactly once, after every one of them exists, so the
+        call is all-or-nothing: a failure consumes no leaf and returns no
+        partial result, a concurrent caller never receives an already
+        selected leaf, and no thread ever observes a half-signed
+        selection. No randomness is drawn and no format changes.
+        """
+        _validate_selection(indices, messages)
+        with self._lock:
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if base >= leaf_count:
+                raise KeyExhaustedError("all Merkle leaves have been used")
+            if indices[0] < base or indices[-1] >= leaf_count:
+                raise ValueError(
+                    "indices must be between the current index and the last leaf"
+                )
+            signatures = tuple(
+                self._signature_at(index, message)
+                for index, message in zip(indices, messages)
+            )
+            self._next_index = indices[-1] + 1
+            return signatures
 
     def sign_with_checkpoint(self, message: Any) -> tuple[MerkleSignature, bytes]:
         """Sign ``message`` and snapshot the advanced state in one atomic step.

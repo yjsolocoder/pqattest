@@ -7,11 +7,18 @@ vector as eight 2-byte big-endian coefficients (each in ``0..256``). The
 shared secret derives from a dot product modulo 257 and a SHA-256 key
 confirmation tag.
 
+The same vectors also back a tiny one-message toy signature: signing draws a
+fresh random vector, derives a 32-byte chain key from it and the message, and
+keys a 32-byte HMAC-SHA-256 tag with the private vector; verification
+re-derives the chain key and checks the tag against the public vector.
+
 .. warning::
 
     Unaudited and insecure by design: keygen reuses the same vector for the
     public and private keys, there is no noise or trapdoor, and the whole
-    "lattice" fits in 16 bytes. **Teaching only — never use in production.**
+    "lattice" fits in 16 bytes. The toy signature is a stateless MAC tag and
+    is not a real lattice signature. **Teaching only — never use in
+    production.**
 
 Only the standard library is used.
 """
@@ -28,9 +35,12 @@ __all__ = [
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
     "ToyLatticePublicKey",
+    "ToyLatticeSignature",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
     "toy_lattice_keygen",
+    "toy_lattice_sign",
+    "toy_lattice_verify",
 ]
 
 _DIMENSION = 8
@@ -41,14 +51,17 @@ _MAX_COEFF = 256
 _TOKEN_BYTES = _DIMENSION
 _TAG_BYTES = 32
 _KEY_DOMAIN = b"K"
+_SIGNATURE_DOMAIN = b"S"
 
 _PUBLIC_KEY_MAGIC = b"PQALPK\0\0"
 _PRIVATE_KEY_MAGIC = b"PQALSK\0\0"
 _CIPHERTEXT_MAGIC = b"PQALCT\0\0"
+_SIGNATURE_MAGIC = b"PQALSG\0\0"
 _LATTICE_VERSION = 1
 _KEY_BYTES = 8 + 1 + _ELEMENT_BYTES
 _TAG_LENGTH_BYTES = 4
 _CIPHERTEXT_HEADER_BYTES = 8 + 1 + _ELEMENT_BYTES + _TAG_LENGTH_BYTES
+_SIGNATURE_HEADER_BYTES = 8 + 1 + _ELEMENT_BYTES + _TAG_LENGTH_BYTES
 _MAX_TAG_LENGTH = 2**32 - 1
 
 
@@ -94,6 +107,26 @@ def _dot_mod(left: Iterable[int], right: Iterable[int]) -> int:
 def _derive_shared(v: int) -> bytes:
     """K = SHA256(b"K" + v2) with ``v`` encoded as 2-byte big endian."""
     return hashlib.sha256(_KEY_DOMAIN + v.to_bytes(_COEFF_BYTES, "big")).digest()
+
+
+def _as_bytes(message: Any) -> bytes:
+    if isinstance(message, bytes):
+        return message
+    if isinstance(message, bytearray):
+        return bytes(message)
+    if isinstance(message, str):
+        return message.encode("utf-8")
+    raise TypeError("message must be bytes, bytearray or str")
+
+
+def _chain_key(random_vector: bytes, message: bytes) -> bytes:
+    """Signature chain key: SHA256(b"S" + random vector + message)."""
+    return hashlib.sha256(_SIGNATURE_DOMAIN + random_vector + message).digest()
+
+
+def _signature_tag(chain: bytes, vector: bytes) -> bytes:
+    """Keyed tag over the key vector, keyed by the chain key."""
+    return hmac.new(chain, _SIGNATURE_DOMAIN + vector, hashlib.sha256).digest()
 
 
 @dataclass(frozen=True)
@@ -235,6 +268,84 @@ class ToyLatticeCiphertext:
         return cls(u=u, tag=data[_CIPHERTEXT_HEADER_BYTES:expected])
 
 
+@dataclass(frozen=True)
+class ToyLatticeSignature:
+    """Frozen toy signature: the ``E``-encoded random vector ``u`` and a tag.
+
+    ``u`` must be a valid encoding ``E`` (16 bytes, eight coefficients in
+    ``0..256``) and ``tag`` must be exactly 32 bytes. A non-``bytes`` field
+    raises ``TypeError``; a wrong ``u`` length, an out-of-range coefficient or
+    a tag that is not exactly 32 bytes raises ``ValueError`` at construction
+    time.
+    """
+
+    u: bytes
+    tag: bytes
+
+    def __post_init__(self) -> None:
+        _validate_e(self.u, "u")
+        if not isinstance(self.tag, bytes):
+            raise TypeError("tag must be bytes")
+        if len(self.tag) != _TAG_BYTES:
+            raise ValueError(f"tag must be exactly {_TAG_BYTES} bytes")
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALSG\\0\\0"``; one version byte
+        (1); the 16-byte ``E``-encoded random vector ``u``; the tag length as
+        four big-endian unsigned bytes (always 32); and the 32-byte tag
+        verbatim — 61 bytes in total. Neither the message nor the key is
+        carried. Encoding is deterministic: the same signature always produces
+        the same bytes. A field corrupted by bypassing the frozen constructor
+        raises ``ValueError`` instead of producing a malformed encoding.
+        """
+        if not isinstance(self, ToyLatticeSignature):
+            raise TypeError("to_bytes must be called on a ToyLatticeSignature")
+        _serializable_e(self.u, "u")
+        if not isinstance(self.tag, bytes) or len(self.tag) != _TAG_BYTES:
+            raise ValueError("tag is not a valid 32-byte bytes field")
+        return (
+            _SIGNATURE_MAGIC
+            + bytes((_LATTICE_VERSION,))
+            + self.u
+            + len(self.tag).to_bytes(_TAG_LENGTH_BYTES, "big")
+            + self.tag
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "ToyLatticeSignature":
+        """Parse ``to_bytes()`` output back into a :class:`ToyLatticeSignature`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. A bad magic, an unknown version, truncation, trailing
+        data, a ``u`` that is not a valid ``E`` encoding (eight coefficients
+        in ``0..256``), or a tag length other than 32 raises ``ValueError``.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("signature data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _SIGNATURE_HEADER_BYTES:
+            raise ValueError("signature encoding is truncated")
+        if data[:8] != _SIGNATURE_MAGIC:
+            raise ValueError("bad signature magic")
+        if data[8] != _LATTICE_VERSION:
+            raise ValueError(f"unsupported signature version: {data[8]}")
+        u = data[9 : 9 + _ELEMENT_BYTES]
+        _validate_e(u, "u")
+        tag_length = int.from_bytes(
+            data[9 + _ELEMENT_BYTES : _SIGNATURE_HEADER_BYTES], "big"
+        )
+        if tag_length != _TAG_BYTES:
+            raise ValueError(f"signature tag length must be {_TAG_BYTES}")
+        expected = _SIGNATURE_HEADER_BYTES + tag_length
+        if len(data) < expected:
+            raise ValueError("signature encoding is truncated")
+        if len(data) > expected:
+            raise ValueError("trailing data after the signature encoding")
+        return cls(u=u, tag=data[_SIGNATURE_HEADER_BYTES:expected])
+
+
 def _decode_key_field(data: Any, magic: bytes, label: str) -> bytes:
     """Validate a fixed-length public/private key blob and return its ``E`` field."""
     if not isinstance(data, (bytes, bytearray)):
@@ -313,3 +424,73 @@ def toy_lattice_decapsulate(
     if not hmac.compare_digest(candidate, ciphertext.tag):
         raise ValueError("ciphertext tag does not match")
     return candidate
+
+
+def toy_lattice_sign(
+    message: Any,
+    private_key: ToyLatticePrivateKey,
+    *,
+    token_bytes: Callable[[int], bytes] = secrets.token_bytes,
+) -> ToyLatticeSignature:
+    """Sign ``message`` with ``private_key`` and return a :class:`ToyLatticeSignature`.
+
+    The message may be ``bytes``, ``bytearray`` or ``str`` (UTF-8); any other
+    type raises ``TypeError``, as does a ``private_key`` that is not a
+    :class:`ToyLatticePrivateKey`. Eight random bytes ``r`` are drawn with
+    ``token_bytes`` and used verbatim as the eight coefficients of the
+    ``E``-encoded random vector ``u``; a source that returns anything other
+    than ``bytes`` (including ``bytearray``) or not exactly eight bytes raises
+    ``ValueError``. The chain key is
+    ``K = SHA256(b"S" + u + message)`` and the 32-byte tag is
+    ``HMAC-SHA256(K, b"S" + s)`` over the private vector. The key is never
+    modified; different random sources may produce different signatures even
+    for the same message and key.
+    """
+    if not isinstance(private_key, ToyLatticePrivateKey):
+        raise TypeError("private_key must be a ToyLatticePrivateKey")
+    message = _as_bytes(message)
+    raw = token_bytes(_TOKEN_BYTES)
+    if not isinstance(raw, bytes):
+        raise ValueError("token_bytes must return bytes")
+    if len(raw) != _TOKEN_BYTES:
+        raise ValueError(f"token_bytes must return {_TOKEN_BYTES} bytes")
+    u = _encode_e(raw)
+    chain = _chain_key(u, message)
+    tag = _signature_tag(chain, private_key.s)
+    return ToyLatticeSignature(u=u, tag=tag)
+
+
+def toy_lattice_verify(
+    message: Any,
+    signature: ToyLatticeSignature,
+    public_key: ToyLatticePublicKey,
+) -> bool:
+    """Check ``signature`` on ``message`` against ``public_key``.
+
+    Re-derives the chain key ``K = SHA256(b"S" + u + message)`` from the
+    signature's random vector and the message, recomputes the keyed tag over
+    the public vector ``t`` and compares it in constant time with the carried
+    tag. Only the original message together with the matching public key
+    returns ``True``. A ``public_key`` that is not a :class:`ToyLatticePublicKey`
+    raises ``TypeError``; every other problem — an unsupported message type, a
+    ``signature`` that is not a :class:`ToyLatticeSignature`, malformed
+    signature fields, or any content mismatch — returns ``False``.
+    """
+    if not isinstance(public_key, ToyLatticePublicKey):
+        raise TypeError("public_key must be a ToyLatticePublicKey")
+    try:
+        message = _as_bytes(message)
+        if not isinstance(signature, ToyLatticeSignature):
+            return False
+        _validate_e(signature.u, "u")
+        if not isinstance(signature.tag, bytes) or len(signature.tag) != _TAG_BYTES:
+            return False
+        chain = _chain_key(signature.u, message)
+        candidate = _signature_tag(chain, public_key.t)
+        return hmac.compare_digest(candidate, signature.tag)
+    except Exception:
+        # A bypass-constructed signature may carry arbitrary field objects
+        # whose access raises anything; every malformed structure verifies
+        # False. External public-key type errors were raised before this
+        # block.
+        return False

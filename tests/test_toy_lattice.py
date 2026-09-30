@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import unittest
 from dataclasses import FrozenInstanceError
 
@@ -6,9 +7,12 @@ from pqattest import (
     ToyLatticeCiphertext,
     ToyLatticePrivateKey,
     ToyLatticePublicKey,
+    ToyLatticeSignature,
     toy_lattice_decapsulate,
     toy_lattice_encapsulate,
     toy_lattice_keygen,
+    toy_lattice_sign,
+    toy_lattice_verify,
 )
 from pqattest.toy_lattice import _decode_e, _encode_e
 
@@ -202,6 +206,274 @@ class DecapsulateTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
                     toy_lattice_decapsulate(ciphertext, bad)
+
+
+class SignatureValueObjectTest(unittest.TestCase):
+    def test_positional_construction_and_equality(self):
+        a = ToyLatticeSignature(b"\x00\x01" * 8, b"t" * 32)
+        b = ToyLatticeSignature(b"\x00\x01" * 8, b"t" * 32)
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        self.assertIn(a, {b})
+        self.assertNotEqual(a, ToyLatticeSignature(b"\x00\x02" * 8, b"t" * 32))
+        self.assertNotEqual(a, ToyLatticeSignature(b"\x00\x01" * 8, b"u" * 32))
+        self.assertNotEqual(a, ToyLatticeCiphertext(b"\x00\x01" * 8, b"t" * 32))
+
+    def test_frozen(self):
+        signature = ToyLatticeSignature(b"\x00" * 16, b"\x00" * 32)
+        with self.assertRaises(FrozenInstanceError):
+            signature.u = b"\x00" * 16
+        with self.assertRaises(FrozenInstanceError):
+            signature.tag = b"\x00" * 32
+
+    def test_fields_reject_non_bytes(self):
+        for bad in ("0123456789abcdef", bytearray(16), None, [0] * 16):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    ToyLatticeSignature(bad, b"\x00" * 32)
+        for bad in ("x" * 32, bytearray(32), None, [0] * 32):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    ToyLatticeSignature(b"\x00" * 16, bad)
+
+    def test_fields_reject_bad_values(self):
+        with self.assertRaises(ValueError):
+            ToyLatticeSignature(b"\x00" * 15, b"\x00" * 32)  # u too short
+        with self.assertRaises(ValueError):
+            ToyLatticeSignature(b"\x00" * 17, b"\x00" * 32)  # u too long
+        with self.assertRaises(ValueError):
+            ToyLatticeSignature(b"\x01\x01" + b"\x00" * 14, b"\x00" * 32)  # coeff 257
+        for size in (0, 1, 31, 33, 64):
+            with self.subTest(size=size):
+                with self.assertRaises(ValueError):
+                    ToyLatticeSignature(b"\x00" * 16, b"\x00" * size)
+
+
+class SignTest(unittest.TestCase):
+    def test_known_vectors(self):
+        s = _encode_e((10, 20, 30, 40, 50, 60, 70, 80))
+        private_key = ToyLatticePrivateKey(s)
+        r = b"r-r-r-r-"
+        message = b"hello"
+        signature = toy_lattice_sign(
+            message, private_key, token_bytes=fixed_tokens(r)
+        )
+        self.assertIsInstance(signature, ToyLatticeSignature)
+        self.assertEqual(signature.u, _encode_e(r))
+        chain = hashlib.sha256(b"S" + signature.u + message).digest()
+        expected_tag = hmac.new(chain, b"S" + s, hashlib.sha256).digest()
+        self.assertEqual(signature.tag, expected_tag)
+        self.assertEqual(len(signature.tag), 32)
+
+    def test_message_types_equivalent(self):
+        private_key = ToyLatticePrivateKey(_encode_e((1, 2, 3, 4, 5, 6, 7, 8)))
+        text = "héllo—世界"
+        signatures = [
+            toy_lattice_sign(text, private_key, token_bytes=fixed_tokens(b"r-r-r-r-")),
+            toy_lattice_sign(
+                text.encode("utf-8"), private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+            ),
+            toy_lattice_sign(
+                bytearray(text.encode("utf-8")),
+                private_key,
+                token_bytes=fixed_tokens(b"r-r-r-r-"),
+            ),
+        ]
+        self.assertEqual(signatures[0], signatures[1])
+        self.assertEqual(signatures[0], signatures[2])
+
+    def test_random_source_changes_signature_without_touching_key(self):
+        s = _encode_e((1, 2, 3, 4, 5, 6, 7, 8))
+        private_key = ToyLatticePrivateKey(s)
+        first = toy_lattice_sign(b"m", private_key, token_bytes=fixed_tokens(b"aaaaaaaa"))
+        second = toy_lattice_sign(b"m", private_key, token_bytes=fixed_tokens(b"bbbbbbbb"))
+        self.assertNotEqual(first, second)
+        self.assertEqual(private_key.s, s)
+
+    def test_wrong_message_type(self):
+        private_key = ToyLatticePrivateKey(b"\x00" * 16)
+        for bad in (None, 123, [1, 2, 3], object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    toy_lattice_sign(bad, private_key)
+
+    def test_wrong_private_key_type(self):
+        public_key = ToyLatticePublicKey(b"\x00" * 16)
+        for bad in (None, b"\x00" * 16, public_key, object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    toy_lattice_sign(b"m", bad)
+
+    def test_token_source_rules(self):
+        private_key = ToyLatticePrivateKey(b"\x00" * 16)
+        with self.assertRaises(ValueError):
+            toy_lattice_sign(b"m", private_key, token_bytes=lambda size: b"short")
+        with self.assertRaises(ValueError):
+            toy_lattice_sign(b"m", private_key, token_bytes=lambda size: b"x" * 9)
+        for bad in (bytearray(8), [0] * 8, memoryview(b"\x00" * 8), None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    toy_lattice_sign(
+                        b"m", private_key, token_bytes=lambda size: bad
+                    )
+
+
+class VerifyTest(unittest.TestCase):
+    def _pair(self):
+        return toy_lattice_keygen(token_bytes=fixed_tokens(b"abcdefgh"))
+
+    def test_original_message_verifies_for_all_message_types(self):
+        private_key, public_key = self._pair()
+        text = "héllo—世界"
+        signature = toy_lattice_sign(text, private_key, token_bytes=fixed_tokens(b"r-r-r-r-"))
+        self.assertTrue(toy_lattice_verify(text, signature, public_key))
+        self.assertTrue(toy_lattice_verify(text.encode("utf-8"), signature, public_key))
+        self.assertTrue(
+            toy_lattice_verify(bytearray(text.encode("utf-8")), signature, public_key)
+        )
+
+    def test_mismatches_return_false(self):
+        private_key, public_key = self._pair()
+        _, other_public = toy_lattice_keygen(
+            token_bytes=fixed_tokens(bytes(range(1, 9)))
+        )
+        signature = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        self.assertFalse(toy_lattice_verify(b"hellp", signature, public_key))
+        self.assertFalse(toy_lattice_verify(b"", signature, public_key))
+        self.assertFalse(toy_lattice_verify(b"hello", signature, other_public))
+        wrong_u = ToyLatticeSignature(_encode_e(b"XXXXXXXX"), signature.tag)
+        self.assertFalse(toy_lattice_verify(b"hello", wrong_u, public_key))
+        wrong_tag = ToyLatticeSignature(signature.u, b"\x00" * 32)
+        self.assertFalse(toy_lattice_verify(b"hello", wrong_tag, public_key))
+
+    def test_bad_message_type_returns_false(self):
+        _, public_key = self._pair()
+        signature = ToyLatticeSignature(b"\x00" * 16, b"\x00" * 32)
+        for bad in (None, 123, [1, 2, 3], object()):
+            with self.subTest(bad=bad):
+                self.assertFalse(toy_lattice_verify(bad, signature, public_key))
+
+    def test_bad_signature_returns_false(self):
+        private_key, public_key = self._pair()
+        signature = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        for bad in (
+            None,
+            signature.to_bytes(),
+            b"\x00" * 61,
+            42,
+            ToyLatticeCiphertext(signature.u, signature.tag),
+            object(),
+        ):
+            with self.subTest(bad=bad):
+                self.assertFalse(toy_lattice_verify(b"hello", bad, public_key))
+
+    def test_bypass_constructed_signature_returns_false(self):
+        _, public_key = self._pair()
+        for u, tag in (
+            ("x" * 16, b"\x00" * 32),
+            (b"\x00" * 16, "x" * 32),
+            (b"\x00" * 15, b"\x00" * 32),
+            (b"\x00" * 16, b"\x00" * 31),
+            (None, None),
+        ):
+            broken = ToyLatticeSignature.__new__(ToyLatticeSignature)
+            object.__setattr__(broken, "u", u)
+            object.__setattr__(broken, "tag", tag)
+            with self.subTest():
+                self.assertFalse(toy_lattice_verify(b"hello", broken, public_key))
+
+    def test_wrong_public_key_type_raises(self):
+        private_key, public_key = self._pair()
+        signature = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        for bad in (None, b"\x00" * 16, private_key, object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    toy_lattice_verify(b"hello", signature, bad)
+
+
+class SignatureSerializationTest(unittest.TestCase):
+    def _signature(self):
+        private_key, _ = toy_lattice_keygen(token_bytes=fixed_tokens(b"abcdefgh"))
+        return toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+
+    def test_wire_layout(self):
+        signature = self._signature()
+        blob = signature.to_bytes()
+        self.assertEqual(len(blob), 61)
+        self.assertEqual(blob[:8], b"PQALSG\0\0")
+        self.assertEqual(blob[8], 1)
+        self.assertEqual(blob[9:25], signature.u)
+        self.assertEqual(int.from_bytes(blob[25:29], "big"), 32)
+        self.assertEqual(blob[29:], signature.tag)
+        # neither message nor key is carried
+        self.assertNotIn(b"hello", blob)
+        self.assertNotIn(b"abcdefgh", blob)
+
+    def test_deterministic_encoding_and_roundtrip(self):
+        signature = self._signature()
+        self.assertEqual(signature.to_bytes(), signature.to_bytes())
+        _, public_key = toy_lattice_keygen(token_bytes=fixed_tokens(b"abcdefgh"))
+        for data in (signature.to_bytes(), bytearray(signature.to_bytes())):
+            restored = ToyLatticeSignature.from_bytes(data)
+            self.assertEqual(restored, signature)
+            self.assertEqual(hash(restored), hash(signature))
+            self.assertTrue(toy_lattice_verify(b"hello", restored, public_key))
+
+    def test_to_bytes_rejects_corrupt_fields(self):
+        good = self._signature()
+        for u, tag in (
+            ("x" * 16, good.tag),
+            (b"\x00" * 15, good.tag),
+            (b"\x01\x01" + b"\x00" * 14, good.tag),
+            (good.u, "x" * 32),
+            (good.u, b"\x00" * 31),
+            (good.u, None),
+            (None, None),
+        ):
+            broken = ToyLatticeSignature.__new__(ToyLatticeSignature)
+            object.__setattr__(broken, "u", u)
+            object.__setattr__(broken, "tag", tag)
+            with self.subTest():
+                with self.assertRaises(ValueError):
+                    broken.to_bytes()
+
+    def test_from_bytes_rejects_non_bytes(self):
+        blob = self._signature().to_bytes()
+        for bad in (blob.decode("latin-1"), None, 42, [blob], memoryview(blob)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    ToyLatticeSignature.from_bytes(bad)
+
+    def test_from_bytes_rejects_bad_blobs(self):
+        signature = self._signature()
+        blob = signature.to_bytes()
+        header = b"PQALSG\0\0" + bytes((1,)) + signature.u
+        bad_blobs = {
+            "bad magic": b"PQALXX\0\0" + blob[8:],
+            "ciphertext magic": ToyLatticeCiphertext(signature.u, signature.tag).to_bytes(),
+            "unknown version": blob[:8] + bytes((2,)) + blob[9:],
+            "cut at magic": blob[:7],
+            "cut in header": blob[:28],
+            "cut in tag": blob[:60],
+            "trailing byte": blob + b"\x00",
+            "bad coefficient": blob[:9] + b"\x01\x01" + blob[11:],
+            "tag length 31": header + (31).to_bytes(4, "big") + b"\x00" * 31,
+            "tag length 33": header + (33).to_bytes(4, "big") + b"\x00" * 33,
+            "tag length 0": header + (0).to_bytes(4, "big"),
+            "length says 32 but short": header + (32).to_bytes(4, "big") + b"\x00" * 31,
+        }
+        for label, bad in bad_blobs.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    ToyLatticeSignature.from_bytes(bad)
 
 
 if __name__ == "__main__":

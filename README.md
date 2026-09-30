@@ -62,15 +62,20 @@ assert MerkleBatchProof.from_bytes(blob).verify(messages)
 
 消息统一接受 `bytes`、`bytearray`、`str`（str 按 UTF-8 编码）。
 
-教学用格基玩具 KEM（仅演示封装/解封装流程）：
+教学用格基玩具 KEM 与签名（仅演示封装/解封装与签名/验签流程）：
 
 ```python
 from pqattest import toy_lattice_keygen, toy_lattice_encapsulate, toy_lattice_decapsulate
+from pqattest import toy_lattice_sign, toy_lattice_verify
 
 private_key, public_key = toy_lattice_keygen()
 ciphertext, enc_key = toy_lattice_encapsulate(public_key)
 dec_key = toy_lattice_decapsulate(ciphertext, private_key)
 assert enc_key == dec_key == ciphertext.tag
+
+signature = toy_lattice_sign(b"hello", private_key)
+assert toy_lattice_verify(b"hello", signature, public_key)
+assert not toy_lattice_verify(b"hellp", signature, public_key)   # 改动消息即失败
 ```
 
 **未审计、不具安全性，仅供教学，严禁生产使用。**
@@ -613,20 +618,25 @@ assert verify(b"one-time claim", signature, ots.public_key)
 # next_blob 恢复出的签名器已用尽：再转换一次会抛 KeyExhaustedError
 ```
 
-玩具格基 KEM（教学用，**未审计，禁止生产**）：
+玩具格基 KEM 与签名（教学用，**未审计，禁止生产**）：
 
 - `ToyLatticePrivateKey(s)` / `ToyLatticePublicKey(t)` / `ToyLatticeCiphertext(u, tag)` — 三个冻结值对象，可位置构造、按值相等（含可哈希）。字段均为 `bytes`：`s`/`t`/`u` 必须是编码 `E` 值（恰好 16 字节、8 个 2 字节大端系数、每项在 `0..256`），`tag` 为任意 `bytes`。字段类型错误抛 `TypeError`，长度或系数越界抛 `ValueError`
+- `ToyLatticeSignature(u, tag)` — 冻结的签名值对象，可位置构造、按值相等（含可哈希）；`u` 为编码 `E` 的随机向量（16 字节、8 个系数在 `0..256`），`tag` 必须恰好 32 字节。字段非 `bytes` 抛 `TypeError`；`u` 长度或系数非法、`tag` 长度不是 32 抛 `ValueError`
 - `ToyLatticePrivateKey.to_bytes()` / `ToyLatticePrivateKey.from_bytes(data)`、`ToyLatticePublicKey.to_bytes()` / `ToyLatticePublicKey.from_bytes(data)`、`ToyLatticeCiphertext.to_bytes()` / `ToyLatticeCiphertext.from_bytes(data)` — 三类对象的版本化二进制编解码；编码确定、同值同字节，往返后仍是可位置构造、按值相等的冻结对象。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），魔数、版本、长度、截断、尾随数据或非法 `E` 系数抛 `ValueError`
+- `ToyLatticeSignature.to_bytes()` / `ToyLatticeSignature.from_bytes(data)` — 签名的版本化 v1 二进制编解码，不携带消息或密钥；编码确定、同值同字节，往返对象按值相等且可对原消息验证。`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），坏魔数、未知版本、截断、尾随数据、非法 `E` 系数或标签长度不是 32 抛 `ValueError`
 - `toy_lattice_keygen(*, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`；取 `x = token_bytes(8)`，令 `s = t = E(x)`（即私钥与公钥是同一个向量，毫无难度可求逆——这正是它只能教学的原因之一）。令牌源未返回恰好 8 字节抛 `ValueError`
 - `toy_lattice_encapsulate(public_key, *, token_bytes=secrets.token_bytes)` — 返回 `(ciphertext, shared_key)`；取 `r = token_bytes(8)`、`u = E(r)`，用**解码后的向量**计算 `v = t·r mod 257`，共享密钥 `K = SHA256(b"K" + v₂)`，其中 `v₂` 为 `v` 的 2 字节大端编码；`tag = K`。`public_key` 类型错误抛 `TypeError`，令牌长度错误抛 `ValueError`
 - `toy_lattice_decapsulate(ciphertext, private_key)` — 用解码向量计算 `v = s·u mod 257`，以相同方式推出 `K`，并以常量时间比较校验 `tag`；一致则返回 `K`，`tag` 不符（含长度不同）抛 `ValueError`。参数类型错误抛 `TypeError`
+- `toy_lattice_sign(message, private_key, *, token_bytes=secrets.token_bytes)` — 返回 `ToyLatticeSignature`；消息接受 `bytes`/`bytearray`/`str`（`str` 按 UTF-8 编码）。按维度 8、编码 `E`、模 257 语义取 `r = token_bytes(8)` 并令随机向量 `u = E(r)`，链密钥 `K = SHA256(b"S" + u + message)`，32 字节标签 `tag = HMAC-SHA256(K, b"S" + s)`。同一消息与私钥在不同随机源下可得到不同签名；不修改密钥。消息或私钥类型错误抛 `TypeError`；令牌源返回非 `bytes` 或长度不为 8 抛 `ValueError`
+- `toy_lattice_verify(message, signature, public_key)` — 按公钥向量 `t` 重算链密钥 `K = SHA256(b"S" + u + message)` 与标签 `HMAC-SHA256(K, b"S" + t)`，以常量时间比较签名携带的 `tag`。仅原消息配匹配公钥返回 `True`；消息、签名或公钥内容不一致，以及签名结构损坏（非 `ToyLatticeSignature`、字段非 `bytes`、非法 `E` 系数或标签长度不对）一律返回 `False`；仅 `public_key` 类型错误抛 `TypeError`
 
-构造细节：向量维度固定为 8，系数环为模 257 整数；编码 `E` 把 8 个系数各编为 2 字节大端（系数允许 256，故 2 字节刚好容纳），共 16 字节。封装与解封装都先把 `E` 值解码回向量再做点积。密钥生成与封装的随机字节经注入的 `token_bytes` 取得（默认 `secrets.token_bytes`），仅被原样当作系数使用，因此系数实际落在 `0..255`；接收到的 `t`/`s`/`u` 则允许完整的 `0..256`。
+构造细节：向量维度固定为 8，系数环为模 257 整数；编码 `E` 把 8 个系数各编为 2 字节大端（系数允许 256，故 2 字节刚好容纳），共 16 字节。封装、解封装与签名都在 `E` 值域上操作；封装与解封装先把 `E` 值解码回向量再做点积。密钥生成、封装与签名的随机字节经注入的 `token_bytes` 取得（默认 `secrets.token_bytes`），仅被原样当作系数使用，因此系数实际落在 `0..255`；接收到的 `t`/`s`/`u` 则允许完整的 `0..256`。
 
-线格式（v1）：公钥固定 25 字节——8 字节魔数 `b"PQALPK\0\0"`、1 字节版本（1）、16 字节 `t`；私钥同序，魔数为 `b"PQALSK\0\0"`，随后 16 字节 `s`，同样固定 25 字节。密文依次为 8 字节魔数 `b"PQALCT\0\0"`、1 字节版本（1）、16 字节 `u`、4 字节大端无符号 `tag` 长度、原样拼接的 `tag`；`tag` 可为任意 `bytes`，长度范围 `0..2**32-1`，故密文总长为 `29 + tag 长度` 字节。
+线格式（v1）：公钥固定 25 字节——8 字节魔数 `b"PQALPK\0\0"`、1 字节版本（1）、16 字节 `t`；私钥同序，魔数为 `b"PQALSK\0\0"`，随后 16 字节 `s`，同样固定 25 字节。密文依次为 8 字节魔数 `b"PQALCT\0\0"`、1 字节版本（1）、16 字节 `u`、4 字节大端无符号 `tag` 长度、原样拼接的 `tag`；`tag` 可为任意 `bytes`，长度范围 `0..2**32-1`，故密文总长为 `29 + tag 长度` 字节。签名依次为 8 字节魔数 `b"PQALSG\0\0"`、1 字节版本（1）、16 字节随机向量 `u`、4 字节大端无符号标签长度（恒为 32）、32 字节 `tag`，固定 61 字节，不含消息或密钥。
 
 ```python
 from pqattest import toy_lattice_keygen, toy_lattice_encapsulate, toy_lattice_decapsulate
+from pqattest import toy_lattice_sign, toy_lattice_verify, ToyLatticeSignature
 
 private_key, public_key = toy_lattice_keygen()
 ciphertext, enc_key = toy_lattice_encapsulate(public_key)
@@ -635,6 +645,14 @@ assert toy_lattice_decapsulate(ciphertext, private_key) == enc_key
 # tag 是密钥确认：任何字节被改动都会在解封装时抛 ValueError
 tampered = ToyLatticeCiphertext(ciphertext.u, b"\x00" * 32)
 toy_lattice_decapsulate(tampered, private_key)   # ValueError
+
+# 签名含随机向量与 32 字节标签，v1 线格式确定，往返后仍可验证
+signature = toy_lattice_sign(b"hello", private_key)
+assert toy_lattice_verify(b"hello", signature, public_key)
+assert not toy_lattice_verify(b"hellp", signature, public_key)
+restored = ToyLatticeSignature.from_bytes(signature.to_bytes())
+assert restored == signature
+assert toy_lattice_verify(b"hello", restored, public_key)
 ```
 
 参数分析（纯函数，不生成密钥、不取随机数）：

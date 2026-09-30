@@ -171,9 +171,13 @@ order, each carrying the candidate's plan/cost pairing, its five
 normalised costs, its final score and a selected flag — again with exact
 Fraction arithmetic,
 and
-the teaching-only toy lattice KEM: toy_lattice_keygen / toy_lattice_encapsulate /
-toy_lattice_decapsulate / ToyLatticePublicKey / ToyLatticePrivateKey /
-ToyLatticeCiphertext. The three plaintext signer checkpoints and the toy
+the teaching-only toy lattice KEM and signature toys:
+toy_lattice_keygen / toy_lattice_encapsulate /
+toy_lattice_decapsulate / toy_lattice_sign / toy_lattice_verify /
+ToyLatticePublicKey / ToyLatticePrivateKey /
+ToyLatticeCiphertext / ToyLatticeSignature, the latter carrying the
+E-encoded random vector and 32-byte keyed tag under its own versioned v1
+wire encoding. The three plaintext signer checkpoints and the toy
 lattice private key's versioned encoding can be sealed
 in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; a v2
 envelope with auth_state_wrap / auth_state_unwrap additionally binds a
@@ -374,9 +378,12 @@ from .toy_lattice import (
     ToyLatticeCiphertext,
     ToyLatticePrivateKey,
     ToyLatticePublicKey,
+    ToyLatticeSignature,
     toy_lattice_decapsulate,
     toy_lattice_encapsulate,
     toy_lattice_keygen,
+    toy_lattice_sign,
+    toy_lattice_verify,
 )
 from .wots import (
     ELEMENT_BYTES,
@@ -430,6 +437,7 @@ __all__ = [
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
     "ToyLatticePublicKey",
+    "ToyLatticeSignature",
     "WOTSOneTimeSigner",
     "WOTSPrivateKey",
     "WOTSProof",
@@ -519,6 +527,8 @@ __all__ = [
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
     "toy_lattice_keygen",
+    "toy_lattice_sign",
+    "toy_lattice_verify",
     "verify",
     "wots_keygen",
     "wots_sign",

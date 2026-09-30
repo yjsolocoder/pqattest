@@ -28,9 +28,12 @@ __all__ = [
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
     "ToyLatticePublicKey",
+    "ToyLatticeSignature",
     "toy_lattice_decapsulate",
     "toy_lattice_encapsulate",
     "toy_lattice_keygen",
+    "toy_lattice_sign",
+    "toy_lattice_verify",
 ]
 
 _DIMENSION = 8
@@ -41,10 +44,12 @@ _MAX_COEFF = 256
 _TOKEN_BYTES = _DIMENSION
 _TAG_BYTES = 32
 _KEY_DOMAIN = b"K"
+_SIGNATURE_DOMAIN = b"S"
 
 _PUBLIC_KEY_MAGIC = b"PQALPK\0\0"
 _PRIVATE_KEY_MAGIC = b"PQALSK\0\0"
 _CIPHERTEXT_MAGIC = b"PQALCT\0\0"
+_SIGNATURE_MAGIC = b"PQALSG\0\0"
 _LATTICE_VERSION = 1
 _KEY_BYTES = 8 + 1 + _ELEMENT_BYTES
 _TAG_LENGTH_BYTES = 4

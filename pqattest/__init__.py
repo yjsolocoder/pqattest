@@ -377,6 +377,7 @@ from .params import (
 from .toy_lattice import (
     ToyLatticeCiphertext,
     ToyLatticePrivateKey,
+    ToyLatticeProof,
     ToyLatticePublicKey,
     ToyLatticeSignature,
     toy_lattice_decapsulate,
@@ -436,6 +437,7 @@ __all__ = [
     "SchemeScenarioScore",
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
+    "ToyLatticeProof",
     "ToyLatticePublicKey",
     "ToyLatticeSignature",
     "WOTSOneTimeSigner",

@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable
 __all__ = [
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
+    "ToyLatticeProof",
     "ToyLatticePublicKey",
     "ToyLatticeSignature",
     "toy_lattice_decapsulate",
@@ -57,11 +58,13 @@ _PUBLIC_KEY_MAGIC = b"PQALPK\0\0"
 _PRIVATE_KEY_MAGIC = b"PQALSK\0\0"
 _CIPHERTEXT_MAGIC = b"PQALCT\0\0"
 _SIGNATURE_MAGIC = b"PQALSG\0\0"
+_PROOF_MAGIC = b"PQALPF\0\0"
 _LATTICE_VERSION = 1
 _KEY_BYTES = 8 + 1 + _ELEMENT_BYTES
 _TAG_LENGTH_BYTES = 4
 _CIPHERTEXT_HEADER_BYTES = 8 + 1 + _ELEMENT_BYTES + _TAG_LENGTH_BYTES
 _SIGNATURE_HEADER_BYTES = 8 + 1 + _ELEMENT_BYTES + _TAG_LENGTH_BYTES
+_PROOF_HEADER_BYTES = 8 + 1 + _TAG_LENGTH_BYTES + _TAG_LENGTH_BYTES
 _MAX_TAG_LENGTH = 2**32 - 1
 
 
@@ -344,6 +347,155 @@ class ToyLatticeSignature:
         if len(data) > expected:
             raise ValueError("trailing data after the signature encoding")
         return cls(u=u, tag=data[_SIGNATURE_HEADER_BYTES:expected])
+
+
+@dataclass(frozen=True)
+class ToyLatticeProof:
+    """Frozen, self-contained bundle of one toy public key and one signature.
+
+    Unlike a bare :class:`ToyLatticeSignature` (whose tag cannot be checked
+    without the matching :class:`ToyLatticePublicKey` supplied separately), a
+    proof carries the public key that constrains its signature, so it can be
+    transported on its own as a single byte block and verified with
+    :meth:`verify`. The proof stores no message, private key, randomness or
+    state and is a pure serialisation container: it offers neither
+    authentication nor encryption of the wrapper itself, draws no randomness,
+    generates no keys and keeps no state.
+
+    .. warning::
+
+        Teaching only, like everything in this module: the embedded toy
+        signature is a stateless MAC tag, not a real lattice signature.
+    """
+
+    public_key: ToyLatticePublicKey
+    signature: ToyLatticeSignature
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.public_key, ToyLatticePublicKey):
+            raise TypeError("public_key must be a ToyLatticePublicKey")
+        if not isinstance(self.signature, ToyLatticeSignature):
+            raise TypeError("signature must be a ToyLatticeSignature")
+
+    def to_bytes(self) -> bytes:
+        """Serialise to the versioned v1 proof wire format as ``bytes``.
+
+        The layout is the 8-byte magic ``b"PQALPF\\0\\0"``; one version byte
+        (1); the public-key and signature lengths as 4 big-endian bytes each;
+        then the existing v1 encodings of the public key and of the
+        signature, in that order (the inner encodings are reused unchanged).
+        Encoding is deterministic: the same proof always produces the same
+        bytes. Neither the message, the private key, any randomness nor any
+        state is carried. A field corrupted by bypassing the frozen
+        constructor raises ``ValueError`` instead of producing malformed
+        bytes.
+        """
+        if not isinstance(self, ToyLatticeProof):
+            raise TypeError("to_bytes must be called on a ToyLatticeProof")
+        try:
+            key_bytes = self.public_key.to_bytes()
+            signature_bytes = self.signature.to_bytes()
+        except (TypeError, AttributeError) as exc:
+            raise ValueError(f"corrupted proof field: {exc}") from exc
+        return (
+            _PROOF_MAGIC
+            + bytes((_LATTICE_VERSION,))
+            + len(key_bytes).to_bytes(_TAG_LENGTH_BYTES, "big")
+            + len(signature_bytes).to_bytes(_TAG_LENGTH_BYTES, "big")
+            + key_bytes
+            + signature_bytes
+        )
+
+    @classmethod
+    def from_bytes(cls, data: Any) -> "ToyLatticeProof":
+        """Parse ``to_bytes()`` output back into a :class:`ToyLatticeProof`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. The embedded public key and signature are each
+        recovered through their own existing v1 parsers, public key first.
+        A bad magic, an unknown version, a length field that is out of bounds
+        or disagrees with the actual content, truncation, trailing data, or
+        an invalid nested public-key or signature encoding raises
+        ``ValueError`` and no half-valid object is returned.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("proof data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) < _PROOF_HEADER_BYTES:
+            raise ValueError("proof encoding is truncated")
+        if data[:8] != _PROOF_MAGIC:
+            raise ValueError("bad proof magic")
+        if data[8] != _LATTICE_VERSION:
+            raise ValueError(f"unsupported proof version: {data[8]}")
+        key_length = int.from_bytes(data[9:13], "big")
+        signature_length = int.from_bytes(data[13:17], "big")
+        key_end = _PROOF_HEADER_BYTES + key_length
+        signature_end = key_end + signature_length
+        if key_length == 0 or signature_length == 0:
+            raise ValueError("a length field must not be zero")
+        if key_end > len(data) or signature_end > len(data):
+            raise ValueError("proof encoding is truncated")
+        if signature_end < len(data):
+            raise ValueError("trailing data after the proof encoding")
+        try:
+            public_key = ToyLatticePublicKey.from_bytes(
+                data[_PROOF_HEADER_BYTES:key_end]
+            )
+            signature = ToyLatticeSignature.from_bytes(data[key_end:signature_end])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid nested proof field encoding: {exc}") from exc
+        return cls(public_key=public_key, signature=signature)
+
+    def verify(self, message: Any) -> bool:
+        """Verify the embedded signature against the embedded public key.
+
+        Accepts ``bytes``/``bytearray``/``str`` exactly like
+        :func:`toy_lattice_verify`, to which this call delegates; it returns
+        ``True`` only for the message that was actually signed with the key
+        matching the embedded public key. Any change to the message, public
+        key or signature, an illegal message type, or fields corrupted by
+        bypassing the frozen constructor returns ``False`` instead of
+        raising. The proof itself carries no message and cannot authenticate
+        its own origin.
+        """
+        try:
+            return toy_lattice_verify(message, self.signature, self.public_key)
+        except Exception:
+            return False
+
+    def verify_bound(self, message: Any, *, public_key: Any) -> bool:
+        """Verify the signature and bind the proof to an expected public key.
+
+        First requires ``public_key`` to equal the public key embedded in
+        the proof, compared by value, then runs the exact verification of
+        :meth:`verify` — ``message`` is checked against the embedded
+        signature with :func:`toy_lattice_verify`, accepting
+        ``bytes``/``bytearray``/``str`` (a ``str`` is encoded as UTF-8). No
+        wire format changes, no new objects, no randomness and no state are
+        involved.
+
+        ``public_key`` must be a :class:`ToyLatticePublicKey`; any other
+        type raises ``TypeError``. Missing or mistyped embedded fields
+        (including values corrupted by bypassing the frozen constructor),
+        any public-key value mismatch, and any message or signature
+        mismatch return ``False`` without leaking any other exception.
+        """
+        if not isinstance(public_key, ToyLatticePublicKey):
+            raise TypeError("public_key must be a ToyLatticePublicKey")
+        try:
+            embedded_key = self.public_key
+            signature = self.signature
+            if not isinstance(embedded_key, ToyLatticePublicKey):
+                return False
+            if embedded_key != public_key:
+                return False
+            return toy_lattice_verify(message, signature, embedded_key)
+        except Exception:
+            # A bypass-constructed proof may carry arbitrary field objects
+            # whose access or comparison raises anything; the bound check
+            # reports every such malformed structure as ``False``. External
+            # argument type errors were raised before this block.
+            return False
 
 
 def _decode_key_field(data: Any, magic: bytes, label: str) -> bytes:

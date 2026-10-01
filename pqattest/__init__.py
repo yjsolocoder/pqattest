@@ -177,7 +177,11 @@ toy_lattice_decapsulate / toy_lattice_sign / toy_lattice_verify /
 ToyLatticePublicKey / ToyLatticePrivateKey /
 ToyLatticeCiphertext / ToyLatticeSignature, the latter carrying the
 E-encoded random vector and 32-byte keyed tag under its own versioned v1
-wire encoding. The three plaintext signer checkpoints and the toy
+wire encoding, plus the standalone proof pack ToyLatticeProof that
+bundles one ToyLatticePublicKey and one ToyLatticeSignature into one
+independently transportable, deterministic v1 byte block (its
+verify_bound additionally binds the proof to the receiver's expected
+public key). The three plaintext signer checkpoints and the toy
 lattice private key's versioned encoding can be sealed
 in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; a v2
 envelope with auth_state_wrap / auth_state_unwrap additionally binds a
@@ -377,6 +381,7 @@ from .params import (
 from .toy_lattice import (
     ToyLatticeCiphertext,
     ToyLatticePrivateKey,
+    ToyLatticeProof,
     ToyLatticePublicKey,
     ToyLatticeSignature,
     toy_lattice_decapsulate,
@@ -436,6 +441,7 @@ __all__ = [
     "SchemeScenarioScore",
     "ToyLatticeCiphertext",
     "ToyLatticePrivateKey",
+    "ToyLatticeProof",
     "ToyLatticePublicKey",
     "ToyLatticeSignature",
     "WOTSOneTimeSigner",

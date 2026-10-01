@@ -62,6 +62,17 @@ assert MerkleBatchProof.from_bytes(blob).verify(messages)
 
 消息统一接受 `bytes`、`bytearray`、`str`（str 按 UTF-8 编码）。
 
+需要把同一消息绑定到调用方上下文（如协议域、会话或用途标识）时，签名与验证两端都传同一个仅关键字 `context`：缺省或空值即「无上下文」，签名/验证沿用既有摘要、旧 v1 字节照常可验；非空上下文会进入实际被验的消息摘要，两端不一致就验证失败。
+
+```python
+sig = signer.sign(b"position claim", context=b"enroll/v1")
+assert merkle_verify(b"position claim", sig, public_key, context=b"enroll/v1")
+assert not merkle_verify(b"position claim", sig, public_key)                 # 无上下文
+assert not merkle_verify(b"position claim", sig, public_key, context=b"x")   # 上下文不同
+```
+
+单签、批签、显式选叶、批次证明与 multiproof 的生成入口，以及 `MerkleProof` / `MerkleBatchProof` 的 `verify` / `verify_bound` 和 `multiproof_verify` / `multiproof_verify_bound` 均支持该参数，批次与 multiproof 还要求相同的消息顺序。
+
 教学用格基玩具 KEM 与签名（仅演示封装/解封装与签名/验签流程）：
 
 ```python
@@ -226,6 +237,7 @@ Merkle 聚合（有限次签名）：
 - `MerkleBatchProof.verify_bound(messages, *, public_key, indices=None)` — 在 `verify(messages)` 的逐项验证之外，把批次绑定到接收方预期公钥与可选叶选择；不新增对象、不改动批次证明 v1 线格式，不生成密钥、不取随机数、不保存状态。`public_key` 须为 `MerklePublicKey`（错型抛 `TypeError`），并与包内公钥的 `w`、`height`、`root` 逐值相等；`indices=None` 不限制叶选择；显式 `indices` 须为元组（非元组或含非整数成员抛 `TypeError`），与消息等长、成员为非布尔整数、严格递增，并与各签名的 `index` 按位置完全相同；布尔成员、重复、乱序、越界、数量不符，包内公钥非 `MerklePublicKey`、签名为空或非 `MerkleSignature` 元组（字段缺失、错型、空或非元组，含绕过冻结构造器形成的畸形结构），以及消息、签名、公钥值不匹配均返回 `False` 而不抛异常；仅外部参数 `public_key` 错型或 `indices` 非元组/含非整数成员按旧约抛 `TypeError`
 - `multiproof_encode(public_key, signatures)` — 顶层函数，把同一 `MerklePublicKey` 的多份 `MerkleSignature` 压成一份去重认证路径的确定性证明 `bytes`；不引入新对象、不改动任何旧接口与格式。`public_key` 须为 `MerklePublicKey`，`signatures` 须为非空的 `MerkleSignature` 元组（类型错抛 `TypeError`）；空集合、索引非严格递增、签名不被公钥约束（`w`/树高/索引越界/W-OTS 元素数或路径数不符、元素畸形）或同一坐标节点冲突抛 `ValueError`
 - `multiproof_verify(messages, data)` — 顶层验证；`data` 只接受 `bytes`/`bytearray`，`messages` 须为与叶数等长的元组，成员沿用现有消息规则（`bytes`/`bytearray`/`str`）。按各消息恢复 W-OTS 公钥，沿用现有叶哈希与内部节点字节规则逐层合并，必须得到包内公钥根、且每个证明节点恰好使用一次；消息不符，或 `data`/`messages` 类型或数量错、魔数/版本/长度/计数错、截断、尾随、叶块乱序或重复、节点缺失/多余/重复/乱序/坐标非规范，一律返回 `False`
+- **可选上下文绑定（`context`）** — 上述全部 Merkle 多一次性签名的生成入口（`sign`、`sign_batch`、`sign_selected` 及其 `*_with_checkpoint` / `*_with_auth_state` 变体，`sign_proof_with_checkpoint`、`sign_proof_with_auth_state`、`sign_batch_proof_with_checkpoint`、`sign_batch_proof_with_auth_state`，以及 `sign_multiproof_with_checkpoint`、`sign_multiproof_with_auth_state`）与全部验证入口（`merkle_verify`、`MerkleProof.verify` / `verify_bound`、`MerkleBatchProof.verify` / `verify_bound`、`multiproof_verify` / `multiproof_verify_bound`）都接受仅关键字可选参数 `context=None`。`context` 只接受 `bytes`、`bytearray` 或 `str`（`str` 按 UTF-8 编码）；缺省 `None` 与显式空值（`b""`、`bytearray()`、`""`）按同一「无上下文」口径处理——消息直接沿用既有摘要，不带上下文的旧签名与已序列化 v1 字节继续可验，且同密钥、同消息、同叶位的输出与基线**逐字节相同**。传入非空上下文时，实际被 W-OTS 签名的是 `SHA256(b"pqattest/merkle/context/v1" + len(context) 的 4 字节大端 + context + len(message) 的 4 字节大端 + message)`（长度前缀消除拼接歧义；外层仍沿用 W-OTS 既有摘要与校验和规则），故同一消息在不同上下文下的签名互不通用：签名方在生成签名或证明时把消息、叶索引或批消息与同一上下文交给公开入口，验证方必须使用完全相同的上下文、消息顺序与公钥，否则上下文不匹配与内容、证明结构不匹配一样返回 `False`。上下文进入单签、批次证明与 multiproof 实际被验证的消息摘要（multiproof 按给定元组顺序逐叶绑定），而非只体现在函数名或返回值上；批消息顺序、重复消息、叶索引选择与 multiproof 去重规则沿用当前公开语义。上下文或消息类型错误在生成端抛 `TypeError`（`from_bytes` 等解析入口收到非法字节仍统一抛 `ValueError`），生成端状态或容量不足仍抛 `KeyExhaustedError`；验证端上下文错型抛 `TypeError`，上下文不匹配、验证内容或证明结构不匹配一律返回 `False`，不产生新对象、不隐含落盘。同一上下文、同一密钥与同一消息的生成结果保持既有确定性；默认入口的输出格式、线程安全、一次性叶消耗与 checkpoint / auth_state 语义均不改变，不新增任何线格式或版本号
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 

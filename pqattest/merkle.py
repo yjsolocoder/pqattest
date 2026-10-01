@@ -18,12 +18,17 @@ public key further into one deterministic proof whose shared authentication
 nodes are deduplicated into a canonical node set;
 :func:`multiproof_verify_bound` additionally binds such a proof to the
 receiver's expected public key and, optionally, an explicit leaf-index
-selection. Signer
+selection. Signers can be built deterministically from a 32-byte seed with
+:meth:`MerkleSigner.from_seed`; such signers additionally support a compact
+:meth:`MerkleSigner.seed_checkpoint` /
+:meth:`MerkleSigner.from_seed_checkpoint` pair, a separate versioned format
+from the full checkpoint. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
 key and is protected only by a SHA-256 checksum against accidental
-corruption, so callers must store it securely.
+corruption, so callers must store it securely. The compact seed snapshot
+carries the seed in the clear and must be protected the same way.
 """
 
 from __future__ import annotations
@@ -92,6 +97,20 @@ _CHECKPOINT_VERSION = 1
 _CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 1 + 2 + 4 + ELEMENT_BYTES
 _CHECKPOINT_CHECKSUM_BYTES = 32
 
+# Compact, seed-only snapshot: an independent versioned format, never parsed
+# by from_checkpoint and never accepted where the full checkpoint is expected.
+_SEED_CHECKPOINT_MAGIC = b"PQAMSSC\0"
+_SEED_CHECKPOINT_VERSION = 1
+_SEED_BYTES = 32
+_SEED_CHECKPOINT_FIXED_BYTES = (
+    8 + 1 + _SEED_BYTES + 1 + 1 + 2 + ELEMENT_BYTES
+)
+_SEED_CHECKPOINT_CHECKSUM_BYTES = 32
+_SEED_CHECKPOINT_TOTAL_BYTES = (
+    _SEED_CHECKPOINT_FIXED_BYTES + _SEED_CHECKPOINT_CHECKSUM_BYTES
+)
+_SEED_DOMAIN = b"pqattest/merkle-seed/v1"
+
 _PUBLIC_KEY_MAGIC = b"PQAMPK\0\0"
 _PUBLIC_KEY_VERSION = 1
 _PUBLIC_KEY_BYTES = 8 + 1 + 1 + 1 + ELEMENT_BYTES
@@ -143,6 +162,57 @@ def _signature_params(public_key: MerklePublicKey) -> tuple[int, int, int]:
 
 def _node_hash(left: bytes, right: bytes) -> bytes:
     return hashlib.sha256(_NODE_DOMAIN + left + right).digest()
+
+
+def _validate_seed(seed: Any) -> bytes:
+    """Return ``seed`` as ``bytes``; it must be exactly 32 of them."""
+    if not isinstance(seed, (bytes, bytearray)):
+        raise TypeError("seed must be bytes or bytearray")
+    seed = bytes(seed)
+    if len(seed) != _SEED_BYTES:
+        raise ValueError(f"seed must be exactly {_SEED_BYTES} bytes")
+    return seed
+
+
+def _seeded_chain_start(seed: bytes, w: int, height: int, leaf: int, chain: int) -> bytes:
+    """Derive one W-OTS chain start value from the master seed.
+
+    The fixed domain string isolates seed-derived material from every other
+    hash use; ``w`` and ``height`` isolate parameter combinations; and the
+    leaf index and chain position each get their own tagged, fixed-width
+    field, so no leaf/chain pair can collide with another.
+    """
+    return hashlib.sha256(
+        _SEED_DOMAIN
+        + b"w"
+        + bytes((w,))
+        + b"h"
+        + bytes((height,))
+        + b"leaf"
+        + leaf.to_bytes(4, "big")
+        + b"chain"
+        + chain.to_bytes(2, "big")
+        + seed
+    ).digest()
+
+
+def _seeded_key_material(
+    seed: bytes, w: int, height: int
+) -> tuple[list[WOTSPrivateKey], list[bytes]]:
+    """Deterministically build every W-OTS private key and leaf for a tree."""
+    b, l1, l2 = _params(w)
+    chains = l1 + l2
+    private_keys = []
+    leaves = []
+    for leaf in range(1 << height):
+        elements = tuple(
+            _seeded_chain_start(seed, w, height, leaf, chain)
+            for chain in range(chains)
+        )
+        private_keys.append(WOTSPrivateKey(w=w, elements=elements))
+        endpoints = tuple(_chain_walk(element, b - 1) for element in elements)
+        leaves.append(_leaf_hash(w, endpoints))
+    return private_keys, leaves
 
 
 @dataclass(frozen=True)
@@ -781,7 +851,7 @@ class MerkleSigner:
             wots_private, wots_public = wots_keygen(w=w, token_bytes=token_bytes)
             private_keys.append(wots_private)
             leaves.append(_leaf_hash(w, wots_public.elements))
-        self._init_state(w, height, tuple(private_keys), leaves, 0)
+        self._init_state(w, height, tuple(private_keys), leaves, 0, None)
 
     def _init_state(
         self,
@@ -790,6 +860,7 @@ class MerkleSigner:
         private_keys: tuple[Any, ...],
         leaves: list[bytes],
         next_index: int,
+        seed: bytes | None,
     ) -> None:
         layers = [leaves]
         while len(layers[-1]) > 1:
@@ -802,6 +873,7 @@ class MerkleSigner:
         self._private_keys = private_keys
         self._layers = tuple(tuple(layer) for layer in layers)
         self._next_index = next_index
+        self._seed = seed
         self._lock = threading.Lock()
         self._public_key = MerklePublicKey(w=w, height=height, root=layers[-1][0])
 
@@ -926,7 +998,7 @@ class MerkleSigner:
             endpoints = tuple(_chain_walk(element, b - 1) for element in elements)
             leaves.append(_leaf_hash(w, endpoints))
         signer = cls.__new__(cls)
-        signer._init_state(w, height, tuple(private_keys), leaves, next_index)
+        signer._init_state(w, height, tuple(private_keys), leaves, next_index, None)
         if signer._public_key.root != root:
             raise ValueError("Merkle root rebuilt from the private keys does not match")
         return signer
@@ -971,6 +1043,127 @@ class MerkleSigner:
         )
         signer = cls.from_checkpoint(checkpoint)
         return signer, generation_value
+
+    @classmethod
+    def from_seed(cls, seed: Any, *, height: int = 4, w: int = 4) -> "MerkleSigner":
+        """Build a signer deterministically from a single 32-byte secret seed.
+
+        Every W-OTS leaf key is derived from ``seed`` with SHA-256 under a
+        fixed domain string: the Winternitz parameter ``w`` and tree
+        ``height`` are mixed into the derivation so a parameter combination
+        cannot share material with another, and the leaf index and chain
+        position each occupy their own tagged, fixed-width fields so leaves
+        and chains are isolated from one another. No randomness is drawn.
+        The resulting signer behaves exactly like one built by the ordinary
+        constructor — the same wire formats, signing entries, checkpoint and
+        recovery semantics — except that it can additionally be snapshotted
+        compactly with :meth:`seed_checkpoint`.
+
+        ``seed`` must be exactly 32 bytes of ``bytes`` or ``bytearray``; any
+        other type raises ``TypeError`` and a different length raises
+        ``ValueError``. ``height`` and ``w`` are keyword-only and keep their
+        existing ranges (``height`` 1..8, ``w`` 4 or 8); an invalid value
+        raises ``ValueError``. The same seed, ``w`` and ``height`` always
+        rebuild the same public key and the same per-leaf signatures; a
+        different seed produces a different public key. The seed is a secret
+        — anyone holding it can recreate every private key.
+        """
+        seed_bytes = _validate_seed(seed)
+        w = _validate_w(w)
+        height = _validate_height(height)
+        private_keys, leaves = _seeded_key_material(seed_bytes, w, height)
+        signer = cls.__new__(cls)
+        signer._init_state(w, height, tuple(private_keys), leaves, 0, seed_bytes)
+        return signer
+
+    def _seed_checkpoint_bytes(self, next_index: int) -> bytes:
+        """Serialise the compact seed snapshot; the caller holds the lock."""
+        body = (
+            _SEED_CHECKPOINT_MAGIC
+            + bytes((_SEED_CHECKPOINT_VERSION,))
+            + self._seed
+            + bytes((self._w, self._height))
+            + next_index.to_bytes(2, "big")
+            + self._public_key.root
+        )
+        return body + hashlib.sha256(body).digest()
+
+    def seed_checkpoint(self) -> bytes:
+        """Return the compact, deterministic seed snapshot of this signer.
+
+        Only available for signers created with :meth:`from_seed` (or
+        restored with :meth:`from_seed_checkpoint`); calling it on a randomly
+        initialised signer raises ``ValueError``. The fixed 109-byte v1
+        layout is: the 8-byte magic ``b"PQAMSSC\\0"``; one version byte (1);
+        the 32-byte seed; one byte each for ``w`` and ``height``;
+        ``next_index`` as 2 big-endian bytes; the 32-byte Merkle root; and
+        finally the SHA-256 of all preceding content. It is a separate
+        versioned format from the full :meth:`checkpoint`: each is read only
+        by its matching restore entry.
+
+        The snapshot shares the signing lock, so a concurrent call reflects
+        the state either immediately before or immediately after an in-flight
+        :meth:`sign` or :meth:`advance_to`, never part-way through one. The
+        same state always produces the same bytes; signing, advancing or
+        exhausting the signer moves the recorded index with the state. The
+        blob contains the seed in the clear and its trailing hash only
+        detects accidental corruption — anyone holding it can recreate every
+        private key, so it must be protected exactly like a private key.
+        """
+        with self._lock:
+            if self._seed is None:
+                raise ValueError(
+                    "seed_checkpoint is only available for signers created "
+                    "from a seed"
+                )
+            return self._seed_checkpoint_bytes(self._next_index)
+
+    @classmethod
+    def from_seed_checkpoint(cls, data: Any) -> "MerkleSigner":
+        """Restore a signer from :meth:`seed_checkpoint` output.
+
+        Re-derives every W-OTS key from the embedded seed and resumes at the
+        saved ``next_index`` with the public key, index and remaining count
+        matching the snapshot; an exhausted snapshot stays exhausted and the
+        index can never move backwards. The restored signer supports every
+        existing signing entry and may itself be snapshotted again with
+        :meth:`seed_checkpoint` or fully with :meth:`checkpoint`.
+
+        ``data`` must be ``bytes`` or ``bytearray``; anything else raises
+        ``TypeError``. It must be exactly 109 bytes with no trailing data. A
+        bad magic, an unsupported version, an invalid ``w`` or ``height``, a
+        ``next_index`` outside ``0 .. 2 ** height``, a checksum mismatch, or a
+        Merkle root that does not match the one rebuilt from the seed raises
+        ``ValueError`` and no partial instance is returned. The full
+        :meth:`checkpoint` format is never accepted here.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("seed checkpoint data must be bytes or bytearray")
+        data = bytes(data)
+        if len(data) != _SEED_CHECKPOINT_TOTAL_BYTES:
+            raise ValueError("seed checkpoint must be exactly 109 bytes")
+        body = data[:-_SEED_CHECKPOINT_CHECKSUM_BYTES]
+        checksum = data[-_SEED_CHECKPOINT_CHECKSUM_BYTES:]
+        if body[:8] != _SEED_CHECKPOINT_MAGIC:
+            raise ValueError("bad seed checkpoint magic")
+        if body[8] != _SEED_CHECKPOINT_VERSION:
+            raise ValueError(f"unsupported seed checkpoint version: {body[8]}")
+        seed = body[9 : 9 + _SEED_BYTES]
+        offset = 9 + _SEED_BYTES
+        w = _validate_w(body[offset])
+        height = _validate_height(body[offset + 1])
+        next_index = int.from_bytes(body[offset + 2 : offset + 4], "big")
+        root = body[offset + 4 : offset + 4 + ELEMENT_BYTES]
+        if next_index > (1 << height):
+            raise ValueError("next_index exceeds the leaf count")
+        if hashlib.sha256(body).digest() != checksum:
+            raise ValueError("seed checkpoint checksum mismatch")
+        private_keys, leaves = _seeded_key_material(seed, w, height)
+        signer = cls.__new__(cls)
+        signer._init_state(w, height, tuple(private_keys), leaves, next_index, seed)
+        if signer._public_key.root != root:
+            raise ValueError("Merkle root rebuilt from the seed does not match")
+        return signer
 
     def advance_to(self, next_index: Any) -> tuple[int, int]:
         """Void leaves by advancing ``next_index`` to ``next_index``.

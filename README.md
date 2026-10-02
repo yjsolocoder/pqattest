@@ -27,6 +27,17 @@ signature = wots_sign(b"position claim", private_key)
 assert wots_verify(b"position claim", signature, public_key)
 ```
 
+独立 Lamport、W-OTS 与成对 `OtsPairProof` 也支持同一个仅关键字可选 `context`（`bytes`/`bytearray`/`str`，`str` 按 UTF-8；缺省 `None` 或空值即无上下文）：非空上下文经长度前缀域分离进入实际被签/被验的消息摘要，旧无上下文签名、证明、checkpoint 与 auth_state 字节逐字节不变，两端上下文不同（或一端有、一端无）即验签失败。上下文不写入签名、证明、checkpoint 或 auth_state。
+
+```python
+bound = sign(b"position claim", private_key, context=b"enroll/v1")
+assert verify(b"position claim", bound, public_key, context=b"enroll/v1")
+assert not verify(b"position claim", bound, public_key)                 # 无上下文
+assert not verify(b"position claim", bound, public_key, context=b"x")  # 上下文不同
+```
+
+`sign` / `verify`、`wots_sign` / `wots_verify`、`OneTimeSigner` 与 `WOTSOneTimeSigner` 的 `sign` / `sign_with_checkpoint` / `sign_with_auth_state`、无状态转换 `sign_lamport_auth_state` / `sign_wots_auth_state`、各成对入口（`sign_ots_pair`、`sign_ots_pair_with_checkpoint`、`sign_ots_pair_proof_with_checkpoint`、`sign_ots_pair_proof_with_auth_state`、`sign_ots_pair_proof_auth_state`），以及 `LamportProof` / `WOTSProof` / `OtsPairProof` 的 `verify` / `verify_bound` 均支持该参数。成对入口的同一个 context 同时绑定 Lamport 与 W-OTS 两侧（各用本构造自己的域分隔），整对同过或同败。
+
 需要一把长期公钥对应多条消息时，用 Merkle 聚合的 W-OTS（有限次签名）：
 
 ```python

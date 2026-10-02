@@ -14,6 +14,13 @@ it securely. :class:`WOTSOneTimeSigner` state can be persisted with a
 versioned binary checkpoint (``checkpoint`` / ``from_checkpoint``); the blob
 holds the private key in the clear and is integrity-protected only by a
 SHA-256 checksum, so callers must store it securely.
+
+Every signing and verification entry optionally accepts a keyword-only
+``context``: when omitted (or given as an empty value) the message is
+hashed exactly as the unbound baseline and existing v1 serialised bytes
+verify unchanged; when given, the same ``bytes``/``bytearray``/``str``
+(UTF-8 encoded) context must be supplied to both sides or verification
+fails.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ __all__ = [
 
 ELEMENT_BYTES = 32
 _DOMAIN = b"pqattest/wots/v1"
+_CONTEXT_DOMAIN = b"pqattest/wots/context/v1"
 _ALLOWED_W = (4, 8)
 
 _CHECKPOINT_MAGIC = b"PQAWCP\0\0"
@@ -73,6 +81,45 @@ def _as_bytes(message: Any) -> bytes:
     if isinstance(message, str):
         return message.encode("utf-8")
     raise TypeError("message must be bytes, bytearray or str")
+
+
+def _validate_context(context: Any) -> bytes:
+    """Normalise the optional signing context to canonical ``bytes``.
+
+    ``None`` and an empty ``bytes``/``bytearray``/``str`` both mean
+    "no context" and normalise to ``b""``. Any other type raises
+    ``TypeError``; a ``str`` is encoded as UTF-8.
+    """
+    if context is None:
+        return b""
+    if isinstance(context, (bytes, bytearray)):
+        return bytes(context)
+    if isinstance(context, str):
+        return context.encode("utf-8")
+    raise TypeError("context must be bytes, bytearray, str or None")
+
+
+def _context_message(context: bytes, message: Any) -> Any:
+    """Bind ``message`` to ``context`` for the W-OTS message digest.
+
+    ``context`` must already be normalised by :func:`_validate_context`.
+    The empty context passes ``message`` through untouched, so the
+    no-context path hashes exactly as the unbound baseline and existing
+    signatures stay byte-for-byte identical. With a non-empty context the
+    domain separator, both length-prefixed fields and the message are hashed
+    by :func:`_signing_digits` as one unambiguous byte string, so the same
+    message under two contexts produces two incompatible signatures.
+    """
+    if not context:
+        return message
+    message_bytes = _as_bytes(message)
+    return (
+        _CONTEXT_DOMAIN
+        + len(context).to_bytes(4, "big")
+        + context
+        + len(message_bytes).to_bytes(4, "big")
+        + message_bytes
+    )
 
 
 def _validate_w(w: Any) -> int:
@@ -333,21 +380,27 @@ class WOTSOneTimeSigner:
         """``True`` once a signature has been produced (read-only)."""
         return self._used
 
-    def sign(self, message: Any) -> tuple[bytes, ...]:
+    def sign(self, message: Any, *, context: Any = None) -> tuple[bytes, ...]:
         """Sign once.
 
         Behaves exactly like :func:`wots_sign` on the first successful call,
-        accepting ``bytes``/``bytearray``/``str``; an unsupported message type
-        raises the same ``TypeError`` that :func:`wots_sign` raises without
-        consuming the key. Any later call raises
+        accepting ``bytes``/``bytearray``/``str``; an unsupported message or
+        context type raises the same ``TypeError`` that :func:`wots_sign`
+        raises without consuming the key. Any later call raises
         :class:`~pqattest.KeyExhaustedError`. Concurrent calls are serialised
         on one lock so that at most one succeeds and every loser raises
         :class:`~pqattest.KeyExhaustedError`.
+
+        ``context`` is keyword-only and optional and follows the same rules
+        as :func:`wots_sign`: ``None``/empty means no context and produces
+        the exact unbound signature, while a non-empty context binds the
+        message so verification requires the very same context.
         """
+        context_bytes = _validate_context(context)
         with self._lock:
             if self._used:
                 raise KeyExhaustedError("this one-time signing key has already been used")
-            signature = wots_sign(message, self._private_key)
+            signature = wots_sign(message, self._private_key, context=context_bytes)
             self._used = True
             return signature
 
@@ -380,7 +433,9 @@ class WOTSOneTimeSigner:
         with self._lock:
             return self._checkpoint_bytes()
 
-    def sign_with_checkpoint(self, message: Any) -> tuple[tuple[bytes, ...], bytes]:
+    def sign_with_checkpoint(
+        self, message: Any, *, context: Any = None
+    ) -> tuple[tuple[bytes, ...], bytes]:
         """Sign once and snapshot the used state in one atomic step.
 
         Behaves like :meth:`sign` — same ``bytes``/``bytearray``/``str``
@@ -397,28 +452,30 @@ class WOTSOneTimeSigner:
         to together, so a caller can never match a signature against a
         checkpoint taken at the wrong point under concurrency.
 
-        A rejected message type raises ``TypeError`` without consuming the
-        key, and an already used instance raises
+        A rejected message or context type raises ``TypeError`` without
+        consuming the key, and an already used instance raises
         :class:`~pqattest.KeyExhaustedError`; a failed call returns no
         partial result. The whole call — signature, ``used`` flip and
         snapshot — linearises with :meth:`sign` and :meth:`checkpoint`
         under the same lock, so at most one concurrent caller succeeds,
-        and no randomness is drawn. The returned checkpoint still carries
+        and no randomness is drawn. The context is not written into the
+        signature or the checkpoint. The returned checkpoint still carries
         the private key in the clear and its trailing hash only detects
         accidental corruption — it offers no authentication, encryption or
         atomic persistence, so confidentiality, durable storage and
         rollback protection remain the caller's responsibility.
         """
         message = _as_bytes(message)
+        context_bytes = _validate_context(context)
         with self._lock:
             if self._used:
                 raise KeyExhaustedError("this one-time signing key has already been used")
-            signature = wots_sign(message, self._private_key)
+            signature = wots_sign(message, self._private_key, context=context_bytes)
             self._used = True
             return signature, self._checkpoint_bytes()
 
     def sign_with_auth_state(
-        self, message: Any, *, key: Any, generation: Any
+        self, message: Any, *, key: Any, generation: Any, context: Any = None
     ) -> tuple[tuple[bytes, ...], bytes]:
         """Sign once and return the advanced state as a v2 auth envelope.
 
@@ -441,24 +498,28 @@ class WOTSOneTimeSigner:
         Every argument is validated before the key is spent: ``key`` is
         keyword-only and must be a non-empty ``bytes``/``bytearray`` shared
         secret; ``generation`` is keyword-only and must be a non-boolean
-        integer in ``0 .. 2**64 - 1``. A wrong message or key type raises
-        ``TypeError``; an empty key or an out-of-range generation raises
-        ``ValueError``; an already used instance raises
+        integer in ``0 .. 2**64 - 1``; the keyword-only ``context`` follows
+        the usual rules (``None``/empty means no context, ``str`` encoded as
+        UTF-8). A wrong message, context or key type raises ``TypeError``; an
+        empty key or an out-of-range generation raises ``ValueError``; an
+        already used instance raises
         :class:`~pqattest.KeyExhaustedError`. Every failure leaves ``used``
         untouched and returns no partial result. The whole call — signature,
         ``used`` flip, snapshot and wrapping — linearises with :meth:`sign`
         and :meth:`checkpoint` under the same lock, and no randomness is
-        drawn. The envelope is plaintext and authenticated only; it provides
-        neither encryption nor protection against replay or rollback on its
-        own.
+        drawn. The context is bound into the signature only; it is never
+        written into the envelope. The envelope is plaintext and
+        authenticated only; it provides neither encryption nor protection
+        against replay or rollback on its own.
         """
         message = _as_bytes(message)
+        context_bytes = _validate_context(context)
         key_bytes = _validate_key(key)
         generation_value = _validate_generation(generation, "generation")
         with self._lock:
             if self._used:
                 raise KeyExhaustedError("this one-time signing key has already been used")
-            signature = wots_sign(message, self._private_key)
+            signature = wots_sign(message, self._private_key, context=context_bytes)
             self._used = True
             checkpoint = self._checkpoint_bytes()
             envelope = auth_state_wrap(
@@ -583,14 +644,24 @@ def wots_keygen(
     return private_key, WOTSPublicKey(w=w, elements=endpoints)
 
 
-def wots_sign(message: Any, private_key: WOTSPrivateKey) -> tuple[bytes, ...]:
+def wots_sign(
+    message: Any, private_key: WOTSPrivateKey, *, context: Any = None
+) -> tuple[bytes, ...]:
     """Sign ``message``: for each digit ``d`` reveal chain value at step ``d``.
 
     Message digits come first, followed by the fixed-width checksum digits.
+
+    ``context`` is keyword-only and optional: ``None`` (the default) and an
+    empty ``bytes``/``bytearray``/``str`` both mean "no context" and produce
+    the exact unbound signature, while any other ``str`` is encoded as UTF-8
+    and the message digest is bound to it, so a signature made under one
+    context verifies only under that same context. A context of any other
+    type raises ``TypeError`` without touching the key.
     """
     if not isinstance(private_key, WOTSPrivateKey):
         raise TypeError("private_key must be a WOTSPrivateKey")
-    digits = _signing_digits(message, private_key.w)
+    context_bytes = _validate_context(context)
+    digits = _signing_digits(_context_message(context_bytes, message), private_key.w)
     return tuple(
         _chain_walk(private_key.elements[i], digit)
         for i, digit in enumerate(digits)
@@ -598,13 +669,24 @@ def wots_sign(message: Any, private_key: WOTSPrivateKey) -> tuple[bytes, ...]:
 
 
 def wots_verify(
-    message: Any, signature: Sequence[Any], public_key: WOTSPublicKey
+    message: Any,
+    signature: Sequence[Any],
+    public_key: WOTSPublicKey,
+    *,
+    context: Any = None,
 ) -> bool:
     """Complete the remaining chain steps and compare every public endpoint.
 
     Returns ``False`` for any structural, parameter or content mismatch; only
-    a wrong key *type* raises ``TypeError``.
+    a wrong key *type* or a wrong ``context`` *type* raises ``TypeError``.
+
+    ``context`` is keyword-only and optional: ``None`` (the default) and an
+    empty ``bytes``/``bytearray``/``str`` both mean "no context" and verify
+    the legacy unbound signatures, while any other context must be exactly
+    the one used at signing (a ``str`` is encoded as UTF-8); a signature
+    made under one context returns ``False`` under another.
     """
+    context_bytes = _validate_context(context)
     if not isinstance(public_key, WOTSPublicKey):
         raise TypeError("public_key must be a WOTSPublicKey")
     w = public_key.w
@@ -621,7 +703,7 @@ def wots_verify(
         return False
 
     try:
-        digits = _signing_digits(message, w)
+        digits = _signing_digits(_context_message(context_bytes, message), w)
     except TypeError:
         return False
     for i, digit in enumerate(digits):
@@ -785,7 +867,7 @@ class WOTSProof:
             raise ValueError("signature w does not match the public key")
         return cls(public_key=public_key, signature=signature)
 
-    def verify(self, message: Any) -> bool:
+    def verify(self, message: Any, *, context: Any = None) -> bool:
         """Verify the embedded signature against the embedded public key.
 
         Accepts ``bytes``/``bytearray``/``str`` exactly like
@@ -795,13 +877,24 @@ class WOTSProof:
         fields corrupted by bypassing the frozen constructor returns
         ``False`` instead of raising. The proof itself carries no message and
         cannot authenticate its own origin.
+
+        ``context`` is keyword-only and optional: ``None`` (the default) and
+        an empty value both mean "no context" and verify legacy unbound
+        signatures; any other ``bytes``/``bytearray``/``str`` (``str`` encoded
+        as UTF-8) must match the signing context exactly, else the signature
+        fails to verify. A context of any other type raises ``TypeError``.
         """
+        context_bytes = _validate_context(context)
         try:
-            return wots_verify(message, self.signature, self.public_key)
+            return wots_verify(
+                message, self.signature, self.public_key, context=context_bytes
+            )
         except Exception:
             return False
 
-    def verify_bound(self, message: Any, *, public_key: Any) -> bool:
+    def verify_bound(
+        self, message: Any, *, public_key: Any, context: Any = None
+    ) -> bool:
         """Verify the signature and bind the proof to an expected public key.
 
         First requires ``public_key`` to equal the public key embedded in
@@ -812,6 +905,12 @@ class WOTSProof:
         No wire format changes, no new objects, no randomness and no state
         are involved.
 
+        ``context`` is keyword-only and optional and follows the same rules
+        as :meth:`verify`: ``None``/empty means no context, while a non-empty
+        context must be the one used at signing; the wrong context makes the
+        bound check return ``False``, and a context of a wrong type raises
+        ``TypeError``.
+
         ``public_key`` must be a :class:`WOTSPublicKey`; any other type
         raises ``TypeError``. Missing or mistyped embedded fields
         (including values corrupted by bypassing the frozen constructor),
@@ -820,6 +919,7 @@ class WOTSProof:
         """
         if not isinstance(public_key, WOTSPublicKey):
             raise TypeError("public_key must be a WOTSPublicKey")
+        context_bytes = _validate_context(context)
         try:
             embedded_key = self.public_key
             signature = self.signature
@@ -827,7 +927,9 @@ class WOTSProof:
                 return False
             if embedded_key != public_key:
                 return False
-            return wots_verify(message, signature, embedded_key)
+            return wots_verify(
+                message, signature, embedded_key, context=context_bytes
+            )
         except Exception:
             # A bypass-constructed proof may carry arbitrary field objects
             # whose access or comparison raises anything; the bound check

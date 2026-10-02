@@ -185,7 +185,12 @@ public key). The three plaintext signer checkpoints and the toy
 lattice private key's versioned encoding can be sealed
 in a keyed HMAC-SHA-256 envelope with auth_wrap / auth_unwrap; a v2
 envelope with auth_state_wrap / auth_state_unwrap additionally binds a
-uint64 generation so an externally tracked floor can detect rollback.
+uint64 generation so an externally tracked floor can detect rollback;
+auth_state_fingerprint derives a keyed 32-byte state identity from a v2
+envelope and auth_state_unwrap's optional expect_state_id compares that
+identity in constant time, so a caller persisting the identity alongside
+its high-water generation can also reject a replaced same-generation
+state.
 The Lamport and W-OTS signers additionally offer from_auth_state, which
 authenticates and restores a v2 envelope and then invokes a caller-supplied
 monotonic claim callback exactly once; restore_ots_pair restores a
@@ -291,6 +296,7 @@ from .auth import (
     _validate_claim,
     _validate_generation,
     _validate_key,
+    auth_state_fingerprint,
     auth_state_unwrap,
     auth_state_wrap,
     auth_unwrap,
@@ -452,6 +458,7 @@ __all__ = [
     "advance_and_sign_merkle_auth_state",
     "advance_and_sign_merkle_auth_state_batch",
     "advance_merkle_auth_state",
+    "auth_state_fingerprint",
     "auth_state_unwrap",
     "auth_state_wrap",
     "auth_unwrap",

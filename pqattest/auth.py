@@ -17,11 +17,18 @@ envelope: the same magic, authentication and v1 parameter rules, plus an
 8-byte unsigned *generation*. :func:`auth_state_unwrap` can refuse a blob
 whose generation is below a caller-supplied floor, which lets a trusted
 monotonic counter detect rollback across unwraps (the floor itself is not
-stored in the envelope and must live in trusted storage).
+stored in the envelope and must live in trusted storage). The floor alone
+cannot tell two different same-generation states apart, so
+:func:`auth_state_fingerprint` derives a 32-byte, keyed *state identity*
+from a v2 envelope's authenticated body and :func:`auth_state_unwrap`
+optionally takes that identity as ``expect_state_id``: a caller persists
+the identity (the state it actually accepted) together with its high-water
+generation, and any replaced payload at the same generation is then
+rejected as well.
 
 Both envelopes authenticate but do **not** encrypt (the payload stays
-readable), and a same-generation replay, or a rollback that also rewinds
-the trusted floor, remains undetectable.
+readable), and a same-generation, same-identity replay, or a rollback that
+also rewinds the trusted floor and identity, remains undetectable.
 """
 
 from __future__ import annotations
@@ -35,10 +42,13 @@ __all__ = [
     "auth_unwrap",
     "auth_state_wrap",
     "auth_state_unwrap",
+    "auth_state_fingerprint",
 ]
 
 _AUTH_MAGIC = b"PQAAUTH\0"
 _AUTH_TAG_BYTES = 32  # HMAC-SHA-256 output length
+_STATE_ID_BYTES = 32  # HMAC-SHA-256 output length
+_STATE_ID_DOMAIN = b"pqattest/auth-state-id/v1"
 _UINT64_MAX = 2**64 - 1
 
 # v1 envelope: magic, version, scheme identifier, 4-byte payload length.
@@ -97,6 +107,18 @@ def _validate_expect(expect: Any) -> None:
         raise TypeError("expect must be a scheme name string or None")
     if expect not in _SCHEMES:
         raise ValueError(f"unknown expected scheme: {expect!r}")
+
+
+def _validate_state_id(value: Any) -> bytes | None:
+    """Coerce the optional 32-byte ``expect_state_id`` argument."""
+    if value is None:
+        return None
+    state_id = _coerce_bytes(value, "expect_state_id")
+    if len(state_id) != _STATE_ID_BYTES:
+        raise ValueError(
+            f"expect_state_id must be exactly {_STATE_ID_BYTES} bytes"
+        )
+    return state_id
 
 
 def _check_payload_magic(payload: bytes, payload_magic: bytes, scheme: str) -> None:
@@ -261,6 +283,60 @@ def _auth_state_authenticate(blob: bytes, key_bytes: bytes) -> bytes:
     return body
 
 
+def _auth_state_identity(body: bytes, key_bytes: bytes) -> bytes:
+    """Keyed 32-byte identity over an authenticated v2 body.
+
+    ``HMAC-SHA-256(key, domain || body)`` under a state-id-specific domain
+    prefix so the identity can never be confused with the envelope's own
+    authentication tag; the body is exactly the bytes covered by that tag
+    (everything before it), so every field the envelope binds — magic,
+    version, scheme identifier, generation, length and payload — feeds the
+    identity.
+    """
+    return hmac.new(
+        key_bytes, _STATE_ID_DOMAIN + body, hashlib.sha256
+    ).digest()
+
+
+def auth_state_fingerprint(data: Any, *, key: Any) -> bytes:
+    """Return the 32-byte keyed state identity of a v2 authenticated envelope.
+
+    The identity is ``HMAC-SHA-256(key, b"pqattest/auth-state-id/v1" + body)``
+    where ``body`` is the v2 envelope content the envelope tag authenticates
+    — all bytes from the ``PQAAUTH`` magic through the payload, i.e.
+    everything except the trailing 32-byte tag. The envelope's own HMAC tag
+    is verified first (exactly as in :func:`auth_state_unwrap`), so the
+    identity is only ever derived from an envelope that authenticates under
+    ``key``; it is not a second parsing path and trusts no field beforehand.
+
+    The same envelope and key always return the same 32 ``bytes``; a
+    different payload, generation or scheme identifier — or a different
+    key — yields a different identity. Persist the returned bytes alongside
+    a :func:`auth_state_unwrap` high-water generation and pass them back as
+    ``expect_state_id`` to distinguish the current state from any other
+    valid same-generation state.
+
+    ``data`` must be ``bytes`` or ``bytearray`` produced by
+    :func:`auth_state_wrap` and ``key`` a non-empty ``bytes``/``bytearray``
+    shared secret; both are keyword-only after ``data``. Wrong parameter
+    types raise ``TypeError``. An empty key, a bad HMAC tag, truncation,
+    trailing data, a bad magic, a version other than 2 (including a v1
+    envelope), an unknown scheme identifier, a mismatched length field or a
+    payload magic that does not match its scheme identifier raises
+    ``ValueError``; unlike :func:`auth_state_unwrap` this function takes no
+    ``expect`` or generation floor. The identity authenticates but does not
+    encrypt and does not defeat replay of the very state it names.
+    """
+    blob = _coerce_bytes(data, "data")
+    key_bytes = _validate_key(key)
+    body = _auth_state_authenticate(blob, key_bytes)
+    # The same v2 field/payload validation the unwrap path runs on an
+    # authenticated body: an identity is never returned for a well-tagged
+    # envelope that the unwrap path would reject.
+    _auth_state_parse(body, expect=None, min_generation=None)
+    return _auth_state_identity(body, key_bytes)
+
+
 def _auth_state_parse(
     body: bytes, *, expect: Any, min_generation: Any
 ) -> tuple[str, int, bytes]:
@@ -301,7 +377,12 @@ def _auth_state_parse(
 
 
 def auth_state_unwrap(
-    data: Any, *, key: Any, expect: Any = None, min_generation: Any = None
+    data: Any,
+    *,
+    key: Any,
+    expect: Any = None,
+    min_generation: Any = None,
+    expect_state_id: Any = None,
 ) -> tuple[str, int, bytes]:
     """Verify a v2 envelope and return ``(scheme, generation, payload)``.
 
@@ -314,36 +395,65 @@ def auth_state_unwrap(
     the envelope — persist it in trusted storage, or an attacker who can
     roll the checkpoint back and rewind the floor defeats the check.
 
-    Wrong parameter types raise ``TypeError`` (a non-bytes ``data``/``key``,
-    a non-string ``expect``, a non-integer or boolean ``min_generation``);
-    an empty key, an unknown ``expect``/floor value out of the uint64 range,
+    ``expect_state_id`` is ``None`` (the default) or exactly 32
+    ``bytes``/``bytearray`` previously returned by
+    :func:`auth_state_fingerprint` for the envelope the caller considers
+    current. When given, the identity of the authenticated body —
+    ``HMAC-SHA-256(key, b"pqattest/auth-state-id/v1" + body)`` — is compared
+    with :func:`hmac.compare_digest` only after the tag and every other
+    condition (v2 fields, payload magic, ``expect`` and the generation
+    floor) have passed, and a mismatch raises ``ValueError``. This is what
+    separates the expected state from a different, valid, same-generation
+    payload; like the floor, the saved identity must live in trusted
+    storage. Persist the fingerprint together with the accepted generation
+    (and use that generation plus one as the next floor) to reject a
+    replaced older state on the next unwrap.
+
+    Wrong parameter types raise ``TypeError`` (a non-bytes ``data``/``key``
+    /``expect_state_id``, a non-string ``expect``, a non-integer or boolean
+    ``min_generation``); an empty key, an ``expect_state_id`` whose length
+    is not 32, an unknown ``expect``/floor value out of the uint64 range,
     a bad envelope magic, a version other than 2 (including a v1 envelope),
     an unknown scheme identifier, a mismatched length field, truncation,
     trailing data, a bad HMAC tag, a payload magic that does not match its
-    scheme identifier, an identifier different from ``expect`` or a
-    generation below ``min_generation`` raises ``ValueError``.
+    scheme identifier, an identifier different from ``expect``, a
+    generation below ``min_generation`` or a state identity different from
+    ``expect_state_id`` raises ``ValueError``.
 
     Once at least the 32 tag bytes are present, the last 32 bytes are taken
     as the tag and everything before them as the authenticated body; the tag
     is verified with :func:`hmac.compare_digest` before any field is
     trusted. Only afterwards are the v2 fields and the payload parsed, the
-    payload magic and the scheme (including ``expect``) checked, and the
-    generation floor applied last. The returned checkpoint is the exact
-    payload passed to :func:`auth_state_wrap` (as ``bytes``), ready for the
-    matching ``from_checkpoint``. The envelope authenticates but does not
-    encrypt; a same-generation replay or a rollback accompanied by a floor
-    rewind remains undetectable.
+    payload magic and the scheme (including ``expect``) checked, the
+    generation floor applied and finally the expected state identity
+    compared. The returned checkpoint is the exact payload passed to
+    :func:`auth_state_wrap` (as ``bytes``), ready for the matching
+    ``from_checkpoint``. With ``expect_state_id`` omitted the return value
+    and exception semantics are unchanged. The envelope authenticates but
+    does not encrypt; a replay of the exact named state, or a rollback
+    accompanied by a floor-and-identity rewind, remains undetectable.
     """
     blob = _coerce_bytes(data, "data")
     key_bytes = _validate_key(key)
     _validate_expect(expect)
     if min_generation is not None:
         _validate_generation(min_generation, "min_generation")
+    expected_state_id = _validate_state_id(expect_state_id)
 
     # Authenticate first: no field (including the generation) is trusted
     # until this tag over the whole body checks out.
     body = _auth_state_authenticate(blob, key_bytes)
-    return _auth_state_parse(body, expect=expect, min_generation=min_generation)
+    scheme, generation, payload = _auth_state_parse(
+        body, expect=expect, min_generation=min_generation
+    )
+    if expected_state_id is not None:
+        # Last gate, constant-time over the authenticated body: an envelope
+        # that passes the tag and floor but names a different same-generation
+        # state is rejected before anything is returned to the caller.
+        actual_state_id = _auth_state_identity(body, key_bytes)
+        if not hmac.compare_digest(actual_state_id, expected_state_id):
+            raise ValueError("state identity does not match expect_state_id")
+    return scheme, generation, payload
 
 
 def _validate_claim(claim: Any) -> Callable[..., Any]:

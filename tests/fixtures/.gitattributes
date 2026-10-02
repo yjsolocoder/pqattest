@@ -1,0 +1,2 @@
+# Golden byte samples must stay byte-for-byte identical on every checkout.
+*.bin binary

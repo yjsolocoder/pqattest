@@ -5982,6 +5982,179 @@ def recommend_merkle_cardinality_deployment(
     return min(frontier, key=ranking)
 
 
+def _cardinality_weight_metrics(
+    mode_cost: MerkleModeCost,
+) -> tuple[int, int, int, int, int]:
+    """Return the five ranked costs of one cardinality frontier member.
+
+    The order matches every weighted entry's weights: aggregate transport
+    bytes, any single group's transport peak, total verifier SHA-256 hashes,
+    carried multi-proof nodes and per-signature verifier chain steps.
+    """
+    return (
+        mode_cost.plan.total,
+        max(mode_cost.plan.sizes),
+        mode_cost.cost.total,
+        mode_cost.nodes,
+        profile(
+            "merkle",
+            w=mode_cost.plan.config.w,
+            height=mode_cost.plan.config.height,
+        ).steps,
+    )
+
+
+def _cardinality_ranking_tail(
+    mode_cost: MerkleModeCost,
+) -> tuple[int, int, int, int, tuple[str, ...]]:
+    """Ascending tie-break shared by every weighted cardinality ranking."""
+    config = mode_cost.plan.config
+    return (
+        config.checkpoint_bytes,
+        config.leaf_count,
+        config.w,
+        config.height,
+        mode_cost.plan.modes,
+    )
+
+
+def _cardinality_normalised_costs(
+    frontier: tuple[MerkleModeCost, ...],
+) -> tuple[tuple[Fraction, ...], ...]:
+    """Min-max-normalise the five costs over the whole frontier.
+
+    Returns one five-tuple of exact :class:`~fractions.Fraction` costs per
+    frontier member, in frontier order; a dimension whose frontier-wide span
+    is zero scores ``0`` for every member.
+    """
+    metric_rows = tuple(_cardinality_weight_metrics(mode_cost) for mode_cost in frontier)
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+    return tuple(
+        tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        for row in metric_rows
+    )
+
+
+def _cardinality_score_rows(
+    normalised_rows: tuple[tuple[Fraction, ...], ...],
+    weight_sets: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[Fraction, ...], ...]:
+    """Score every frontier member under every weight set.
+
+    Returns one tuple per frontier member; each inner tuple holds that
+    member's weighted-average score under each weight set in input order —
+    the five normalised costs times the weights, summed and divided by the
+    weight set's total. Repeated weight sets stay at separate positions and
+    are scored separately.
+    """
+    weight_totals = tuple(sum(weights) for weights in weight_sets)
+    return tuple(
+        tuple(
+            sum(
+                (weight * cost for weight, cost in zip(weights, costs)),
+                Fraction(0),
+            )
+            / weight_total
+            for weights, weight_total in zip(weight_sets, weight_totals)
+        )
+        for costs in normalised_rows
+    )
+
+
+def _cardinality_regret_rows(
+    score_rows: tuple[tuple[Fraction, ...], ...],
+    scenario_count: int,
+) -> tuple[tuple[Fraction, ...], ...]:
+    """Subtract each scenario's best frontier score from every row's score."""
+    scenario_best = tuple(
+        min(row[index] for row in score_rows) for index in range(scenario_count)
+    )
+    return tuple(
+        tuple(score - best for score, best in zip(scores, scenario_best))
+        for scores in score_rows
+    )
+
+
+def _cardinality_weighted_entries(
+    frontier: tuple[MerkleModeCost, ...],
+    weight_sets: tuple[tuple[int, ...], ...],
+) -> list[
+    tuple[
+        MerkleModeCost,
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+    ]
+]:
+    """Build, in frontier order, ``(member, costs, scores, regrets)`` rows.
+
+    One normalisation pass over the frontier feeds both the single-weight
+    and the multi-scenario rankings, so the cost arithmetic and scoring
+    rules live nowhere else; a single weight set simply yields one score
+    and one zero regret per row.
+    """
+    normalised_rows = _cardinality_normalised_costs(frontier)
+    score_rows = _cardinality_score_rows(normalised_rows, weight_sets)
+    regret_rows = _cardinality_regret_rows(score_rows, len(weight_sets))
+    return [
+        (mode_cost, costs, scores, regrets)
+        for mode_cost, costs, scores, regrets in zip(
+            frontier, normalised_rows, score_rows, regret_rows
+        )
+    ]
+
+
+def _cardinality_single_ranking_key(
+    entry: tuple[
+        MerkleModeCost,
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+    ],
+) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
+    """Single-weight ranking key: the one weighted-average score, then tail.
+
+    Dividing by the weight total scales every member's score by the same
+    positive constant, so the ordering (including exact ties) is identical
+    to ranking by the undivided weighted sum.
+    """
+    mode_cost, _costs, scores, _regrets = entry
+    return (scores[0], *_cardinality_ranking_tail(mode_cost))
+
+
+def _cardinality_scenario_ranking_key(
+    entry: tuple[
+        MerkleModeCost,
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+    ],
+) -> tuple[
+    Fraction,
+    Fraction,
+    tuple[Fraction, ...],
+    int,
+    int,
+    int,
+    int,
+    tuple[str, ...],
+]:
+    """Multi-scenario ranking key: worst regret, regret sum, scores, tail."""
+    mode_cost, _costs, scores, regrets = entry
+    return (
+        max(regrets),
+        sum(regrets, Fraction(0)),
+        scores,
+        *_cardinality_ranking_tail(mode_cost),
+    )
+
+
 def _validate_cardinality_weights(weights: Any) -> tuple[int, ...]:
     """Validate the five-tuple of non-negative cost weights."""
     if not isinstance(weights, tuple):
@@ -6028,7 +6201,10 @@ def recommend_merkle_cardinality_weighted(
     count, ``w``, ``height`` and the ``modes`` tuple in lexicographic
     order, exactly like every other cardinality ranking. The candidate
     enumeration and Pareto filtering are not duplicated: the frontier is
-    the only source of candidates and is called exactly once.
+    the only source of candidates and is called exactly once, and the
+    scoring rules are shared with
+    :func:`explain_merkle_cardinality_weighted`, whose unique selected row
+    is therefore this function's result.
 
     ``capacity``, ``group_sizes`` and the six-tuple ``budgets`` follow
     :func:`merkle_cardinality_frontier`'s types, ranges, inclusive-budget,
@@ -6040,45 +6216,9 @@ def recommend_merkle_cardinality_weighted(
     randomness, generates no keys and changes no state.
     """
     frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
-    _validate_cardinality_weights(weights)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-
-    def ranking(
-        mode_cost: MerkleModeCost,
-    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
-        score = Fraction(0)
-        for value, weight, (low, high) in zip(metrics(mode_cost), weights, spans):
-            if high > low:
-                score += weight * Fraction(value - low, high - low)
-        config = mode_cost.plan.config
-        return (
-            score,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    return min(frontier, key=ranking)
+    validated_weights = _validate_cardinality_weights(weights)
+    entries = _cardinality_weighted_entries(frontier, (validated_weights,))
+    return min(entries, key=_cardinality_single_ranking_key)[0]
 
 
 def _validate_weight_scenarios(scenarios: Any) -> tuple[tuple[int, ...], ...]:
@@ -6483,80 +6623,8 @@ def recommend_merkle_cardinality_weighted_scenarios(
     """
     frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
     validated_scenarios = _validate_weight_scenarios(scenarios)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-
-    def normalised(row: tuple[int, ...]) -> tuple[Fraction, ...]:
-        return tuple(
-            Fraction(value - low, high - low) if high > low else Fraction(0)
-            for value, (low, high) in zip(row, spans)
-        )
-
-    normalised_rows = tuple(normalised(row) for row in metric_rows)
-    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
-
-    def scenario_scores(row: tuple[Fraction, ...]) -> tuple[Fraction, ...]:
-        return tuple(
-            sum(
-                (weight * component for weight, component in zip(weights, row)),
-                Fraction(0),
-            )
-            / weight_total
-            for weights, weight_total in zip(validated_scenarios, scenario_totals)
-        )
-
-    score_rows = tuple(scenario_scores(row) for row in normalised_rows)
-    scenario_best = tuple(
-        min(row[scenario_index] for row in score_rows)
-        for scenario_index in range(len(validated_scenarios))
-    )
-
-    def ranking(
-        entry: tuple[MerkleModeCost, tuple[Fraction, ...]],
-    ) -> tuple[
-        Fraction,
-        Fraction,
-        tuple[Fraction, ...],
-        int,
-        int,
-        int,
-        int,
-        tuple[str, ...],
-    ]:
-        mode_cost, scores = entry
-        regrets = tuple(
-            score - best for score, best in zip(scores, scenario_best)
-        )
-        config = mode_cost.plan.config
-        return (
-            max(regrets),
-            sum(regrets, Fraction(0)),
-            scores,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    return min(zip(frontier, score_rows), key=ranking)[0]
+    entries = _cardinality_weighted_entries(frontier, validated_scenarios)
+    return min(entries, key=_cardinality_scenario_ranking_key)[0]
 
 
 @dataclass(frozen=True)
@@ -6647,57 +6715,13 @@ def explain_merkle_cardinality_weighted(
     """
     frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
     validated_weights = _validate_verify_mode_weights(weights)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-    weight_total = sum(validated_weights)
-
-    entries = []
-    for mode_cost, row in zip(frontier, metric_rows):
-        costs = tuple(
-            Fraction(value - low, high - low) if high > low else Fraction(0)
-            for value, (low, high) in zip(row, spans)
-        )
-        score = sum(
-            (weight * cost for weight, cost in zip(validated_weights, costs)),
-            Fraction(0),
-        ) / weight_total
-        entries.append((mode_cost, costs, score))
-
-    def ranking(
-        entry: tuple[MerkleModeCost, tuple[Fraction, ...], Fraction],
-    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
-        mode_cost, _costs, score = entry
-        config = mode_cost.plan.config
-        return (
-            score,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    chosen = min(entries, key=ranking)[0]
+    entries = _cardinality_weighted_entries(frontier, (validated_weights,))
+    chosen = min(entries, key=_cardinality_single_ranking_key)[0]
     return tuple(
-        MerkleCardinalityScore(mode_cost, *costs, score, mode_cost is chosen)
-        for mode_cost, costs, score in entries
+        MerkleCardinalityScore(
+            mode_cost, *costs, scores[0], mode_cost is chosen
+        )
+        for mode_cost, costs, scores, _regrets in entries
     )
 
 
@@ -6797,85 +6821,8 @@ def explain_merkle_cardinality_weighted_scenarios(
     """
     frontier = merkle_cardinality_frontier(capacity, group_sizes, budgets)
     validated_scenarios = _validate_weight_scenarios(scenarios)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
-
-    entries = []
-    for mode_cost, row in zip(frontier, metric_rows):
-        costs = tuple(
-            Fraction(value - low, high - low) if high > low else Fraction(0)
-            for value, (low, high) in zip(row, spans)
-        )
-        scores = tuple(
-            sum(
-                (weight * component for weight, component in zip(weights, costs)),
-                Fraction(0),
-            )
-            / weight_total
-            for weights, weight_total in zip(validated_scenarios, scenario_totals)
-        )
-        entries.append((mode_cost, costs, scores))
-
-    scenario_best = tuple(
-        min(entry[2][scenario_index] for entry in entries)
-        for scenario_index in range(len(validated_scenarios))
-    )
-    entries = [
-        (mode_cost, costs, scores, tuple(
-            score - best for score, best in zip(scores, scenario_best)
-        ))
-        for mode_cost, costs, scores in entries
-    ]
-
-    def ranking(
-        entry: tuple[
-            MerkleModeCost,
-            tuple[Fraction, ...],
-            tuple[Fraction, ...],
-            tuple[Fraction, ...],
-        ],
-    ) -> tuple[
-        Fraction,
-        Fraction,
-        tuple[Fraction, ...],
-        int,
-        int,
-        int,
-        int,
-        tuple[str, ...],
-    ]:
-        mode_cost, _costs, scores, regrets = entry
-        config = mode_cost.plan.config
-        return (
-            max(regrets),
-            sum(regrets, Fraction(0)),
-            scores,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    chosen = min(entries, key=ranking)[0]
+    entries = _cardinality_weighted_entries(frontier, validated_scenarios)
+    chosen = min(entries, key=_cardinality_scenario_ranking_key)[0]
     return tuple(
         MerkleCardinalityScenarioScore(
             mode_cost, *costs, scores, regrets, mode_cost is chosen

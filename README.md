@@ -389,10 +389,11 @@ restored = MerkleSigner.from_checkpoint(checkpoint)
 v1 封装没有任何新旧概念；v2 封装在共享同一魔数、同一套 v1 参数约束与认证方式之外，额外绑定一个 64 位无符号**代次（generation）**，解封时可按调用方提供的下限拒绝旧封装：
 
 - `auth_state_wrap(checkpoint, *, scheme, key, generation)` — 参数与 `auth_wrap` 完全一致（`checkpoint`/`key` 为非空 `bytes`/`bytearray`，`scheme` 仅取 `"lamport"`/`"wots"`/`"merkle"`/`"lattice"`，封装前按载荷魔数核对方案），额外的关键字参数 `generation` 必须是 `0..2**64-1` 的**非布尔整数**；类型错抛 `TypeError`，越界抛 `ValueError`。返回确定编码的 `bytes`
-- `auth_state_unwrap(data, *, key, expect=None, min_generation=None)` — 验证 v2 封装并返回 `(scheme, generation, payload)`：`generation` 为封装中的非负 `int`，`payload` 为传入 `auth_state_wrap` 的原检查点字节（`bytes`，可直接交给对应的 `from_checkpoint`）。`expect` 语义与 `auth_unwrap` 相同；`min_generation` 为 `None`（缺省，不检查）或 `0..2**64-1` 的非布尔整数，低于下限的代次一律拒绝
-- 参数类型错误抛 `TypeError`（非字节的 `data`/`key`、非字符串 `expect`、非整数或布尔的 `generation`/`min_generation`）；空 `key`、未知 `expect`、代次参数超出 uint64、坏封装魔数、版本不为 2（v1 封装也算版本不符）、未知方案标识、长度字段不符、截断、尾随数据、载荷魔数与标识不符、与 `expect` 不符、HMAC 标签错误或代次低于 `min_generation`，一律抛 `ValueError`
+- `auth_state_unwrap(data, *, key, expect=None, min_generation=None, expect_state_id=None)` — 验证 v2 封装并返回 `(scheme, generation, payload)`：`generation` 为封装中的非负 `int`，`payload` 为传入 `auth_state_wrap` 的原检查点字节（`bytes`，可直接交给对应的 `from_checkpoint`）。`expect` 语义与 `auth_unwrap` 相同；`min_generation` 为 `None`（缺省，不检查）或 `0..2**64-1` 的非布尔整数，低于下限的代次一律拒绝；`expect_state_id` 为 `None`（缺省，身份校验关闭，返回值与异常语义与旧版完全一致）或恰好 32 字节的 `bytes`/`bytearray`（通常取自此前接受状态的 `auth_state_fingerprint`），在标签与既有条件全部通过后以 `hmac.compare_digest` 常量时间比对，身份一致才返回三元组——同一代次内载荷、方案或长度不同的替换封装由此被拒绝
+- `auth_state_fingerprint(data, *, key)` — 返回 v2 信封的 32 字节**状态身份**：先按 `auth_state_unwrap` 的既有规则用 `hmac.compare_digest` 验证现有 HMAC 标签并完整解析 v2 字段（魔数、版本 2、方案标识、长度、载荷魔数均须合法），再计算 `HMAC-SHA-256(key, b"pqattest/auth-state-id/v1" + 标签前的 v2 body)`。同一信封与同一 key 重复调用返回逐字节相同的 32 `bytes`；payload、generation、scheme 标识或 key 任一不同，身份即不同。供调用方在可信存储中保存身份，连同 `min_generation` 高水位一起原子推进，再作为 `expect_state_id` 传回
+- 参数类型错误抛 `TypeError`（非字节的 `data`/`key`/`expect_state_id`、非字符串 `expect`、非整数或布尔的 `generation`/`min_generation`）；空 `key`、未知 `expect`、代次参数超出 uint64、`expect_state_id` 长度不是 32、坏封装魔数、版本不为 2（v1 封装也算版本不符）、未知方案标识、长度字段不符、截断、尾随数据、载荷魔数与标识不符、与 `expect` 不符、HMAC 标签错误、代次低于 `min_generation` 或状态身份与 `expect_state_id` 不符，一律抛 `ValueError`，绝不返回半可信状态
 
-v2 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（2）；1 字节方案标识（lamport=1、wots=2、merkle=3、lattice=4）；**8 字节大端 `generation`**；4 字节大端载荷长度；原样嵌入的载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `22 + 载荷长度 + 32` 字节。编码确定、同输入同字节。解封**先用 `hmac.compare_digest` 验证标签**，此后才信任任何字段；标签通过后再核对载荷魔数与方案（含 `expect`），**最后**应用代次下限。v1 与 v2 仅以版本字节区分：`auth_unwrap` 只接受版本 1、`auth_state_unwrap` 只接受版本 2，互不解析对方的封装；旧的 v1 封装与三类检查点的字节格式保持逐字节不变。
+v2 封装格式依次为：8 字节魔数 `b"PQAAUTH\0"`；1 字节版本（2）；1 字节方案标识（lamport=1、wots=2、merkle=3、lattice=4）；**8 字节大端 `generation`**；4 字节大端载荷长度；原样嵌入的载荷；末尾 32 字节 `HMAC-SHA-256(key, 此前全部字节)`。总长度为 `22 + 载荷长度 + 32` 字节。编码确定、同输入同字节。解封**先用 `hmac.compare_digest` 验证标签**，此后才信任任何字段；标签通过后再核对载荷魔数与方案（含 `expect`），**然后**应用代次下限，最后在提供 `expect_state_id` 时以 `hmac.compare_digest` 常量时间比对 `HMAC-SHA-256(key, b"pqattest/auth-state-id/v1" + 标签前的 v2 body)` 身份。v1 与 v2 仅以版本字节区分：`auth_unwrap` 只接受版本 1、`auth_state_unwrap` 只接受版本 2，互不解析对方的封装；旧的 v1 封装与三类检查点的字节格式保持逐字节不变。
 
 ```python
 from pqattest import MerkleSigner, auth_state_wrap, auth_state_unwrap
@@ -414,9 +415,32 @@ restored, generation = MerkleSigner.from_auth_state(
 
 auth_state_unwrap(blob, key=b"shared-secret", min_generation=8)  # ValueError：回滚
 MerkleSigner.from_auth_state(blob, key=b"shared-secret", min_generation=8)  # 同上
+
+# 状态身份：保存高水位时一并保存，可区分同一代次内被替换过的旧状态
+state_id = auth_state_fingerprint(blob, key=b"shared-secret")
+assert len(state_id) == 32
+assert auth_state_fingerprint(blob, key=b"shared-secret") == state_id
+scheme, generation, checkpoint = auth_state_unwrap(
+    blob,
+    key=b"shared-secret",
+    min_generation=7,
+    expect_state_id=state_id,
+)
+same_generation_other_payload = auth_state_wrap(
+    MerkleSigner(height=4, w=4).checkpoint(),
+    scheme="merkle",
+    key=b"shared-secret",
+    generation=7,
+)
+auth_state_unwrap(  # ValueError：同一代次 7 但身份不符
+    same_generation_other_payload,
+    key=b"shared-secret",
+    min_generation=7,
+    expect_state_id=state_id,
+)
 ```
 
-**代次安全边界**：下限 `min_generation` **不由封装携带**，必须保存在调用方的外部可信存储中（随每次接受的新一代次原子推进），并与封装/检查点分开保管。代次只对「检查点回滚、但可信下限没有一并回退」的情形有效：攻击者若能把检查点和可信下限**一起**回滚，或者在**同一代次内**重放一份合法封装，HMAC 依然有效、无从检测。与 v1 相同，v2 封装**不加密**，载荷是明文，也不防复制；须把封装连同明文检查点一起当秘密保管。
+**代次安全边界**：下限 `min_generation` **不由封装携带**，必须保存在调用方的外部可信存储中（随每次接受的新一代次原子推进），并与封装/检查点分开保管。代次只对「检查点回滚、但可信下限没有一并回退」的情形有效：攻击者若能把检查点和可信下限**一起**回滚，或者在**同一代次内**重放一份合法封装，HMAC 依然有效、无从检测——后者可再用 `auth_state_fingerprint` 与 `expect_state_id` 补上：把已接受封装的 32 字节身份与高水位存在同一处可信存储，解封时要求身份一致，同一代次内载荷、方案或长度不同的替换封装即被拒绝（身份以同一把 key 对标签前的 v2 body 做域分离 HMAC 得到，故 payload/generation/scheme/key 任一不同身份都不同）。但身份校验同样不防「被接受封装原样重放」，也不防可信存储里的身份与下限被一并回退。与 v1 相同，v2 封装**不加密**，载荷是明文，也不防复制；须把封装连同明文检查点一起当秘密保管。省略 `expect_state_id` 的旧调用方行为保持逐字不变。
 
 ### 带外部单调认领的认证恢复
 

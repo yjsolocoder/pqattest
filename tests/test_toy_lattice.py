@@ -397,6 +397,258 @@ class VerifyTest(unittest.TestCase):
                     toy_lattice_verify(b"hello", signature, bad)
 
 
+class ContextSignTest(unittest.TestCase):
+    def _key(self):
+        return ToyLatticePrivateKey(_encode_e((1, 2, 3, 4, 5, 6, 7, 8)))
+
+    def test_empty_contexts_match_legacy_signature_byte_for_byte(self):
+        private_key = self._key()
+        legacy = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        for empty in (None, b"", bytearray(), ""):
+            with self.subTest(empty=repr(empty)):
+                signed = toy_lattice_sign(
+                    b"hello",
+                    private_key,
+                    token_bytes=fixed_tokens(b"r-r-r-r-"),
+                    context=empty,
+                )
+                self.assertEqual(signed, legacy)
+                self.assertEqual(signed.to_bytes(), legacy.to_bytes())
+
+    def test_context_must_be_keyword(self):
+        private_key = self._key()
+        with self.assertRaises(TypeError):
+            toy_lattice_sign(
+                b"hello",
+                private_key,
+                fixed_tokens(b"r-r-r-r-"),
+                b"app/1",
+            )
+
+    def test_context_types_equivalent(self):
+        private_key = self._key()
+        text = "app/世界"
+        variants = (text, text.encode("utf-8"), bytearray(text.encode("utf-8")))
+        signatures = [
+            toy_lattice_sign(
+                b"hello",
+                private_key,
+                token_bytes=fixed_tokens(b"r-r-r-r-"),
+                context=context,
+            )
+            for context in variants
+        ]
+        for other in signatures[1:]:
+            self.assertEqual(signatures[0], other)
+
+    def test_non_empty_context_participates_in_binding(self):
+        private_key = self._key()
+        unbound = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        bound = toy_lattice_sign(
+            b"hello",
+            private_key,
+            token_bytes=fixed_tokens(b"r-r-r-r-"),
+            context=b"app/1",
+        )
+        self.assertNotEqual(bound, unbound)
+        # The tag, not just the random vector, changes.
+        self.assertNotEqual(bound.tag, unbound.tag)
+
+    def test_bound_signature_is_deterministic(self):
+        private_key = self._key()
+        first = toy_lattice_sign(
+            b"hello",
+            private_key,
+            token_bytes=fixed_tokens(b"r-r-r-r-"),
+            context=b"app/1",
+        )
+        second = toy_lattice_sign(
+            b"hello",
+            private_key,
+            token_bytes=fixed_tokens(b"r-r-r-r-"),
+            context="app/1",
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first.to_bytes(), second.to_bytes())
+
+    def test_bound_known_vectors(self):
+        s = _encode_e((10, 20, 30, 40, 50, 60, 70, 80))
+        private_key = ToyLatticePrivateKey(s)
+        signature = toy_lattice_sign(
+            b"hello",
+            private_key,
+            token_bytes=fixed_tokens(b"r-r-r-r-"),
+            context=b"app/1",
+        )
+        message = b"hello"
+        context = b"app/1"
+        bound = (
+            b"pqattest/toy-lattice/context/v1"
+            + signature.u
+            + len(context).to_bytes(4, "big")
+            + context
+            + len(message).to_bytes(4, "big")
+            + message
+        )
+        chain = hashlib.sha256(b"S" + bound).digest()
+        expected_tag = hmac.new(chain, b"S" + s, hashlib.sha256).digest()
+        self.assertEqual(signature.tag, expected_tag)
+
+    def test_bad_context_type_raises_type_error(self):
+        private_key = self._key()
+        for bad in (123, 3.5, [b"x"], (b"x",), object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    toy_lattice_sign(
+                        b"hello",
+                        private_key,
+                        token_bytes=fixed_tokens(b"r-r-r-r-"),
+                        context=bad,
+                    )
+
+
+class ContextVerifyTest(unittest.TestCase):
+    def _pair(self):
+        private_key, public_key = toy_lattice_keygen(
+            token_bytes=fixed_tokens(b"abcdefgh")
+        )
+        return private_key, public_key
+
+    def _bound(self, private_key, message=b"hello", context=b"app/1"):
+        return toy_lattice_sign(
+            message,
+            private_key,
+            token_bytes=fixed_tokens(b"r-r-r-r-"),
+            context=context,
+        )
+
+    def test_matching_context_verifies_for_all_context_types(self):
+        private_key, public_key = self._pair()
+        text = "app/世界"
+        signature = self._bound(private_key, context=text.encode("utf-8"))
+        self.assertTrue(
+            toy_lattice_verify(b"hello", signature, public_key, context=text)
+        )
+        self.assertTrue(
+            toy_lattice_verify(
+                b"hello", signature, public_key, context=text.encode("utf-8")
+            )
+        )
+        self.assertTrue(
+            toy_lattice_verify(
+                b"hello", signature, public_key, context=bytearray(text.encode("utf-8"))
+            )
+        )
+
+    def test_empty_context_verifies_legacy_signatures(self):
+        private_key, public_key = self._pair()
+        legacy = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        for empty in (None, b"", bytearray(), ""):
+            with self.subTest(empty=repr(empty)):
+                self.assertTrue(
+                    toy_lattice_verify(
+                        b"hello", legacy, public_key, context=empty
+                    )
+                )
+
+    def test_wrong_context_returns_false(self):
+        private_key, public_key = self._pair()
+        signature = self._bound(private_key)
+        self.assertFalse(
+            toy_lattice_verify(b"hello", signature, public_key, context=b"app/2")
+        )
+        # Legacy unbound verification must not accept a context-bound tag.
+        self.assertFalse(toy_lattice_verify(b"hello", signature, public_key))
+        self.assertFalse(
+            toy_lattice_verify(b"hello", signature, public_key, context=b"")
+        )
+
+    def test_legacy_signature_rejected_under_non_empty_context(self):
+        private_key, public_key = self._pair()
+        legacy = toy_lattice_sign(
+            b"hello", private_key, token_bytes=fixed_tokens(b"r-r-r-r-")
+        )
+        self.assertFalse(
+            toy_lattice_verify(b"hello", legacy, public_key, context=b"app/1")
+        )
+
+    def test_context_does_not_authorise_other_fields(self):
+        private_key, public_key = self._pair()
+        _, other_public = toy_lattice_keygen(
+            token_bytes=fixed_tokens(bytes(range(1, 9)))
+        )
+        signature = self._bound(private_key)
+        # Same context, different message.
+        self.assertFalse(
+            toy_lattice_verify(b"hellp", signature, public_key, context=b"app/1")
+        )
+        # Same context, different public key.
+        self.assertFalse(
+            toy_lattice_verify(
+                b"hello", signature, other_public, context=b"app/1"
+            )
+        )
+        # Same context, tampered signature fields.
+        wrong_u = ToyLatticeSignature(_encode_e(b"XXXXXXXX"), signature.tag)
+        self.assertFalse(
+            toy_lattice_verify(b"hello", wrong_u, public_key, context=b"app/1")
+        )
+        wrong_tag = ToyLatticeSignature(signature.u, b"\x00" * 32)
+        self.assertFalse(
+            toy_lattice_verify(b"hello", wrong_tag, public_key, context=b"app/1")
+        )
+
+    def test_context_must_be_keyword(self):
+        _, public_key = self._pair()
+        signature = ToyLatticeSignature(b"\x00" * 16, b"\x00" * 32)
+        with self.assertRaises(TypeError):
+            toy_lattice_verify(b"hello", signature, public_key, b"app/1")
+
+    def test_bad_context_type_raises_type_error(self):
+        _, public_key = self._pair()
+        signature = ToyLatticeSignature(b"\x00" * 16, b"\x00" * 32)
+        for bad in (123, 3.5, [b"x"], object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    toy_lattice_verify(
+                        b"hello", signature, public_key, context=bad
+                    )
+
+    def test_bad_message_type_with_good_context_returns_false(self):
+        _, public_key = self._pair()
+        signature = ToyLatticeSignature(b"\x00" * 16, b"\x00" * 32)
+        for bad in (None, 123, [1, 2, 3], object()):
+            with self.subTest(bad=bad):
+                self.assertFalse(
+                    toy_lattice_verify(
+                        bad, signature, public_key, context=b"app/1"
+                    )
+                )
+
+    def test_bad_signature_with_good_context_returns_false(self):
+        private_key, public_key = self._pair()
+        signature = self._bound(private_key)
+        for bad in (
+            None,
+            signature.to_bytes(),
+            42,
+            ToyLatticeCiphertext(signature.u, signature.tag),
+            object(),
+        ):
+            with self.subTest(bad=bad):
+                self.assertFalse(
+                    toy_lattice_verify(
+                        b"hello", bad, public_key, context=b"app/1"
+                    )
+                )
+
+
 class SignatureSerializationTest(unittest.TestCase):
     def _signature(self):
         private_key, _ = toy_lattice_keygen(token_bytes=fixed_tokens(b"abcdefgh"))

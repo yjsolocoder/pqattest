@@ -27,10 +27,18 @@ def make_keypair(seed=b"abcdefgh"):
     return toy_lattice_keygen(token_bytes=fixed_tokens(seed))
 
 
-def make_proof(seed=b"abcdefgh", randomness=b"r-r-r-r-", message=b"position claim"):
+def make_proof(
+    seed=b"abcdefgh",
+    randomness=b"r-r-r-r-",
+    message=b"position claim",
+    context=None,
+):
     private_key, public_key = make_keypair(seed)
     signature = toy_lattice_sign(
-        message, private_key, token_bytes=fixed_tokens(randomness)
+        message,
+        private_key,
+        token_bytes=fixed_tokens(randomness),
+        context=context,
     )
     return public_key, ToyLatticeProof(public_key=public_key, signature=signature)
 
@@ -445,6 +453,195 @@ class ToyLatticeProofVerifyBoundTest(unittest.TestCase):
         self.assertTrue(proof.verify(b"m"))
         self.assertFalse(proof.verify(b"other"))
         self.assertEqual(sorted(vars(proof).keys()), ["public_key", "signature"])
+
+
+class ToyLatticeProofContextTest(unittest.TestCase):
+    CONTEXT = b"deployment/42"
+
+    def test_bound_signature_verifies_only_under_context(self):
+        _, proof = make_proof(context=self.CONTEXT)
+        self.assertTrue(proof.verify(b"position claim", context=self.CONTEXT))
+        self.assertTrue(
+            proof.verify(b"position claim", context=self.CONTEXT.decode("ascii"))
+        )
+        self.assertTrue(
+            proof.verify(
+                b"position claim", context=bytearray(self.CONTEXT)
+            )
+        )
+        self.assertFalse(proof.verify(b"position claim", context=b"deployment/7"))
+        # A context-bound signature must not verify as a legacy one.
+        self.assertFalse(proof.verify(b"position claim"))
+        self.assertFalse(proof.verify(b"position claim", context=None))
+        self.assertFalse(proof.verify(b"position claim", context=b""))
+
+    def test_legacy_proof_verifies_without_and_empty_context_only(self):
+        _, proof = make_proof()
+        for empty in (None, b"", bytearray(), ""):
+            with self.subTest(empty=repr(empty)):
+                self.assertTrue(proof.verify(b"position claim", context=empty))
+        self.assertFalse(proof.verify(b"position claim", context=self.CONTEXT))
+
+    def test_context_does_not_authorise_other_fields(self):
+        public_key, proof = make_proof(context=self.CONTEXT)
+        self.assertFalse(proof.verify(b"other claim", context=self.CONTEXT))
+        _, other_public = make_keypair(seed=bytes(range(1, 9)))
+        mismatched = ToyLatticeProof(
+            public_key=other_public, signature=proof.signature
+        )
+        self.assertFalse(
+            mismatched.verify(b"position claim", context=self.CONTEXT)
+        )
+        forged_tag = ToyLatticeProof(
+            public_key=public_key,
+            signature=ToyLatticeSignature(proof.signature.u, b"\x00" * 32),
+        )
+        self.assertFalse(forged_tag.verify(b"position claim", context=self.CONTEXT))
+        forged_u = ToyLatticeProof(
+            public_key=public_key,
+            signature=ToyLatticeSignature(
+                _encode_e(b"XXXXXXXX"), proof.signature.tag
+            ),
+        )
+        self.assertFalse(forged_u.verify(b"position claim", context=self.CONTEXT))
+
+    def test_bad_context_type_raises_type_error(self):
+        _, proof = make_proof()
+        for bad in (123, 3.5, ["x"], object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    proof.verify(b"position claim", context=bad)
+
+    def test_bad_message_type_under_context_is_false(self):
+        _, proof = make_proof(context=self.CONTEXT)
+        for bad in (None, 42, 3.5, object(), ["x"]):
+            with self.subTest(bad=type(bad).__name__):
+                self.assertFalse(proof.verify(bad, context=self.CONTEXT))
+
+    def test_bypass_constructed_proof_under_context_is_false(self):
+        rogue = object.__new__(ToyLatticeProof)
+        self.assertFalse(rogue.verify(b"position claim", context=self.CONTEXT))
+
+    def test_context_must_be_keyword(self):
+        _, proof = make_proof(context=self.CONTEXT)
+        with self.assertRaises(TypeError):
+            proof.verify(b"position claim", self.CONTEXT)
+
+
+class ToyLatticeProofVerifyBoundContextTest(unittest.TestCase):
+    CONTEXT = b"deployment/42"
+
+    def test_bound_verifies_with_context(self):
+        public_key, proof = make_proof(context=self.CONTEXT)
+        self.assertTrue(
+            proof.verify_bound(
+                b"position claim",
+                public_key=public_key,
+                context=self.CONTEXT,
+            )
+        )
+        self.assertTrue(
+            proof.verify_bound(
+                b"position claim",
+                public_key=ToyLatticePublicKey(public_key.t),
+                context=self.CONTEXT.decode("ascii"),
+            )
+        )
+
+    def test_wrong_context_is_false_even_with_matching_key(self):
+        public_key, proof = make_proof(context=self.CONTEXT)
+        self.assertFalse(
+            proof.verify_bound(
+                b"position claim", public_key=public_key, context=b"other"
+            )
+        )
+        # Context-bound signatures must not verify as legacy bound ones.
+        self.assertFalse(
+            proof.verify_bound(b"position claim", public_key=public_key)
+        )
+        self.assertFalse(
+            proof.verify_bound(
+                b"position claim", public_key=public_key, context=None
+            )
+        )
+
+    def test_legacy_proof_rejects_non_empty_context_when_bound(self):
+        public_key, proof = make_proof()
+        self.assertTrue(proof.verify_bound(b"position claim", public_key=public_key))
+        self.assertFalse(
+            proof.verify_bound(
+                b"position claim", public_key=public_key, context=self.CONTEXT
+            )
+        )
+
+    def test_wrong_message_or_key_under_context_is_false(self):
+        public_key, proof = make_proof(context=self.CONTEXT)
+        self.assertFalse(
+            proof.verify_bound(b"other", public_key=public_key, context=self.CONTEXT)
+        )
+        _, foreign_key = make_keypair(seed=bytes(range(9, 17)))
+        self.assertFalse(
+            proof.verify_bound(
+                b"position claim",
+                public_key=foreign_key,
+                context=self.CONTEXT,
+            )
+        )
+
+    def test_bad_context_type_raises_type_error(self):
+        public_key, proof = make_proof()
+        for bad in (123, 3.5, ["x"], object()):
+            with self.subTest(bad=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    proof.verify_bound(
+                        b"position claim", public_key=public_key, context=bad
+                    )
+
+    def test_bad_public_key_type_raises_even_with_bad_context(self):
+        _, proof = make_proof()
+        with self.assertRaises(TypeError):
+            proof.verify_bound(
+                b"position claim", public_key="not-a-key", context=123
+            )
+
+    def test_bypass_constructed_proof_under_context_is_false(self):
+        public_key, proof = make_proof(context=self.CONTEXT)
+        rogue = object.__new__(ToyLatticeProof)
+        object.__setattr__(rogue, "public_key", public_key)
+        object.__setattr__(rogue, "signature", "not-a-signature")
+        self.assertFalse(
+            rogue.verify_bound(
+                b"position claim", public_key=public_key, context=self.CONTEXT
+            )
+        )
+
+    def test_context_must_be_keyword(self):
+        public_key, proof = make_proof(context=self.CONTEXT)
+        with self.assertRaises(TypeError):
+            proof.verify_bound(
+                b"position claim", public_key, self.CONTEXT
+            )
+
+    def test_serialisation_unchanged_and_context_still_verifies(self):
+        _, bound = make_proof(context=self.CONTEXT)
+        blob = bound.to_bytes()
+        # The proof format carries no context: the layout is still the v1
+        # header followed by the unchanged inner key and signature encodings.
+        self.assertEqual(blob[:8], b"PQALPF\0\0")
+        self.assertEqual(blob[8], 1)
+        self.assertEqual(len(blob), _PROOF_HEADER_BYTES + 25 + 61)
+        self.assertNotIn(self.CONTEXT, blob)
+        restored = ToyLatticeProof.from_bytes(blob)
+        self.assertEqual(restored, bound)
+        public_key = bound.public_key
+        self.assertTrue(
+            restored.verify_bound(
+                b"position claim",
+                public_key=public_key,
+                context=self.CONTEXT,
+            )
+        )
+        self.assertFalse(restored.verify_bound(b"position claim", public_key=public_key))
 
 
 if __name__ == "__main__":

@@ -277,6 +277,15 @@ multiproof_encode proof bytes over the batch, the envelope and generation
 g+1, again under the same single (g, g+1) claim.
 Both envelopes authenticate but do not encrypt and give no replay
 protection on their own.
+The standalone Lamport and W-OTS constructions, their one-time signers,
+the OtsPairProof pack and their atomic/auth-state signing entries also
+accept an optional keyword-only ``context``: when omitted (or given as an
+empty value) the message is hashed exactly as the unbound baseline and
+existing signatures, proofs, checkpoints and auth-state envelopes stay
+byte-for-byte identical and verifiable; when given, the same
+``bytes``/``bytearray``/``str`` (UTF-8 encoded) context must be supplied
+to both sides (and to both halves of an OtsPair) or verification fails,
+and the context is never written into any wire format or persisted state.
 """
 
 from __future__ import annotations
@@ -552,6 +561,7 @@ __all__ = [
 BITS = 256
 HASH_BYTES = 32
 _DOMAIN = b"pqattest/lamport/v1"
+_CONTEXT_DOMAIN = b"pqattest/lamport/context/v1"
 
 _PRIVATE_KEY_MAGIC = b"PQALPRV\0"
 _PUBLIC_KEY_MAGIC = b"PQALPUB\0"
@@ -645,6 +655,52 @@ def _as_bytes(message: Any) -> bytes:
     if isinstance(message, str):
         return message.encode("utf-8")
     raise TypeError("message must be bytes, bytearray or str")
+
+
+def _validate_context(context: Any) -> bytes:
+    """Normalise the optional signing context to canonical ``bytes``.
+
+    ``None`` and an empty ``bytes``/``bytearray``/``str`` both mean
+    "no context" and normalise to ``b""``. Any other type raises
+    ``TypeError``; a ``str`` is encoded as UTF-8.
+    """
+    if context is None:
+        return b""
+    if isinstance(context, (bytes, bytearray)):
+        return bytes(context)
+    if isinstance(context, str):
+        return context.encode("utf-8")
+    raise TypeError("context must be bytes, bytearray, str or None")
+
+
+def _context_message(context: bytes, message: Any) -> Any:
+    """Bind ``message`` to ``context`` for the Lamport digest bits.
+
+    ``context`` must already be normalised by :func:`_validate_context`.
+    The empty context passes ``message`` through untouched, so the
+    no-context path hashes exactly as the unbound baseline and existing
+    signatures stay byte-for-byte identical. With a non-empty context the
+    domain separator and both length-prefixed fields are hashed as one
+    unambiguous byte string, so the same message under two contexts (or the
+    same context for two messages) produces two incompatible signatures.
+    """
+    if not context:
+        return message
+    message_bytes = _as_bytes(message)
+    return (
+        _CONTEXT_DOMAIN
+        + len(context).to_bytes(4, "big")
+        + context
+        + len(message_bytes).to_bytes(4, "big")
+        + message_bytes
+    )
+
+
+def _bound_message_bits(
+    message: Any, *, bits: int, context: bytes = b""
+) -> tuple[int, ...]:
+    """Lamport digest bits of ``message`` bound to ``context``."""
+    return message_bits(_context_message(context, message), bits=bits)
 
 
 def message_digest(message: Any) -> bytes:
@@ -772,22 +828,56 @@ def public_key_from(private_key: PrivateKey) -> PublicKey:
     return PublicKey(tuple(_secret_digest(secret) for secret in private_key.secrets))
 
 
-def sign(message: Any, private_key: PrivateKey) -> tuple[bytes, ...]:
-    """Produce a one-time signature: reveal one secret per digest bit."""
+def sign(
+    message: Any, private_key: PrivateKey, *, context: Any = None
+) -> tuple[bytes, ...]:
+    """Produce a one-time signature: reveal one secret per digest bit.
+
+    ``context`` is keyword-only and optional: ``None`` (the default) and an
+    empty ``bytes``/``bytearray``/``str`` all mean "no context" and produce
+    a signature byte-for-byte identical to the legacy unbound signature,
+    while any other context (a ``str`` is encoded as UTF-8) is
+    length-prefix domain-separated and bound into the message digest, so the
+    signature verifies only when verifier and signer share both the message
+    and the context. A context of any other type raises ``TypeError``. The
+    wire format is unchanged — the context is not carried in the signature.
+    """
     if not isinstance(private_key, PrivateKey):
         raise TypeError("private_key must be a PrivateKey")
-    bits = message_bits(message, bits=private_key.bits)
+    context_bytes = _validate_context(context)
+    bits = _bound_message_bits(
+        message, bits=private_key.bits, context=context_bytes
+    )
     return tuple(private_key.secrets[2 * index + bit] for index, bit in enumerate(bits))
 
 
-def verify(message: Any, signature: Sequence[bytes], public_key: PublicKey) -> bool:
-    """Check a signature against the digest bits of ``message``."""
+def verify(
+    message: Any,
+    signature: Sequence[bytes],
+    public_key: PublicKey,
+    *,
+    context: Any = None,
+) -> bool:
+    """Check a signature against the digest bits of ``message``.
+
+    ``context`` is keyword-only and optional: ``None`` (the default) and an
+    empty value both mean "no context" and accept only legacy unbound
+    signatures, while a non-empty ``bytes``/``bytearray``/``str`` (``str``
+    encoded as UTF-8) must be the very context the message was signed under;
+    a signature made under one context returns ``False`` under another, and
+    an unbound signature fails whenever a non-empty context is supplied. A
+    context of any other type raises ``TypeError``; a context mismatch
+    returns ``False`` like any other mismatch.
+    """
     if not isinstance(public_key, PublicKey):
         raise TypeError("public_key must be a PublicKey")
+    context_bytes = _validate_context(context)
     materialised = tuple(bytes(part) for part in signature)
     if len(materialised) != public_key.bits:
         return False
-    bits = message_bits(message, bits=public_key.bits)
+    bits = _bound_message_bits(
+        message, bits=public_key.bits, context=context_bytes
+    )
     for index, bit in enumerate(bits):
         if _secret_digest(materialised[index]) != public_key.digests[2 * index + bit]:
             return False
@@ -901,7 +991,7 @@ class LamportProof:
             raise ValueError("signature bits do not match the public key")
         return cls(public_key=public_key, signature=signature)
 
-    def verify(self, message: Any) -> bool:
+    def verify(self, message: Any, *, context: Any = None) -> bool:
         """Verify the embedded signature against the embedded public key.
 
         Accepts ``bytes``/``bytearray``/``str`` exactly like :func:`verify`,
@@ -911,13 +1001,28 @@ class LamportProof:
         bypassing the frozen constructor returns ``False`` instead of
         raising. The proof itself carries no message and cannot authenticate
         its own origin.
+
+        ``context`` is keyword-only and optional: ``None`` (the default) and
+        an empty value both mean "no context" and verify legacy unbound
+        signatures; any other ``bytes``/``bytearray``/``str`` (``str``
+        encoded as UTF-8) must match the signing context exactly, else the
+        signature fails to verify. A context of any other type raises
+        ``TypeError``.
         """
+        context_bytes = _validate_context(context)
         try:
-            return verify(message, self.signature, self.public_key)
+            return verify(
+                message,
+                self.signature,
+                self.public_key,
+                context=context_bytes,
+            )
         except Exception:
             return False
 
-    def verify_bound(self, message: Any, *, public_key: Any) -> bool:
+    def verify_bound(
+        self, message: Any, *, public_key: Any, context: Any = None
+    ) -> bool:
         """Verify the signature and bind the proof to an expected public key.
 
         First requires ``public_key`` to equal the public key embedded in
@@ -929,14 +1034,21 @@ class LamportProof:
         selected by the message bits. No wire format changes, no new
         objects, no randomness and no state are involved.
 
+        ``context`` is keyword-only and optional and follows the same rules
+        as :meth:`verify`: ``None``/empty means no context, while a
+        non-empty context must be the one used at signing; the wrong
+        context makes the bound check return ``False``, and a context of a
+        wrong type raises ``TypeError``.
+
         ``public_key`` must be a :class:`PublicKey`; any other type raises
         ``TypeError``. Missing or mistyped embedded fields (including
         values corrupted by bypassing the frozen constructor), any
-        public-key value mismatch, and any message or signature mismatch
-        return ``False`` without leaking any other exception.
+        public-key value mismatch, and any message, context or signature
+        mismatch return ``False`` without leaking any other exception.
         """
         if not isinstance(public_key, PublicKey):
             raise TypeError("public_key must be a PublicKey")
+        context_bytes = _validate_context(context)
         try:
             embedded_key = self.public_key
             signature = self.signature
@@ -944,7 +1056,9 @@ class LamportProof:
                 return False
             if embedded_key != public_key:
                 return False
-            return verify(message, signature, embedded_key)
+            return verify(
+                message, signature, embedded_key, context=context_bytes
+            )
         except Exception:
             # A bypass-constructed proof may carry arbitrary field objects
             # whose access or comparison raises anything; the bound check
@@ -1041,7 +1155,7 @@ class OtsPairProof:
         wots = WOTSProof.from_bytes(data[lamport_end:wots_end])
         return cls(lamport=lamport, wots=wots)
 
-    def verify(self, message: Any) -> bool:
+    def verify(self, message: Any, *, context: Any = None) -> bool:
         """Verify both embedded proofs against ``message``.
 
         Accepts ``bytes``/``bytearray``/``str`` exactly like the member
@@ -1056,7 +1170,16 @@ class OtsPairProof:
         bits are outside this guarantee — binding the pair to expected
         public keys with :meth:`verify_bound` closes that gap. The pair
         itself carries no message and cannot authenticate its own origin.
+
+        ``context`` is keyword-only and optional: ``None`` (the default)
+        and an empty value both mean "no context" and verify legacy
+        unbound pairs; any other ``bytes``/``bytearray``/``str`` (``str``
+        encoded as UTF-8) must be the context both member signatures were
+        made under — the whole pair passes or fails together, so a pair
+        bound to one context never verifies under another. A context of
+        any other type raises ``TypeError``.
         """
+        context_bytes = _validate_context(context)
         try:
             lamport = self.lamport
             wots = self.wots
@@ -1064,11 +1187,20 @@ class OtsPairProof:
                 return False
             if not isinstance(wots, WOTSProof):
                 return False
-            return lamport.verify(message) and wots.verify(message)
+            return lamport.verify(
+                message, context=context_bytes
+            ) and wots.verify(message, context=context_bytes)
         except Exception:
             return False
 
-    def verify_bound(self, message: Any, *, lamport_key: Any, wots_key: Any) -> bool:
+    def verify_bound(
+        self,
+        message: Any,
+        *,
+        lamport_key: Any,
+        wots_key: Any,
+        context: Any = None,
+    ) -> bool:
         """Verify both proofs and bind the pair to the expected public keys.
 
         First requires ``lamport_key`` to equal the public key embedded in
@@ -1081,17 +1213,25 @@ class OtsPairProof:
         branches not selected by the message bits. No wire format changes,
         no new objects, no randomness and no state are involved.
 
+        ``context`` is keyword-only and optional and follows the same
+        rules as :meth:`verify`: ``None``/empty means no context, while a
+        non-empty context must be the one shared by both member
+        signatures; the wrong context makes the bound check return
+        ``False`` for the whole pair, and a context of a wrong type
+        raises ``TypeError``.
+
         ``lamport_key`` must be a :class:`PublicKey` and ``wots_key`` a
         :class:`WOTSPublicKey`; any other type raises ``TypeError``.
         Missing or mistyped embedded fields (including values corrupted by
         bypassing the frozen constructor), any public-key value mismatch,
-        and any message or signature mismatch return ``False`` without
-        leaking any other exception.
+        and any message, context or signature mismatch return ``False``
+        without leaking any other exception.
         """
         if not isinstance(lamport_key, PublicKey):
             raise TypeError("lamport_key must be a PublicKey")
         if not isinstance(wots_key, WOTSPublicKey):
             raise TypeError("wots_key must be a WOTSPublicKey")
+        context_bytes = _validate_context(context)
         try:
             lamport = self.lamport
             wots = self.wots
@@ -1103,7 +1243,9 @@ class OtsPairProof:
                 return False
             if wots.public_key != wots_key:
                 return False
-            return lamport.verify(message) and wots.verify(message)
+            return lamport.verify(
+                message, context=context_bytes
+            ) and wots.verify(message, context=context_bytes)
         except Exception:
             # A bypass-constructed pair may carry arbitrary field objects
             # whose access or comparison raises anything; the bound check
@@ -1156,7 +1298,7 @@ class OneTimeSigner:
         """``True`` once a signature has been produced (read-only)."""
         return self._used
 
-    def sign(self, message: Any) -> tuple[bytes, ...]:
+    def sign(self, message: Any, *, context: Any = None) -> tuple[bytes, ...]:
         """Sign once.
 
         Behaves exactly like :func:`sign` on the first call, accepting
@@ -1164,11 +1306,22 @@ class OneTimeSigner:
         ``TypeError`` without consuming the key. Any later call raises
         :class:`KeyExhaustedError`. Concurrent calls are serialised so that at
         most one of them can succeed.
+
+        ``context`` is keyword-only and optional: ``None`` (the default) and
+        an empty ``bytes``/``bytearray``/``str`` both mean "no context" and
+        produce the exact unbound signature, while any other ``str`` is
+        encoded as UTF-8 and the message digest is bound to it, so a
+        signature made under one context verifies only under that same
+        context. A context of any other type raises ``TypeError`` without
+        consuming the key.
         """
+        context_bytes = _validate_context(context)
         with self._lock:
             if self._used:
                 raise KeyExhaustedError("this one-time signing key has already been used")
-            signature = sign(message, self._private_key)
+            signature = sign(
+                message, self._private_key, context=context_bytes
+            )
             self._used = True
             return signature
 
@@ -1203,7 +1356,9 @@ class OneTimeSigner:
         with self._lock:
             return self._checkpoint_bytes()
 
-    def sign_with_checkpoint(self, message: Any) -> tuple[tuple[bytes, ...], bytes]:
+    def sign_with_checkpoint(
+        self, message: Any, *, context: Any = None
+    ) -> tuple[tuple[bytes, ...], bytes]:
         """Sign once and snapshot the used state in one atomic step.
 
         Behaves like :meth:`sign` — same ``bytes``/``bytearray``/``str``
@@ -1220,28 +1375,38 @@ class OneTimeSigner:
         to together, so a caller can never match a signature against a
         checkpoint taken at the wrong point under concurrency.
 
-        A rejected message type raises ``TypeError`` without consuming the
-        key, and an already used instance raises
+        ``context`` is keyword-only and optional and follows the same
+        rules as :meth:`sign`: ``None``/empty means no context and gives
+        byte-identical unbound output, while a non-empty context is bound
+        into the message digest and the same context must be supplied to
+        verify.
+
+        A rejected message or context type raises ``TypeError`` without
+        consuming the key, and an already used instance raises
         :class:`KeyExhaustedError`; a failed call returns no partial
         result. The whole call — signature, ``used`` flip and snapshot —
         linearises with :meth:`sign` and :meth:`checkpoint` under the same
         lock, so at most one concurrent caller succeeds, and no randomness
-        is drawn. The returned checkpoint still carries the private key in
-        the clear and its trailing hash only detects accidental corruption
-        — it offers no authentication, encryption or atomic persistence,
-        so confidentiality, durable storage and rollback protection remain
-        the caller's responsibility.
+        is drawn. The context is bound only into the signature; it is not
+        written into the checkpoint. The returned checkpoint still carries
+        the private key in the clear and its trailing hash only detects
+        accidental corruption — it offers no authentication, encryption or
+        atomic persistence, so confidentiality, durable storage and
+        rollback protection remain the caller's responsibility.
         """
+        context_bytes = _validate_context(context)
         message = _as_bytes(message)
         with self._lock:
             if self._used:
                 raise KeyExhaustedError("this one-time signing key has already been used")
-            signature = sign(message, self._private_key)
+            signature = sign(
+                message, self._private_key, context=context_bytes
+            )
             self._used = True
             return signature, self._checkpoint_bytes()
 
     def sign_with_auth_state(
-        self, message: Any, *, key: Any, generation: Any
+        self, message: Any, *, key: Any, generation: Any, context: Any = None
     ) -> tuple[tuple[bytes, ...], bytes]:
         """Sign once and return the advanced state as a v2 auth envelope.
 
@@ -1264,24 +1429,31 @@ class OneTimeSigner:
         Every argument is validated before the key is spent: ``key`` is
         keyword-only and must be a non-empty ``bytes``/``bytearray`` shared
         secret; ``generation`` is keyword-only and must be a non-boolean
-        integer in ``0 .. 2**64 - 1``. A wrong message or key type raises
-        ``TypeError``; an empty key or an out-of-range generation raises
-        ``ValueError``; an already used instance raises
+        integer in ``0 .. 2**64 - 1``; ``context`` is keyword-only and
+        optional and follows the same rules as :meth:`sign`
+        (``None``/empty means no context, ``str`` encoded as UTF-8). A
+        wrong message, key or context type raises ``TypeError``; an empty
+        key or an out-of-range generation raises ``ValueError``; an
+        already used instance raises
         :class:`KeyExhaustedError`. Every failure leaves ``used`` untouched
         and returns no partial result. The whole call — signature, ``used``
         flip, snapshot and wrapping — linearises with :meth:`sign` and
         :meth:`checkpoint` under the same lock, at most one concurrent caller
-        succeeds, and no randomness is drawn. The envelope is plaintext and
-        authenticated only; it provides neither encryption nor protection
-        against replay or rollback on its own.
+        succeeds, and no randomness is drawn. The context is bound only into
+        the signature; it is not written into the envelope. The envelope is
+        plaintext and authenticated only; it provides neither encryption nor
+        protection against replay or rollback on its own.
         """
+        context_bytes = _validate_context(context)
         message = _as_bytes(message)
         key_bytes = _validate_key(key)
         generation_value = _validate_generation(generation, "generation")
         with self._lock:
             if self._used:
                 raise KeyExhaustedError("this one-time signing key has already been used")
-            signature = sign(message, self._private_key)
+            signature = sign(
+                message, self._private_key, context=context_bytes
+            )
             self._used = True
             checkpoint = self._checkpoint_bytes()
             envelope = auth_state_wrap(
@@ -1531,7 +1703,13 @@ def ots_pair_restore(data: Any) -> tuple["OneTimeSigner", "WOTSOneTimeSigner"]:
 
 
 def sign_ots_pair(
-    lamport: Any, wots: Any, message: Any, *, key: Any, generation: Any
+    lamport: Any,
+    wots: Any,
+    message: Any,
+    *,
+    key: Any,
+    generation: Any,
+    context: Any = None,
 ) -> tuple[tuple[tuple[bytes, ...], tuple[bytes, ...]], tuple[bytes, bytes]]:
     """Sign one message with a Lamport/W-OTS pair and wrap both advanced states.
 
@@ -1554,26 +1732,37 @@ def sign_ots_pair(
     envelope is byte-for-byte identical to signing and then wrapping an
     explicit checkpoint.
 
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8): the
+    very same context is bound into the Lamport message digest and the
+    W-OTS message digest, so the whole pair is bound to one context and a
+    verifier must pass that same context to both sides. The empty context
+    leaves every output byte-for-byte identical to the unbound call.
+
     Every argument is validated before either key is spent: ``message``
     follows the usual ``bytes``/``bytearray``/``str`` rules; ``key`` must be
     a non-empty ``bytes``/``bytearray`` shared secret; ``generation`` must be
-    a non-boolean integer in ``0 .. 2**64 - 1``. A wrong signer, message or
-    key type (including a boolean generation) raises ``TypeError``; an empty
-    key or an out-of-range generation raises ``ValueError``; an already used
-    signer on either side raises :class:`KeyExhaustedError`. Every failure
-    leaves both ``used`` flags untouched and returns no partial result. Both
-    signing locks are acquired together, Lamport first and W-OTS second, and
-    the whole call — both signatures, both ``used`` flips, both snapshots and
-    both wrappings — linearises with :meth:`OneTimeSigner.sign`,
-    :meth:`WOTSOneTimeSigner.sign` and both :meth:`checkpoint` methods, so at
-    most one concurrent caller can succeed and no randomness is drawn. The
-    envelopes are plaintext and authenticated only; they provide neither
-    encryption nor protection against replay or rollback on their own.
+    a non-boolean integer in ``0 .. 2**64 - 1``. A wrong signer, message,
+    context or key type (including a boolean generation) raises
+    ``TypeError``; an empty key or an out-of-range generation raises
+    ``ValueError``; an already used signer on either side raises
+    :class:`KeyExhaustedError`. Every failure leaves both ``used`` flags
+    untouched and returns no partial result. Both signing locks are
+    acquired together, Lamport first and W-OTS second, and the whole call —
+    both signatures, both ``used`` flips, both snapshots and both wrappings
+    — linearises with :meth:`OneTimeSigner.sign`,
+    :meth:`WOTSOneTimeSigner.sign` and both :meth:`checkpoint` methods, so
+    at most one concurrent caller can succeed and no randomness is drawn.
+    The context is bound only into the signatures; it is not written into
+    either envelope. The envelopes are plaintext and authenticated only;
+    they provide neither encryption nor protection against replay or
+    rollback on their own.
     """
     if not isinstance(lamport, OneTimeSigner):
         raise TypeError("lamport must be a OneTimeSigner")
     if not isinstance(wots, WOTSOneTimeSigner):
         raise TypeError("wots must be a WOTSOneTimeSigner")
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
     key_bytes = _validate_key(key)
     generation_value = _validate_generation(generation, "generation")
@@ -1586,8 +1775,12 @@ def sign_ots_pair(
             raise KeyExhaustedError(
                 "this wots one-time signing key has already been used"
             )
-        lamport_signature = sign(message, lamport._private_key)
-        wots_signature = wots_sign(message, wots._private_key)
+        lamport_signature = sign(
+            message, lamport._private_key, context=context_bytes
+        )
+        wots_signature = wots_sign(
+            message, wots._private_key, context=context_bytes
+        )
         lamport._used = True
         wots._used = True
         lamport_envelope = auth_state_wrap(
@@ -1606,7 +1799,7 @@ def sign_ots_pair(
 
 
 def sign_ots_pair_with_checkpoint(
-    lamport: Any, wots: Any, message: Any
+    lamport: Any, wots: Any, message: Any, *, context: Any = None
 ) -> tuple[tuple[tuple[bytes, ...], tuple[bytes, ...]], tuple[bytes, bytes]]:
     """Sign one message with a Lamport/W-OTS pair and snapshot both states.
 
@@ -1628,27 +1821,35 @@ def sign_ots_pair_with_checkpoint(
     signer's :meth:`sign_with_checkpoint` individually from the same
     state.
 
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8): the
+    very same context is bound into both member signatures, so the pair is
+    bound to one context; the empty context leaves every output
+    byte-for-byte identical to the unbound call.
+
     Every argument is validated before either key is spent: ``message``
     follows the usual ``bytes``/``bytearray``/``str`` rules. A wrong
-    signer or message type raises ``TypeError``; an already used signer on
-    either side raises :class:`KeyExhaustedError`. Every failure leaves
-    both ``used`` flags untouched and returns no partial result — when
-    either side is already used, neither side is consumed. Both signing
-    locks are acquired together, Lamport first and W-OTS second, and the
-    whole call — both signatures, both ``used`` flips and both snapshots —
-    linearises with :meth:`OneTimeSigner.sign`,
+    signer, message or context type raises ``TypeError``; an already used
+    signer on either side raises :class:`KeyExhaustedError`. Every failure
+    leaves both ``used`` flags untouched and returns no partial result —
+    when either side is already used, neither side is consumed. Both
+    signing locks are acquired together, Lamport first and W-OTS second,
+    and the whole call — both signatures, both ``used`` flips and both
+    snapshots — linearises with :meth:`OneTimeSigner.sign`,
     :meth:`WOTSOneTimeSigner.sign` and both :meth:`checkpoint` methods, so
     at most one concurrent caller can succeed and no randomness is drawn.
-    The returned checkpoints still carry the private keys in the clear and
-    their trailing hashes only detect accidental corruption — they offer
-    no authentication, encryption or atomic persistence, so
-    confidentiality, durable storage and rollback protection remain the
-    caller's responsibility.
+    The context is bound only into the signatures; it is not written into
+    either checkpoint. The returned checkpoints still carry the private
+    keys in the clear and their trailing hashes only detect accidental
+    corruption — they offer no authentication, encryption or atomic
+    persistence, so confidentiality, durable storage and rollback
+    protection remain the caller's responsibility.
     """
     if not isinstance(lamport, OneTimeSigner):
         raise TypeError("lamport must be a OneTimeSigner")
     if not isinstance(wots, WOTSOneTimeSigner):
         raise TypeError("wots must be a WOTSOneTimeSigner")
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
     with lamport._lock, wots._lock:
         if lamport._used:
@@ -1659,8 +1860,12 @@ def sign_ots_pair_with_checkpoint(
             raise KeyExhaustedError(
                 "this wots one-time signing key has already been used"
             )
-        lamport_signature = sign(message, lamport._private_key)
-        wots_signature = wots_sign(message, wots._private_key)
+        lamport_signature = sign(
+            message, lamport._private_key, context=context_bytes
+        )
+        wots_signature = wots_sign(
+            message, wots._private_key, context=context_bytes
+        )
         lamport._used = True
         wots._used = True
         return (lamport_signature, wots_signature), (
@@ -1670,7 +1875,7 @@ def sign_ots_pair_with_checkpoint(
 
 
 def sign_ots_pair_proof_with_checkpoint(
-    lamport: Any, wots: Any, message: Any
+    lamport: Any, wots: Any, message: Any, *, context: Any = None
 ) -> tuple[OtsPairProof, tuple[bytes, bytes]]:
     """Sign one message with a Lamport/W-OTS pair, pack the proof, snapshot both.
 
@@ -1693,27 +1898,35 @@ def sign_ots_pair_proof_with_checkpoint(
     checkpoint is byte-for-byte identical to the one the matching
     :meth:`checkpoint` returns immediately after the call.
 
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8): the
+    very same context is bound into both member signatures, so the pair is
+    bound to one context; the empty context leaves every output
+    byte-for-byte identical to the unbound call.
+
     Every argument is validated before either key is spent: ``message``
     follows the usual ``bytes``/``bytearray``/``str`` rules. A wrong
-    signer or message type raises ``TypeError``; an already used signer on
-    either side raises :class:`KeyExhaustedError`. Every failure leaves
-    both ``used`` flags untouched and returns no partial result — when
-    either side is already used, neither side is consumed. Both signing
-    locks are acquired together, Lamport first and W-OTS second, and the
-    whole call — both signatures, both ``used`` flips, the proof packing
-    and both snapshots — linearises with :meth:`OneTimeSigner.sign`,
+    signer, message or context type raises ``TypeError``; an already used
+    signer on either side raises :class:`KeyExhaustedError`. Every failure
+    leaves both ``used`` flags untouched and returns no partial result —
+    when either side is already used, neither side is consumed. Both
+    signing locks are acquired together, Lamport first and W-OTS second,
+    and the whole call — both signatures, both ``used`` flips, the proof
+    packing and both snapshots — linearises with :meth:`OneTimeSigner.sign`,
     :meth:`WOTSOneTimeSigner.sign` and both :meth:`checkpoint` methods, so
     at most one concurrent caller can succeed and no randomness is drawn.
-    The returned checkpoints still carry the private keys in the clear and
-    their trailing hashes only detect accidental corruption — they offer
-    no authentication, encryption or atomic persistence, so
-    confidentiality, durable storage and rollback protection remain the
-    caller's responsibility.
+    The context is bound only into the signatures; it is not written into
+    either checkpoint. The returned checkpoints still carry the private
+    keys in the clear and their trailing hashes only detect accidental
+    corruption — they offer no authentication, encryption or atomic
+    persistence, so confidentiality, durable storage and rollback
+    protection remain the caller's responsibility.
     """
     if not isinstance(lamport, OneTimeSigner):
         raise TypeError("lamport must be a OneTimeSigner")
     if not isinstance(wots, WOTSOneTimeSigner):
         raise TypeError("wots must be a WOTSOneTimeSigner")
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
     with lamport._lock, wots._lock:
         if lamport._used:
@@ -1724,8 +1937,12 @@ def sign_ots_pair_proof_with_checkpoint(
             raise KeyExhaustedError(
                 "this wots one-time signing key has already been used"
             )
-        lamport_signature = sign(message, lamport._private_key)
-        wots_signature = wots_sign(message, wots._private_key)
+        lamport_signature = sign(
+            message, lamport._private_key, context=context_bytes
+        )
+        wots_signature = wots_sign(
+            message, wots._private_key, context=context_bytes
+        )
         lamport._used = True
         wots._used = True
         pair_proof = OtsPairProof(
@@ -1743,7 +1960,13 @@ def sign_ots_pair_proof_with_checkpoint(
 
 
 def sign_ots_pair_proof_with_auth_state(
-    lamport: Any, wots: Any, message: Any, *, key: Any, generation: Any
+    lamport: Any,
+    wots: Any,
+    message: Any,
+    *,
+    key: Any,
+    generation: Any,
+    context: Any = None,
 ) -> tuple[OtsPairProof, tuple[bytes, bytes]]:
     """Sign one message with a Lamport/W-OTS pair, pack the proof, wrap both.
 
@@ -1772,11 +1995,17 @@ def sign_ots_pair_proof_with_auth_state(
     so each envelope is byte-for-byte identical to signing and then
     wrapping an explicit checkpoint.
 
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8): the
+    very same context is bound into both member signatures, so the pair is
+    bound to one context; the empty context leaves every output
+    byte-for-byte identical to the unbound call.
+
     Every argument is validated before either key is spent: ``message``
     follows the usual ``bytes``/``bytearray``/``str`` rules; ``key`` must
     be a non-empty ``bytes``/``bytearray`` shared secret; ``generation``
     must be a non-boolean integer in ``0 .. 2**64 - 1``. A wrong signer,
-    message or key type (including a boolean generation) raises
+    message, context or key type (including a boolean generation) raises
     ``TypeError``; an empty key or an out-of-range generation raises
     ``ValueError``; an already used signer on either side raises
     :class:`KeyExhaustedError`. Every failure leaves both ``used`` flags
@@ -1787,14 +2016,16 @@ def sign_ots_pair_proof_with_auth_state(
     both wrappings — linearises with :meth:`OneTimeSigner.sign`,
     :meth:`WOTSOneTimeSigner.sign` and both :meth:`checkpoint` methods, so
     at most one concurrent caller can succeed and no randomness is drawn.
-    The envelopes are plaintext and authenticated only; they provide
-    neither encryption nor protection against replay or rollback on their
-    own.
+    The context is bound only into the signatures; it is not written into
+    either envelope. The envelopes are plaintext and authenticated only;
+    they provide neither encryption nor protection against replay or
+    rollback on their own.
     """
     if not isinstance(lamport, OneTimeSigner):
         raise TypeError("lamport must be a OneTimeSigner")
     if not isinstance(wots, WOTSOneTimeSigner):
         raise TypeError("wots must be a WOTSOneTimeSigner")
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
     key_bytes = _validate_key(key)
     generation_value = _validate_generation(generation, "generation")
@@ -1807,8 +2038,12 @@ def sign_ots_pair_proof_with_auth_state(
             raise KeyExhaustedError(
                 "this wots one-time signing key has already been used"
             )
-        lamport_signature = sign(message, lamport._private_key)
-        wots_signature = wots_sign(message, wots._private_key)
+        lamport_signature = sign(
+            message, lamport._private_key, context=context_bytes
+        )
+        wots_signature = wots_sign(
+            message, wots._private_key, context=context_bytes
+        )
         lamport._used = True
         wots._used = True
         pair_proof = OtsPairProof(
@@ -1970,7 +2205,13 @@ def sign_ots_pair_proof_auth_state(
 
 
 def sign_lamport_auth_state(
-    data: Any, message: Any, *, key: Any, min_generation: Any = None, claim: Any
+    data: Any,
+    message: Any,
+    *,
+    key: Any,
+    min_generation: Any = None,
+    claim: Any,
+    context: Any = None,
 ) -> tuple[tuple[bytes, ...], bytes, int]:
     """Restore a Lamport v2 envelope, sign once, and wrap the used state.
 
@@ -1993,12 +2234,19 @@ def sign_lamport_auth_state(
     checkpoint a signer returns from :meth:`~OneTimeSigner.checkpoint`
     immediately after signing — and the new generation ``g + 1``.
 
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8): the
+    context is bound only into the signature, so the verifier must pass the
+    same context; it is not written into the envelope and the empty context
+    makes every output byte-for-byte identical to the unbound call.
+
     ``data`` must be ``bytes`` or ``bytearray`` holding a v2 envelope;
     ``key`` must be a non-empty ``bytes``/``bytearray`` shared secret;
     ``message`` follows the usual ``bytes``/``bytearray``/``str`` rules;
     ``min_generation`` must be ``None`` or a non-boolean integer in
     ``0 .. 2**64 - 1``; ``claim`` must be callable. A wrong type (including a
-    boolean floor or a non-callable claim) raises ``TypeError``. The input
+    bad message or context type, a boolean floor or a non-callable claim)
+    raises ``TypeError``. The input
     generation ``g`` must be strictly below ``2**64 - 1`` so the advanced
     generation fits a uint64; an envelope at ``2**64 - 1`` raises
     ``ValueError``. A restored signer whose key is already used raises
@@ -2027,6 +2275,7 @@ def sign_lamport_auth_state(
     if min_generation is not None:
         _validate_generation(min_generation, "min_generation")
     claim_callable = _validate_claim(claim)
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
 
     # Authenticate first: no field (including the generation) is trusted
@@ -2048,7 +2297,9 @@ def sign_lamport_auth_state(
     with signer._lock:
         if signer._used:
             raise KeyExhaustedError("this one-time signing key has already been used")
-        signature = sign(message, signer._private_key)
+        signature = sign(
+            message, signer._private_key, context=context_bytes
+        )
         signer._used = True
         envelope = auth_state_wrap(
             signer._checkpoint_bytes(),
@@ -2063,7 +2314,13 @@ def sign_lamport_auth_state(
 
 
 def sign_wots_auth_state(
-    data: Any, message: Any, *, key: Any, min_generation: Any = None, claim: Any
+    data: Any,
+    message: Any,
+    *,
+    key: Any,
+    min_generation: Any = None,
+    claim: Any,
+    context: Any = None,
 ) -> tuple[tuple[bytes, ...], bytes, int]:
     """Restore a W-OTS v2 envelope, sign once, and wrap the used state.
 
@@ -2087,12 +2344,19 @@ def sign_wots_auth_state(
     :meth:`~WOTSOneTimeSigner.checkpoint` immediately after signing — and the
     new generation ``g + 1``.
 
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8): the
+    context is bound only into the signature, so the verifier must pass the
+    same context; it is not written into the envelope and the empty context
+    makes every output byte-for-byte identical to the unbound call.
+
     ``data`` must be ``bytes`` or ``bytearray`` holding a v2 envelope;
     ``key`` must be a non-empty ``bytes``/``bytearray`` shared secret;
     ``message`` follows the usual ``bytes``/``bytearray``/``str`` rules;
     ``min_generation`` must be ``None`` or a non-boolean integer in
     ``0 .. 2**64 - 1``; ``claim`` must be callable. A wrong type (including a
-    boolean floor or a non-callable claim) raises ``TypeError``. The input
+    bad message or context type, a boolean floor or a non-callable claim)
+    raises ``TypeError``. The input
     generation ``g`` must be strictly below ``2**64 - 1`` so the advanced
     generation fits a uint64; an envelope at ``2**64 - 1`` raises
     ``ValueError``. A restored signer whose key is already used raises
@@ -2111,9 +2375,10 @@ def sign_wots_auth_state(
     any exception ``claim`` raises propagates untouched. No earlier failure
     invokes the callback. The same inputs always produce byte-identical
     outputs, no randomness is drawn, no input object is mutated, and no
-    library state is kept. The envelope is plaintext and authenticated only;
-    it provides neither encryption nor protection against replay or rollback
-    on its own.
+    library state is kept. The context is bound only into the signature; it
+    is not written into the envelope. The envelope is plaintext and
+    authenticated only; it provides neither encryption nor protection against
+    replay or rollback on its own.
     """
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("data must be bytes or bytearray")
@@ -2121,6 +2386,7 @@ def sign_wots_auth_state(
     if min_generation is not None:
         _validate_generation(min_generation, "min_generation")
     claim_callable = _validate_claim(claim)
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
 
     # Authenticate first: no field (including the generation) is trusted
@@ -2142,7 +2408,9 @@ def sign_wots_auth_state(
     with signer._lock:
         if signer._used:
             raise KeyExhaustedError("this one-time signing key has already been used")
-        signature = wots_sign(message, signer._private_key)
+        signature = wots_sign(
+            message, signer._private_key, context=context_bytes
+        )
         signer._used = True
         envelope = auth_state_wrap(
             signer._checkpoint_bytes(),

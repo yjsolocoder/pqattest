@@ -27,6 +27,15 @@ signature = wots_sign(b"position claim", private_key)
 assert wots_verify(b"position claim", signature, public_key)
 ```
 
+独立 Lamport 与 W-OTS 同样支持仅关键字可选 `context`（`bytes`/`bytearray`/`str`，`str` 按 UTF-8；缺省 `None` 或空值即无上下文）：非空上下文以域分隔与长度前缀进入实际被签的消息摘要，旧无上下文签名、证明、checkpoint 与 auth_state 字节保持不变，两端上下文不同（或一端有、一端无）即验签失败。`sign` / `verify`、`wots_sign` / `wots_verify`、`OneTimeSigner` 与 `WOTSOneTimeSigner` 的 `sign` / `sign_with_checkpoint` / `sign_with_auth_state`、`LamportProof` / `WOTSProof` / `OtsPairProof` 的 `verify` / `verify_bound`，以及 `sign_ots_pair`、`sign_ots_pair_with_checkpoint`、`sign_ots_pair_proof_with_checkpoint`、`sign_ots_pair_proof_with_auth_state`、`sign_lamport_auth_state`、`sign_wots_auth_state` 均支持该参数；OtsPair 两侧绑定同一上下文，整对同过同败。上下文不写入签名、证明、checkpoint 或 auth_state。
+
+```python
+bound = sign(b"position claim", private_key_l, context=b"enroll/v1")
+assert verify(b"position claim", bound, public_key_l, context=b"enroll/v1")
+assert not verify(b"position claim", bound, public_key_l)                # 无上下文
+assert not verify(b"position claim", bound, public_key_l, context=b"x")  # 上下文不同
+```
+
 需要一把长期公钥对应多条消息时，用 Merkle 聚合的 W-OTS（有限次签名）：
 
 ```python
@@ -117,8 +126,8 @@ Lamport：
 - `message_bits(message, *, bits=BITS)` — 摘要展开为比特序列
 - `keygen(*, bits=BITS, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`
 - `public_key_from(private_key)` — 由私钥重算公钥
-- `sign(message, private_key)` — 返回长度等于 `bits` 的签名（比特 `i` 揭示第 `i` 位对应的那个秘密）
-- `verify(message, signature, public_key)` — 逐位比对
+- `sign(message, private_key, *, context=None)` — 返回长度等于 `bits` 的签名（比特 `i` 揭示第 `i` 位对应的那个秘密）。`context` 为仅关键字可选参数，接受 `bytes`/`bytearray`/`str`（`str` 按 UTF-8）；`None`（缺省）与 `b""`/`bytearray()`/`""` 同为无上下文，此时消息按既有方式取摘要比特，输出与旧结果逐字节相同；非空上下文按 `b"pqattest/lamport/context/v1" + len(context) 的 4 字节大端 + context + len(message) 的 4 字节大端 + message` 绑定后再取摘要比特（长度前缀消除拼接歧义），v1 线格式不变（上下文不随签名携带）。上下文错型抛 `TypeError`
+- `verify(message, signature, public_key, *, context=None)` — 逐位比对；`context` 规则同 `sign`，无上下文时验旧无上下文签名，非空时须与签名所用上下文完全一致，上下文不匹配返回 `False`，上下文错型抛 `TypeError`（公钥错型仍抛 `TypeError`）
 - `lamport_signature_to_bytes(signature, *, bits)` / `lamport_signature_from_bytes(data)` — 无状态签名的确定性 v1 二进制编解码；前者要求 `signature` 为成员全为 `bytes` 的元组（容器或成员类型错抛 `TypeError`）并返回 `bytes`，`bits` 仅限关键字且须为 1..256 的非布尔整数、等于元素数（否则抛 `ValueError`）；后者返回 `(bits, elements)`，`bits` 为 `int`，`elements` 为保持原序的不可变 `bytes` 元组、每项 32 字节，可直接交给 `verify`。计数或成员长度不符、坏魔数、未知版本、截断或尾随数据均抛 `ValueError`；解码入口只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`）
 - `OneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `sign(message, private_key)` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `OneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
@@ -196,8 +205,8 @@ Winternitz（W-OTS）：
 - `WOTSPrivateKey(w, elements)` / `WOTSPublicKey(w, elements)` — 含 `w` 与元素元组的冻结值对象
 - `WOTSPrivateKey.to_bytes()` / `WOTSPrivateKey.from_bytes(data)`、`WOTSPublicKey.to_bytes()` / `WOTSPublicKey.from_bytes(data)` — 密钥的确定性 v1 二进制编解码；编码方法不接参数，`from_bytes` 只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`），魔数、版本、`w`、元素计数、截断或尾随数据非法抛 `ValueError`；往返后密钥按值相等。**私钥编码含明文秘密**，须妥善保管
 - `wots_keygen(*, w=4, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`；`w` 仅允许 `4` 或 `8`
-- `wots_sign(message, private_key)` — 返回不可变元组签名
-- `wots_verify(message, signature, public_key)` — 结构/参数/内容不匹配一律返回 `False`；密钥类型错误抛 `TypeError`
+- `wots_sign(message, private_key, *, context=None)` — 返回不可变元组签名；`context` 为仅关键字可选参数，规则同 `sign`（`None`/空值即无上下文，无上下文输出与旧结果逐字节相同；非空上下文按域 `b"pqattest/wots/context/v1"` 长度前缀绑定后进 W-OTS 摘要与校验和，v1 线格式不变；上下文错型抛 `TypeError`）
+- `wots_verify(message, signature, public_key, *, context=None)` — 结构/参数/内容不匹配一律返回 `False`；密钥类型错误与上下文错型抛 `TypeError`，上下文不匹配返回 `False`
 - `wots_signature_to_bytes(signature, *, w)` / `wots_signature_from_bytes(data)` — 无状态签名的确定性 v1 二进制编解码；前者要求 `signature` 为成员全为 `bytes` 的元组（否则抛 `TypeError`）并返回 `bytes`，后者返回 `(w, elements)`，`elements` 为保持原序的不可变 `bytes` 元组，可直接交给 `wots_verify`。非法 `w`、计数不符、成员长度非 32 字节、坏魔数、未知版本、截断或尾随数据均抛 `ValueError`；解码入口只接受 `bytes`/`bytearray`（其他类型抛 `TypeError`）
 - `WOTSOneTimeSigner(private_key)` — 线程安全的进程内一次性签名器；首次 `sign(message)` 与 `wots_sign` 相同，此后抛出 `KeyExhaustedError`；只读属性 `public_key`、`used`
 - `WOTSOneTimeSigner.checkpoint()` — 把签名器状态（**含私钥**与 `used`）序列化为 `bytes`；与 `sign` 共用同一把锁，并发快照只会落在某次签名之前或之后，不会落在签名中途；同一状态编码逐字节相同
@@ -247,6 +256,7 @@ Merkle 聚合（有限次签名）：
 - `multiproof_encode(public_key, signatures)` — 顶层函数，把同一 `MerklePublicKey` 的多份 `MerkleSignature` 压成一份去重认证路径的确定性证明 `bytes`；不引入新对象、不改动任何旧接口与格式。`public_key` 须为 `MerklePublicKey`，`signatures` 须为非空的 `MerkleSignature` 元组（类型错抛 `TypeError`）；空集合、索引非严格递增、签名不被公钥约束（`w`/树高/索引越界/W-OTS 元素数或路径数不符、元素畸形）或同一坐标节点冲突抛 `ValueError`
 - `multiproof_verify(messages, data)` — 顶层验证；`data` 只接受 `bytes`/`bytearray`，`messages` 须为与叶数等长的元组，成员沿用现有消息规则（`bytes`/`bytearray`/`str`）。按各消息恢复 W-OTS 公钥，沿用现有叶哈希与内部节点字节规则逐层合并，必须得到包内公钥根、且每个证明节点恰好使用一次；消息不符，或 `data`/`messages` 类型或数量错、魔数/版本/长度/计数错、截断、尾随、叶块乱序或重复、节点缺失/多余/重复/乱序/坐标非规范，一律返回 `False`
 - **可选上下文绑定（`context`）** — 上述全部 Merkle 多一次性签名的生成入口（`sign`、`sign_batch`、`sign_selected` 及其 `*_with_checkpoint` / `*_with_auth_state` 变体，`sign_proof_with_checkpoint`、`sign_proof_with_auth_state`、`sign_batch_proof_with_checkpoint`、`sign_batch_proof_with_auth_state`，以及 `sign_multiproof_with_checkpoint`、`sign_multiproof_with_auth_state`）与全部验证入口（`merkle_verify`、`MerkleProof.verify` / `verify_bound`、`MerkleBatchProof.verify` / `verify_bound`、`multiproof_verify` / `multiproof_verify_bound`）都接受仅关键字可选参数 `context=None`。`context` 只接受 `bytes`、`bytearray` 或 `str`（`str` 按 UTF-8 编码）；缺省 `None` 与显式空值（`b""`、`bytearray()`、`""`）按同一「无上下文」口径处理——消息直接沿用既有摘要，不带上下文的旧签名与已序列化 v1 字节继续可验，且同密钥、同消息、同叶位的输出与基线**逐字节相同**。传入非空上下文时，实际被 W-OTS 签名的是 `SHA256(b"pqattest/merkle/context/v1" + len(context) 的 4 字节大端 + context + len(message) 的 4 字节大端 + message)`（长度前缀消除拼接歧义；外层仍沿用 W-OTS 既有摘要与校验和规则），故同一消息在不同上下文下的签名互不通用：签名方在生成签名或证明时把消息、叶索引或批消息与同一上下文交给公开入口，验证方必须使用完全相同的上下文、消息顺序与公钥，否则上下文不匹配与内容、证明结构不匹配一样返回 `False`。上下文进入单签、批次证明与 multiproof 实际被验证的消息摘要（multiproof 按给定元组顺序逐叶绑定），而非只体现在函数名或返回值上；批消息顺序、重复消息、叶索引选择与 multiproof 去重规则沿用当前公开语义。上下文或消息类型错误在生成端抛 `TypeError`（`from_bytes` 等解析入口收到非法字节仍统一抛 `ValueError`），生成端状态或容量不足仍抛 `KeyExhaustedError`；验证端上下文错型抛 `TypeError`，上下文不匹配、验证内容或证明结构不匹配一律返回 `False`，不产生新对象、不隐含落盘。同一上下文、同一密钥与同一消息的生成结果保持既有确定性；默认入口的输出格式、线程安全、一次性叶消耗与 checkpoint / auth_state 语义均不改变，不新增任何线格式或版本号
+- **独立 Lamport / W-OTS / OtsPair 的可选上下文绑定（`context`）** — `sign` / `verify`、`wots_sign` / `wots_verify`、`OneTimeSigner` 与 `WOTSOneTimeSigner` 的 `sign` / `sign_with_checkpoint` / `sign_with_auth_state`、`LamportProof` / `WOTSProof` / `OtsPairProof` 的 `verify` / `verify_bound`，以及 `sign_ots_pair`、`sign_ots_pair_with_checkpoint`、`sign_ots_pair_proof_with_checkpoint`、`sign_ots_pair_proof_with_auth_state`、`sign_lamport_auth_state`、`sign_wots_auth_state` 都接受仅关键字可选参数 `context=None`（无状态成对转换入口 `sign_ots_pair_proof_auth_state` 不接该参数，仍只签原始消息）。`context` 只接受 `bytes`、`bytearray` 或 `str`（`str` 按 UTF-8 编码）；缺省 `None` 与显式空值（`b""`、`bytearray()`、`""`）按同一「无上下文」口径处理——消息直接沿用既有摘要，旧签名、旧证明、旧 checkpoint 与旧 auth_state 继续可验可恢复，且同密钥、同消息的输出与基线**逐字节相同**。传入非空上下文时，Lamport 一侧对 `b"pqattest/lamport/context/v1" + len(context) 的 4 字节大端 + context + len(message) 的 4 字节大端 + message` 取 SHA-256 摘要比特，W-OTS 一侧把同一形态的域分隔字节串（域为 `b"pqattest/wots/context/v1"`）交给既有 W-OTS 摘要与校验和规则（长度前缀消除拼接歧义），故同一消息在不同上下文下的签名互不通用，OtsPair 两侧绑定同一上下文后整对同过同败：验证方必须对两侧使用完全相同的上下文、消息与公钥，否则上下文不匹配与内容、公钥或证明结构不匹配一样返回 `False`。消息或上下文错型在生成端抛 `TypeError` 且不消耗签名器、不推进 checkpoint 或 auth_state（已用实例仍抛 `KeyExhaustedError`）；验证端上下文错型抛 `TypeError`，上下文、消息、包内公钥或预期公钥不匹配一律返回 `False`。线格式、版本号、随机数、线程安全、单次消耗、`KeyExhaustedError` 与签名/签后状态原子返回均不变；上下文不写入签名、证明、checkpoint 或 auth_state
 
 构造细节：叶哈希为 `SHA256(b"pqattest/leaf" + bytes([w]) + 公钥元素串)`；内部节点为 `SHA256(b"pqattest/node" + 左 + 右)`；所有节点 32 字节。
 

@@ -10,7 +10,12 @@ confirmation tag.
 The same vectors also back a tiny one-message toy signature: signing draws a
 fresh random vector, derives a 32-byte chain key from it and the message, and
 keys a 32-byte HMAC-SHA-256 tag with the private vector; verification
-re-derives the chain key and checks the tag against the public vector.
+re-derives the chain key and checks the tag against the public vector. As in
+the Merkle signature, signing and verifying accept an optional keyword-only
+``context`` (``None`` or an empty value means no context; a non-empty
+``bytes``/``bytearray``/``str``, with ``str`` encoded as UTF-8) that is bound
+into the chain key together with the message without changing the v1 wire
+format or any no-context result.
 
 .. warning::
 
@@ -53,6 +58,7 @@ _TOKEN_BYTES = _DIMENSION
 _TAG_BYTES = 32
 _KEY_DOMAIN = b"K"
 _SIGNATURE_DOMAIN = b"S"
+_CONTEXT_DOMAIN = b"pqattest/lattice/context/v1"
 
 _PUBLIC_KEY_MAGIC = b"PQALPK\0\0"
 _PRIVATE_KEY_MAGIC = b"PQALSK\0\0"
@@ -120,6 +126,45 @@ def _as_bytes(message: Any) -> bytes:
     if isinstance(message, str):
         return message.encode("utf-8")
     raise TypeError("message must be bytes, bytearray or str")
+
+
+def _validate_context(context: Any) -> bytes:
+    """Normalise the optional signing context to canonical ``bytes``.
+
+    ``None`` and an empty ``bytes``/``bytearray``/``str`` both mean
+    "no context" and normalise to ``b""``. Any other type raises
+    ``TypeError``; a ``str`` is encoded as UTF-8.
+    """
+    if context is None:
+        return b""
+    if isinstance(context, (bytes, bytearray)):
+        return bytes(context)
+    if isinstance(context, str):
+        return context.encode("utf-8")
+    raise TypeError("context must be bytes, bytearray, str or None")
+
+
+def _context_message(context: bytes, message: Any) -> Any:
+    """Bind ``message`` to ``context`` for the signature chain key.
+
+    ``context`` must already be normalised by :func:`_validate_context`.
+    The empty context passes ``message`` through untouched, so the
+    no-context path hashes exactly as the unbound baseline and existing
+    signatures stay byte-for-byte identical. With a non-empty context the
+    domain separator and both length-prefixed fields are hashed as one
+    unambiguous byte string, so the same message under two contexts (or the
+    same context for two messages) produces two incompatible signatures.
+    """
+    if not context:
+        return message
+    message_bytes = _as_bytes(message)
+    return (
+        _CONTEXT_DOMAIN
+        + len(context).to_bytes(4, "big")
+        + context
+        + len(message_bytes).to_bytes(4, "big")
+        + message_bytes
+    )
 
 
 def _chain_key(random_vector: bytes, message: bytes) -> bytes:
@@ -446,7 +491,7 @@ class ToyLatticeProof:
             raise ValueError(f"invalid nested proof field encoding: {exc}") from exc
         return cls(public_key=public_key, signature=signature)
 
-    def verify(self, message: Any) -> bool:
+    def verify(self, message: Any, *, context: Any = None) -> bool:
         """Verify the embedded signature against the embedded public key.
 
         Accepts ``bytes``/``bytearray``/``str`` exactly like
@@ -457,13 +502,27 @@ class ToyLatticeProof:
         bypassing the frozen constructor returns ``False`` instead of
         raising. The proof itself carries no message and cannot authenticate
         its own origin.
+
+        ``context`` is keyword-only and optional: ``None`` (the default) and
+        an empty value both mean "no context" and verify legacy unbound
+        signatures; any other ``bytes``/``bytearray``/``str`` (``str`` encoded
+        as UTF-8) must match the signing context exactly, else the signature
+        fails to verify. A context of any other type raises ``TypeError``.
         """
+        context_bytes = _validate_context(context)
         try:
-            return toy_lattice_verify(message, self.signature, self.public_key)
+            return toy_lattice_verify(
+                message,
+                self.signature,
+                self.public_key,
+                context=context_bytes,
+            )
         except Exception:
             return False
 
-    def verify_bound(self, message: Any, *, public_key: Any) -> bool:
+    def verify_bound(
+        self, message: Any, *, public_key: Any, context: Any = None
+    ) -> bool:
         """Verify the signature and bind the proof to an expected public key.
 
         First requires ``public_key`` to equal the public key embedded in
@@ -474,14 +533,21 @@ class ToyLatticeProof:
         wire format changes, no new objects, no randomness and no state are
         involved.
 
+        ``context`` is keyword-only and optional and follows the same rules
+        as :meth:`verify`: ``None``/empty means no context, while a non-empty
+        context must be the one used at signing; the wrong context makes the
+        bound check return ``False``, and a context of a wrong type raises
+        ``TypeError``.
+
         ``public_key`` must be a :class:`ToyLatticePublicKey`; any other
         type raises ``TypeError``. Missing or mistyped embedded fields
         (including values corrupted by bypassing the frozen constructor),
-        any public-key value mismatch, and any message or signature
+        any public-key value mismatch, and any message, context or signature
         mismatch return ``False`` without leaking any other exception.
         """
         if not isinstance(public_key, ToyLatticePublicKey):
             raise TypeError("public_key must be a ToyLatticePublicKey")
+        context_bytes = _validate_context(context)
         try:
             embedded_key = self.public_key
             signature = self.signature
@@ -489,7 +555,9 @@ class ToyLatticeProof:
                 return False
             if embedded_key != public_key:
                 return False
-            return toy_lattice_verify(message, signature, embedded_key)
+            return toy_lattice_verify(
+                message, signature, embedded_key, context=context_bytes
+            )
         except Exception:
             # A bypass-constructed proof may carry arbitrary field objects
             # whose access or comparison raises anything; the bound check
@@ -583,6 +651,7 @@ def toy_lattice_sign(
     private_key: ToyLatticePrivateKey,
     *,
     token_bytes: Callable[[int], bytes] = secrets.token_bytes,
+    context: Any = None,
 ) -> ToyLatticeSignature:
     """Sign ``message`` with ``private_key`` and return a :class:`ToyLatticeSignature`.
 
@@ -597,9 +666,21 @@ def toy_lattice_sign(
     ``HMAC-SHA256(K, b"S" + s)`` over the private vector. The key is never
     modified; different random sources may produce different signatures even
     for the same message and key.
+
+    ``context`` is keyword-only and optional: ``None`` (the default) and an
+    empty ``bytes``/``bytearray``/``str`` all mean "no context" and produce a
+    signature byte-for-byte identical to the legacy unbound signature for the
+    same private key, message and ``token_bytes`` output. A non-empty context
+    (``str`` encoded as UTF-8) is bound into the chain key together with the
+    message, so the signature verifies only when verifier and signer share
+    both the message and the context; signing stays deterministic for the
+    same key, message, context and randomness. A context of any other type
+    raises ``TypeError``. The v1 wire format is unchanged — the context is
+    not carried in the signature.
     """
     if not isinstance(private_key, ToyLatticePrivateKey):
         raise TypeError("private_key must be a ToyLatticePrivateKey")
+    context_bytes = _validate_context(context)
     message = _as_bytes(message)
     raw = token_bytes(_TOKEN_BYTES)
     if not isinstance(raw, bytes):
@@ -607,7 +688,7 @@ def toy_lattice_sign(
     if len(raw) != _TOKEN_BYTES:
         raise ValueError(f"token_bytes must return {_TOKEN_BYTES} bytes")
     u = _encode_e(raw)
-    chain = _chain_key(u, message)
+    chain = _chain_key(u, _context_message(context_bytes, message))
     tag = _signature_tag(chain, private_key.s)
     return ToyLatticeSignature(u=u, tag=tag)
 
@@ -616,6 +697,8 @@ def toy_lattice_verify(
     message: Any,
     signature: ToyLatticeSignature,
     public_key: ToyLatticePublicKey,
+    *,
+    context: Any = None,
 ) -> bool:
     """Check ``signature`` on ``message`` against ``public_key``.
 
@@ -627,9 +710,19 @@ def toy_lattice_verify(
     raises ``TypeError``; every other problem — an unsupported message type, a
     ``signature`` that is not a :class:`ToyLatticeSignature`, malformed
     signature fields, or any content mismatch — returns ``False``.
+
+    ``context`` is keyword-only and optional: ``None`` (the default) and an
+    empty value both mean "no context" and accept only legacy unbound
+    signatures; a non-empty ``bytes``/``bytearray``/``str`` (``str`` encoded as
+    UTF-8) must be the very context the message was signed under, so a
+    signature made under one context fails under any other context, and an
+    unbound signature fails whenever a non-empty context is supplied. A
+    context of any other type raises ``TypeError``; a context mismatch returns
+    ``False`` like any other mismatch.
     """
     if not isinstance(public_key, ToyLatticePublicKey):
         raise TypeError("public_key must be a ToyLatticePublicKey")
+    context_bytes = _validate_context(context)
     try:
         message = _as_bytes(message)
         if not isinstance(signature, ToyLatticeSignature):
@@ -637,12 +730,12 @@ def toy_lattice_verify(
         _validate_e(signature.u, "u")
         if not isinstance(signature.tag, bytes) or len(signature.tag) != _TAG_BYTES:
             return False
-        chain = _chain_key(signature.u, message)
+        chain = _chain_key(signature.u, _context_message(context_bytes, message))
         candidate = _signature_tag(chain, public_key.t)
         return hmac.compare_digest(candidate, signature.tag)
     except Exception:
         # A bypass-constructed signature may carry arbitrary field objects
         # whose access raises anything; every malformed structure verifies
-        # False. External public-key type errors were raised before this
-        # block.
+        # False. External public-key and context type errors were raised
+        # before this block.
         return False

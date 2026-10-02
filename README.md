@@ -89,6 +89,15 @@ assert toy_lattice_verify(b"hello", signature, public_key)
 assert not toy_lattice_verify(b"hellp", signature, public_key)   # 改动消息即失败
 ```
 
+玩具签名同样支持仅关键字可选 `context`（`bytes`/`bytearray`/`str`，`str` 按 UTF-8；缺省 `None` 或空值即无上下文）：非空上下文与消息一起进入链密钥，旧无上下文签名与 v1 字节保持不变，两端上下文不同（或一端有、一端无）即验签失败。
+
+```python
+bound = toy_lattice_sign(b"hello", private_key, context=b"enroll/v1")
+assert toy_lattice_verify(b"hello", bound, public_key, context=b"enroll/v1")
+assert not toy_lattice_verify(b"hello", bound, public_key)                  # 无上下文
+assert not toy_lattice_verify(b"hello", bound, public_key, context=b"x")   # 上下文不同
+```
+
 **未审计、不具安全性，仅供教学，严禁生产使用。**
 
 ## 命令行演示
@@ -663,8 +672,8 @@ assert verify(b"one-time claim", signature, ots.public_key)
 - `toy_lattice_keygen(*, token_bytes=secrets.token_bytes)` — 返回 `(private_key, public_key)`；取 `x = token_bytes(8)`，令 `s = t = E(x)`（即私钥与公钥是同一个向量，毫无难度可求逆——这正是它只能教学的原因之一）。令牌源未返回恰好 8 字节抛 `ValueError`
 - `toy_lattice_encapsulate(public_key, *, token_bytes=secrets.token_bytes)` — 返回 `(ciphertext, shared_key)`；取 `r = token_bytes(8)`、`u = E(r)`，用**解码后的向量**计算 `v = t·r mod 257`，共享密钥 `K = SHA256(b"K" + v₂)`，其中 `v₂` 为 `v` 的 2 字节大端编码；`tag = K`。`public_key` 类型错误抛 `TypeError`，令牌长度错误抛 `ValueError`
 - `toy_lattice_decapsulate(ciphertext, private_key)` — 用解码向量计算 `v = s·u mod 257`，以相同方式推出 `K`，并以常量时间比较校验 `tag`；一致则返回 `K`，`tag` 不符（含长度不同）抛 `ValueError`。参数类型错误抛 `TypeError`
-- `toy_lattice_sign(message, private_key, *, token_bytes=secrets.token_bytes)` — 返回 `ToyLatticeSignature`；消息接受 `bytes`/`bytearray`/`str`（`str` 按 UTF-8 编码）。按维度 8、编码 `E`、模 257 语义取 `r = token_bytes(8)` 并令随机向量 `u = E(r)`，链密钥 `K = SHA256(b"S" + u + message)`，32 字节标签 `tag = HMAC-SHA256(K, b"S" + s)`。同一消息与私钥在不同随机源下可得到不同签名；不修改密钥。消息或私钥类型错误抛 `TypeError`；令牌源返回非 `bytes` 或长度不为 8 抛 `ValueError`
-- `toy_lattice_verify(message, signature, public_key)` — 按公钥向量 `t` 重算链密钥 `K = SHA256(b"S" + u + message)` 与标签 `HMAC-SHA256(K, b"S" + t)`，以常量时间比较签名携带的 `tag`。仅原消息配匹配公钥返回 `True`；消息、签名或公钥内容不一致，以及签名结构损坏（非 `ToyLatticeSignature`、字段非 `bytes`、非法 `E` 系数或标签长度不对）一律返回 `False`；仅 `public_key` 类型错误抛 `TypeError`
+- `toy_lattice_sign(message, private_key, *, token_bytes=secrets.token_bytes, context=None)` — 返回 `ToyLatticeSignature`；消息接受 `bytes`/`bytearray`/`str`（`str` 按 UTF-8 编码）。按维度 8、编码 `E`、模 257 语义取 `r = token_bytes(8)` 并令随机向量 `u = E(r)`，链密钥 `K = SHA256(b"S" + u + message)`，32 字节标签 `tag = HMAC-SHA256(K, b"S" + s)`。同一消息与私钥在不同随机源下可得到不同签名；不修改密钥。消息或私钥类型错误抛 `TypeError`；令牌源返回非 `bytes` 或长度不为 8 抛 `ValueError`。`context` 为仅关键字可选参数：`None`（缺省）与 `b""`/`bytearray()`/`""` 同为「无上下文」，此时消息原样进入链密钥，相同私钥、消息、`token_bytes` 的输出与旧结果**逐字节相同**；非空 `bytes`/`bytearray`/`str`（`str` 按 UTF-8 归一化）以域分隔与长度前缀与消息一并进入链密钥，链密钥的 SHA-256 输入为 `b"S" + u + b"pqattest/lattice/context/v1" + len(context) 的 4 字节大端 + context + len(message) 的 4 字节大端 + message`（长度前缀消除拼接歧义），相同非空上下文、密钥、消息与随机源下签名确定，v1 线格式不变（上下文不随签名携带）。上下文类型错误抛 `TypeError`
+- `toy_lattice_verify(message, signature, public_key, *, context=None)` — 按公钥向量 `t` 重算链密钥 `K = SHA256(b"S" + u + message)` 与标签 `HMAC-SHA256(K, b"S" + t)`，以常量时间比较签名携带的 `tag`。仅原消息配匹配公钥返回 `True`；消息、签名或公钥内容不一致，以及签名结构损坏（非 `ToyLatticeSignature`、字段非 `bytes`、非法 `E` 系数或标签长度不对）一律返回 `False`；仅 `public_key` 类型错误抛 `TypeError`。`context` 为仅关键字可选参数，口径与签名端一致：缺省/空值只接受旧的无上下文签名，非空上下文必须与签名时完全相同（`str` 按 UTF-8），换上下文、消息、公钥或签名字段均返回 `False`，旧无上下文签名在非空上下文下同样返回 `False`；上下文类型错误抛 `TypeError`，其余不匹配或损坏返回 `False`
 
 构造细节：向量维度固定为 8，系数环为模 257 整数；编码 `E` 把 8 个系数各编为 2 字节大端（系数允许 256，故 2 字节刚好容纳），共 16 字节。封装、解封装与签名都在 `E` 值域上操作；封装与解封装先把 `E` 值解码回向量再做点积。密钥生成、封装与签名的随机字节经注入的 `token_bytes` 取得（默认 `secrets.token_bytes`），仅被原样当作系数使用，因此系数实际落在 `0..255`；接收到的 `t`/`s`/`u` 则允许完整的 `0..256`。
 

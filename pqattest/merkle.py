@@ -1438,6 +1438,93 @@ class MerkleSigner:
             self._next_index = base + len(signatures)
             return tuple(signatures)
 
+    @staticmethod
+    def _validate_selected(indices: Any, messages: Any, context: Any) -> bytes:
+        """Validate an explicit leaf selection before the signing lock.
+
+        Shared by :meth:`sign_selected`,
+        :meth:`sign_selected_with_checkpoint` and
+        :meth:`sign_selected_with_auth_state` so the one-time-key usage
+        constraints (what may be signed, in which order errors are raised,
+        and that nothing is consumed before every check passes) live in
+        exactly one place. Runs entirely outside the lock and never touches
+        state: it first normalises ``context`` (raising ``TypeError`` for an
+        unsupported context type), then enforces the selection's types and
+        structure in the fixed order containers, member types, emptiness,
+        equal length, non-boolean indices, strictly increasing indices —
+        returning the normalised context bytes on success. Exhaustion and
+        the index range are checked afterwards, inside the lock, by
+        :meth:`_sign_selected_locked`.
+        """
+        context_bytes = _validate_context(context)
+        if not isinstance(indices, tuple):
+            raise TypeError("indices must be a tuple of integers")
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for index in indices:
+            if not isinstance(index, int):
+                raise TypeError("every index must be an integer")
+        for message in messages:
+            _as_bytes(message)
+        if not indices:
+            raise ValueError("indices must not be empty")
+        if len(indices) != len(messages):
+            raise ValueError("indices and messages must have the same length")
+        if any(isinstance(index, bool) for index in indices):
+            raise ValueError("every index must be a non-boolean integer")
+        if any(
+            former >= latter for former, latter in zip(indices, indices[1:])
+        ):
+            raise ValueError("indices must be strictly increasing and unique")
+        return context_bytes
+
+    def _sign_selected_locked(
+        self,
+        indices: tuple[int, ...],
+        messages: tuple[Any, ...],
+        context_bytes: bytes,
+        pack: Callable[[int], Any] | None = None,
+    ) -> tuple[tuple[MerkleSignature, ...], Any]:
+        """Validate the range, sign the selection and advance exactly once.
+
+        Shared state-advancement core of the three explicit-selection
+        entries; the caller holds the signing lock and has already passed
+        :meth:`_validate_selected` (plus any envelope key/generation
+        checks). Exhaustion is reported before the index range, so a
+        structurally valid request on an exhausted signer raises
+        :class:`KeyExhaustedError` while a not-yet-exhausted signer raises
+        ``ValueError`` for an index below ``next_index`` or past the last
+        leaf. Every signature is produced first; when ``pack`` is given it
+        builds the state artifact (a candidate checkpoint, or an envelope
+        over one) at the candidate next index, and any exception it raises
+        propagates untouched with nothing committed — only once it returns
+        does ``next_index`` move to the last chosen index plus one, so a
+        failure consumes no leaf and no observer ever sees a half-signed
+        selection or an advanced state without the finished artifact.
+        Returns ``(signatures, artifact)`` where ``artifact`` is ``None``
+        when ``pack`` is omitted.
+        """
+        if self._next_index >= len(self._private_keys):
+            raise KeyExhaustedError("all Merkle leaves have been used")
+        base = self._next_index
+        leaf_count = len(self._private_keys)
+        if indices[0] < base or indices[-1] >= leaf_count:
+            raise ValueError(
+                "every index must be between the current next leaf and "
+                "the last leaf"
+            )
+        signatures = tuple(
+            self._signature_at(index, message, context_bytes)
+            for index, message in zip(indices, messages)
+        )
+        new_next_index = indices[-1] + 1
+        # Build the state output before advancing: any failure must consume
+        # no leaf, and no observer must ever see the advanced state without
+        # the finished artifact.
+        artifact = pack(new_next_index) if pack is not None else None
+        self._next_index = new_next_index
+        return signatures, artifact
+
     def sign_selected(
         self, indices: Any, messages: Any, *, context: Any = None
     ) -> tuple[MerkleSignature, ...]:
@@ -1485,42 +1572,11 @@ class MerkleSigner:
         deduplicated proof for the batch to exactly these leaves. No
         randomness is drawn.
         """
-        context_bytes = _validate_context(context)
-        if not isinstance(indices, tuple):
-            raise TypeError("indices must be a tuple of integers")
-        context_bytes = _validate_context(context)
-        if not isinstance(messages, tuple):
-            raise TypeError("messages must be a tuple of messages")
-        for index in indices:
-            if not isinstance(index, int):
-                raise TypeError("every index must be an integer")
-        for message in messages:
-            _as_bytes(message)
-        if not indices:
-            raise ValueError("indices must not be empty")
-        if len(indices) != len(messages):
-            raise ValueError("indices and messages must have the same length")
-        if any(isinstance(index, bool) for index in indices):
-            raise ValueError("every index must be a non-boolean integer")
-        if any(
-            former >= latter for former, latter in zip(indices, indices[1:])
-        ):
-            raise ValueError("indices must be strictly increasing and unique")
+        context_bytes = self._validate_selected(indices, messages, context)
         with self._lock:
-            if self._next_index >= len(self._private_keys):
-                raise KeyExhaustedError("all Merkle leaves have been used")
-            base = self._next_index
-            leaf_count = len(self._private_keys)
-            if indices[0] < base or indices[-1] >= leaf_count:
-                raise ValueError(
-                    "every index must be between the current next leaf and "
-                    "the last leaf"
-                )
-            signatures = tuple(
-                self._signature_at(index, message, context_bytes)
-                for index, message in zip(indices, messages)
+            signatures, _ = self._sign_selected_locked(
+                indices, messages, context_bytes
             )
-            self._next_index = indices[-1] + 1
             return signatures
 
     def sign_selected_with_checkpoint(
@@ -1575,46 +1631,16 @@ class MerkleSigner:
         durable storage and rollback protection remain the caller's
         responsibility.
         """
-        context_bytes = _validate_context(context)
-        if not isinstance(indices, tuple):
-            raise TypeError("indices must be a tuple of integers")
-        context_bytes = _validate_context(context)
-        if not isinstance(messages, tuple):
-            raise TypeError("messages must be a tuple of messages")
-        for index in indices:
-            if not isinstance(index, int):
-                raise TypeError("every index must be an integer")
-        for message in messages:
-            _as_bytes(message)
-        if not indices:
-            raise ValueError("indices must not be empty")
-        if len(indices) != len(messages):
-            raise ValueError("indices and messages must have the same length")
-        if any(isinstance(index, bool) for index in indices):
-            raise ValueError("every index must be a non-boolean integer")
-        if any(
-            former >= latter for former, latter in zip(indices, indices[1:])
-        ):
-            raise ValueError("indices must be strictly increasing and unique")
+        context_bytes = self._validate_selected(indices, messages, context)
         with self._lock:
-            if self._next_index >= len(self._private_keys):
-                raise KeyExhaustedError("all Merkle leaves have been used")
-            base = self._next_index
-            leaf_count = len(self._private_keys)
-            if indices[0] < base or indices[-1] >= leaf_count:
-                raise ValueError(
-                    "every index must be between the current next leaf and "
-                    "the last leaf"
-                )
-            signatures = tuple(
-                self._signature_at(index, message, context_bytes)
-                for index, message in zip(indices, messages)
+            signatures, checkpoint = self._sign_selected_locked(
+                indices,
+                messages,
+                context_bytes,
+                pack=lambda new_next_index: self._checkpoint_bytes(
+                    new_next_index
+                ),
             )
-            # Build the snapshot before advancing: any failure must consume
-            # no leaf, and no observer must ever see the advanced state
-            # without the finished checkpoint.
-            checkpoint = self._checkpoint_bytes(indices[-1] + 1)
-            self._next_index = indices[-1] + 1
             return signatures, checkpoint
 
     def sign_selected_with_auth_state(
@@ -1678,54 +1704,26 @@ class MerkleSigner:
         only; it provides neither encryption nor protection against replay or
         rollback on its own.
         """
-        context_bytes = _validate_context(context)
-        if not isinstance(indices, tuple):
-            raise TypeError("indices must be a tuple of integers")
-        context_bytes = _validate_context(context)
-        if not isinstance(messages, tuple):
-            raise TypeError("messages must be a tuple of messages")
-        for index in indices:
-            if not isinstance(index, int):
-                raise TypeError("every index must be an integer")
-        for message in messages:
-            _as_bytes(message)
-        if not indices:
-            raise ValueError("indices must not be empty")
-        if len(indices) != len(messages):
-            raise ValueError("indices and messages must have the same length")
-        if any(isinstance(index, bool) for index in indices):
-            raise ValueError("every index must be a non-boolean integer")
-        if any(
-            former >= latter for former, latter in zip(indices, indices[1:])
-        ):
-            raise ValueError("indices must be strictly increasing and unique")
+        context_bytes = self._validate_selected(indices, messages, context)
+        # The envelope inputs are checked only after the selection's types
+        # and structure, matching the fixed order of the other auth-state
+        # entries; exhaustion and the index range follow inside the lock.
         key_bytes = _validate_key(key)
         generation_value = _validate_generation(generation, "generation")
-        with self._lock:
-            if self._next_index >= len(self._private_keys):
-                raise KeyExhaustedError("all Merkle leaves have been used")
-            base = self._next_index
-            leaf_count = len(self._private_keys)
-            if indices[0] < base or indices[-1] >= leaf_count:
-                raise ValueError(
-                    "every index must be between the current next leaf and "
-                    "the last leaf"
-                )
-            signatures = tuple(
-                self._signature_at(index, message, context_bytes)
-                for index, message in zip(indices, messages)
-            )
-            # Build both outputs before advancing: any failure must consume
-            # no leaf, and no observer must ever see the advanced state
-            # without the finished signatures and envelope.
-            checkpoint = self._checkpoint_bytes(indices[-1] + 1)
-            envelope = auth_state_wrap(
+
+        def pack(new_next_index: int) -> bytes:
+            checkpoint = self._checkpoint_bytes(new_next_index)
+            return auth_state_wrap(
                 checkpoint,
                 scheme="merkle",
                 key=key_bytes,
                 generation=generation_value,
             )
-            self._next_index = indices[-1] + 1
+
+        with self._lock:
+            signatures, envelope = self._sign_selected_locked(
+                indices, messages, context_bytes, pack=pack
+            )
             return signatures, envelope
 
     def sign_with_checkpoint(

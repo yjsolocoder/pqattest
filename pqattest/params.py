@@ -5316,6 +5316,107 @@ def _validate_verify_mode_weights(weights: Any) -> tuple[int, ...]:
     return weights
 
 
+def _verify_mode_ranked_metrics(
+    mode_cost: MerkleModeCost,
+) -> tuple[int, int, int, int, int]:
+    """Return the five ranked costs of one verify-mode frontier member.
+
+    The shared cost projection behind the weighted verify-mode deployment
+    ranking: aggregate transport bytes, any single group's transport peak,
+    total verifier SHA-256 hashes, carried multi-proof nodes and the
+    per-signature verifier hash-chain steps.
+    """
+    return (
+        mode_cost.plan.total,
+        max(mode_cost.plan.sizes),
+        mode_cost.cost.total,
+        mode_cost.nodes,
+        profile(
+            "merkle",
+            w=mode_cost.plan.config.w,
+            height=mode_cost.plan.config.height,
+        ).steps,
+    )
+
+
+def _verify_mode_tie_tail(
+    mode_cost: MerkleModeCost,
+) -> tuple[int, int, int, int, tuple[str, ...]]:
+    """Return the ascending tie-break tail shared by verify-mode rankings."""
+    config = mode_cost.plan.config
+    return (
+        config.checkpoint_bytes,
+        config.leaf_count,
+        config.w,
+        config.height,
+        mode_cost.plan.modes,
+    )
+
+
+def _normalised_verify_mode_rows(
+    frontier: tuple[MerkleModeCost, ...],
+) -> tuple[tuple[Fraction, ...], ...]:
+    """Min-max normalise the five ranked costs over the whole frontier.
+
+    Each of the five cost columns is scaled as ``(x - min) / (max - min)``,
+    with a zero span scoring ``0``; every value is an exact
+    :class:`fractions.Fraction` and the rows keep the frontier's order.
+    """
+    metric_rows = tuple(
+        _verify_mode_ranked_metrics(mode_cost) for mode_cost in frontier
+    )
+    spans = tuple(
+        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
+        for i in range(5)
+    )
+    return tuple(
+        tuple(
+            Fraction(value - low, high - low) if high > low else Fraction(0)
+            for value, (low, high) in zip(row, spans)
+        )
+        for row in metric_rows
+    )
+
+
+def _verify_mode_weighted_entries(
+    frontier: tuple[MerkleModeCost, ...],
+    validated_weights: tuple[int, ...],
+) -> list[tuple[MerkleModeCost, tuple[Fraction, ...], Fraction]]:
+    """Build ``(mode_cost, normalised costs, score)`` rows in frontier order.
+
+    The single-weight decision table shared by
+    :func:`recommend_merkle_verify_mode_deployment_weighted` and
+    :func:`explain_merkle_verify_mode_deployment_weighted`: the score is the
+    five normalised costs times their weights, summed and divided by the
+    weight total.
+    """
+    normalised_rows = _normalised_verify_mode_rows(frontier)
+    weight_total = sum(validated_weights)
+    return [
+        (
+            mode_cost,
+            costs,
+            sum(
+                (
+                    weight * component
+                    for weight, component in zip(validated_weights, costs)
+                ),
+                Fraction(0),
+            )
+            / weight_total,
+        )
+        for mode_cost, costs in zip(frontier, normalised_rows)
+    ]
+
+
+def _verify_mode_weighted_ranking(
+    entry: tuple[MerkleModeCost, tuple[Fraction, ...], Fraction],
+) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
+    """Rank single-weight entries by score, then the shared tie-break tail."""
+    mode_cost, _costs, score = entry
+    return (score, *_verify_mode_tie_tail(mode_cost))
+
+
 def recommend_merkle_verify_mode_deployment_weighted(
     capacity: Any,
     groups: Any,
@@ -5368,46 +5469,8 @@ def recommend_merkle_verify_mode_deployment_weighted(
     """
     frontier = merkle_verify_mode_frontier(capacity, groups, budgets)
     validated_weights = _validate_verify_mode_weights(weights)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-    weight_total = sum(validated_weights)
-
-    def ranking(
-        mode_cost: MerkleModeCost,
-    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
-        score = Fraction(0)
-        for value, weight, (low, high) in zip(metrics(mode_cost), validated_weights, spans):
-            if high > low:
-                score += weight * Fraction(value - low, high - low)
-        score /= weight_total
-        config = mode_cost.plan.config
-        return (
-            score,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    return min(frontier, key=ranking)
+    entries = _verify_mode_weighted_entries(frontier, validated_weights)
+    return min(entries, key=_verify_mode_weighted_ranking)[0]
 
 
 @dataclass(frozen=True)
@@ -5498,54 +5561,8 @@ def explain_merkle_verify_mode_deployment_weighted(
     """
     frontier = merkle_verify_mode_frontier(capacity, groups, budgets)
     validated_weights = _validate_verify_mode_weights(weights)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-    weight_total = sum(validated_weights)
-
-    entries = []
-    for mode_cost, row in zip(frontier, metric_rows):
-        costs = tuple(
-            Fraction(value - low, high - low) if high > low else Fraction(0)
-            for value, (low, high) in zip(row, spans)
-        )
-        score = sum(
-            (weight * cost for weight, cost in zip(validated_weights, costs)),
-            Fraction(0),
-        ) / weight_total
-        entries.append((mode_cost, costs, score))
-
-    def ranking(
-        entry: tuple[MerkleModeCost, tuple[Fraction, ...], Fraction],
-    ) -> tuple[Fraction, int, int, int, int, tuple[str, ...]]:
-        mode_cost, _costs, score = entry
-        config = mode_cost.plan.config
-        return (
-            score,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    chosen = min(entries, key=ranking)[0]
+    entries = _verify_mode_weighted_entries(frontier, validated_weights)
+    chosen = min(entries, key=_verify_mode_weighted_ranking)[0]
     return tuple(
         MerkleVerifyModeDeploymentScore(
             mode_cost, *costs, score, mode_cost is chosen

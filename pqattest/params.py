@@ -6266,6 +6266,93 @@ def _validate_weight_scenarios(scenarios: Any) -> tuple[tuple[int, ...], ...]:
     return tuple(validated)
 
 
+def _verify_mode_scenario_scores(
+    normalised_rows: tuple[tuple[Fraction, ...], ...],
+    validated_scenarios: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[Fraction, ...], ...]:
+    """Score every verify-mode frontier member under each weight scenario.
+
+    Each score is the five normalised costs times the scenario's weights,
+    summed and divided by the scenario's weight total; the per-member
+    tuples keep the input scenario order, duplicates included.
+    """
+    return tuple(
+        tuple(
+            sum(
+                (weight * component for weight, component in zip(weights, row)),
+                Fraction(0),
+            )
+            / sum(weights)
+            for weights in validated_scenarios
+        )
+        for row in normalised_rows
+    )
+
+
+def _verify_mode_scenario_entries(
+    frontier: tuple[MerkleModeCost, ...],
+    validated_scenarios: tuple[tuple[int, ...], ...],
+) -> list[
+    tuple[
+        MerkleModeCost,
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+    ]
+]:
+    """Build ``(mode_cost, costs, scores, regrets)`` rows in frontier order.
+
+    The multi-scenario decision table shared by
+    :func:`recommend_merkle_verify_mode_weighted` and
+    :func:`explain_merkle_verify_mode_weighted`, so the recommendation and
+    its explanation always apply one and the same scoring semantics: each
+    regret is the member's score minus that scenario's best score over the
+    frontier.
+    """
+    normalised_rows = _normalised_verify_mode_deployment_rows(frontier)
+    score_rows = _verify_mode_scenario_scores(normalised_rows, validated_scenarios)
+    scenario_best = tuple(
+        min(scores[scenario_index] for scores in score_rows)
+        for scenario_index in range(len(validated_scenarios))
+    )
+    return [
+        (
+            mode_cost,
+            costs,
+            scores,
+            tuple(score - best for score, best in zip(scores, scenario_best)),
+        )
+        for mode_cost, costs, scores in zip(frontier, normalised_rows, score_rows)
+    ]
+
+
+def _verify_mode_scenario_ranking(
+    entry: tuple[
+        MerkleModeCost,
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+        tuple[Fraction, ...],
+    ],
+) -> tuple[
+    Fraction,
+    Fraction,
+    tuple[Fraction, ...],
+    int,
+    int,
+    int,
+    int,
+    tuple[str, ...],
+]:
+    """Rank scenario entries by worst regret, regret sum, scores, then tail."""
+    mode_cost, _costs, scores, regrets = entry
+    return (
+        max(regrets),
+        sum(regrets, Fraction(0)),
+        scores,
+        *_verify_mode_deployment_tie_tail(mode_cost),
+    )
+
+
 def recommend_merkle_verify_mode_weighted(
     capacity: Any,
     groups: Any,
@@ -6324,80 +6411,8 @@ def recommend_merkle_verify_mode_weighted(
     """
     frontier = merkle_verify_mode_frontier(capacity, groups, budgets)
     validated_scenarios = _validate_weight_scenarios(scenarios)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-
-    def normalised(row: tuple[int, ...]) -> tuple[Fraction, ...]:
-        return tuple(
-            Fraction(value - low, high - low) if high > low else Fraction(0)
-            for value, (low, high) in zip(row, spans)
-        )
-
-    normalised_rows = tuple(normalised(row) for row in metric_rows)
-    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
-
-    def scenario_scores(row: tuple[Fraction, ...]) -> tuple[Fraction, ...]:
-        return tuple(
-            sum(
-                (weight * component for weight, component in zip(weights, row)),
-                Fraction(0),
-            )
-            / weight_total
-            for weights, weight_total in zip(validated_scenarios, scenario_totals)
-        )
-
-    score_rows = tuple(scenario_scores(row) for row in normalised_rows)
-    scenario_best = tuple(
-        min(row[scenario_index] for row in score_rows)
-        for scenario_index in range(len(validated_scenarios))
-    )
-
-    def ranking(
-        entry: tuple[MerkleModeCost, tuple[Fraction, ...]],
-    ) -> tuple[
-        Fraction,
-        Fraction,
-        tuple[Fraction, ...],
-        int,
-        int,
-        int,
-        int,
-        tuple[str, ...],
-    ]:
-        mode_cost, scores = entry
-        regrets = tuple(
-            score - best for score, best in zip(scores, scenario_best)
-        )
-        config = mode_cost.plan.config
-        return (
-            max(regrets),
-            sum(regrets, Fraction(0)),
-            scores,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    return min(zip(frontier, score_rows), key=ranking)[0]
+    entries = _verify_mode_scenario_entries(frontier, validated_scenarios)
+    return min(entries, key=_verify_mode_scenario_ranking)[0]
 
 
 @dataclass(frozen=True)
@@ -6496,85 +6511,8 @@ def explain_merkle_verify_mode_weighted(
     """
     frontier = merkle_verify_mode_frontier(capacity, groups, budgets)
     validated_scenarios = _validate_weight_scenarios(scenarios)
-
-    def metrics(mode_cost: MerkleModeCost) -> tuple[int, int, int, int, int]:
-        return (
-            mode_cost.plan.total,
-            max(mode_cost.plan.sizes),
-            mode_cost.cost.total,
-            mode_cost.nodes,
-            profile(
-                "merkle",
-                w=mode_cost.plan.config.w,
-                height=mode_cost.plan.config.height,
-            ).steps,
-        )
-
-    metric_rows = tuple(metrics(mode_cost) for mode_cost in frontier)
-    spans = tuple(
-        (min(row[i] for row in metric_rows), max(row[i] for row in metric_rows))
-        for i in range(5)
-    )
-    scenario_totals = tuple(sum(weights) for weights in validated_scenarios)
-
-    entries = []
-    for mode_cost, row in zip(frontier, metric_rows):
-        costs = tuple(
-            Fraction(value - low, high - low) if high > low else Fraction(0)
-            for value, (low, high) in zip(row, spans)
-        )
-        scores = tuple(
-            sum(
-                (weight * component for weight, component in zip(weights, costs)),
-                Fraction(0),
-            )
-            / weight_total
-            for weights, weight_total in zip(validated_scenarios, scenario_totals)
-        )
-        entries.append((mode_cost, costs, scores))
-
-    scenario_best = tuple(
-        min(entry[2][scenario_index] for entry in entries)
-        for scenario_index in range(len(validated_scenarios))
-    )
-    entries = [
-        (mode_cost, costs, scores, tuple(
-            score - best for score, best in zip(scores, scenario_best)
-        ))
-        for mode_cost, costs, scores in entries
-    ]
-
-    def ranking(
-        entry: tuple[
-            MerkleModeCost,
-            tuple[Fraction, ...],
-            tuple[Fraction, ...],
-            tuple[Fraction, ...],
-        ],
-    ) -> tuple[
-        Fraction,
-        Fraction,
-        tuple[Fraction, ...],
-        int,
-        int,
-        int,
-        int,
-        tuple[str, ...],
-    ]:
-        mode_cost, _costs, scores, regrets = entry
-        config = mode_cost.plan.config
-        return (
-            max(regrets),
-            sum(regrets, Fraction(0)),
-            scores,
-            config.checkpoint_bytes,
-            config.leaf_count,
-            config.w,
-            config.height,
-            mode_cost.plan.modes,
-        )
-
-    chosen = min(entries, key=ranking)[0]
+    entries = _verify_mode_scenario_entries(frontier, validated_scenarios)
+    chosen = min(entries, key=_verify_mode_scenario_ranking)[0]
     return tuple(
         MerkleVerifyModeScore(
             mode_cost, *costs, scores, regrets, mode_cost is chosen

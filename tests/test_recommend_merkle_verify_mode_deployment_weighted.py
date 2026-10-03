@@ -422,6 +422,197 @@ class RecommendMerkleVerifyModeDeploymentWeightedTest(unittest.TestCase):
             self.assertEqual(first, second)
         self.assertEqual(signer.next_index, 0)
 
+    # --- regression tests pinning the refactored shared scoring semantics ---
+
+    # The baseline frontier has six members with genuine trade-offs: w=4
+    # plans are transport-heavy but verify-cheap, w=8 plans are the reverse,
+    # and the two batch/multiproof combinations trade peak transport against
+    # carried nodes. The tails below pin each member in frontier order.
+    _TAIL_W4_MM = (34385, 16, 4, 4, ("multiproof", "multiproof"))
+    _TAIL_W4_MB = (34385, 16, 4, 4, ("multiproof", "batch"))
+    _TAIL_W4_BB = (34385, 16, 4, 4, ("batch", "batch"))
+    _TAIL_W8_MM = (17489, 16, 8, 4, ("multiproof", "multiproof"))
+    _TAIL_W8_MB = (17489, 16, 8, 4, ("multiproof", "batch"))
+    _TAIL_W8_BB = (17489, 16, 8, 4, ("batch", "batch"))
+
+    def test_real_cost_tradeoff_frontier_shape(self):
+        frontier = merkle_verify_mode_frontier(16, _GROUPS, _BUDGETS)
+        tails = [_tail(mode_cost) for mode_cost in frontier]
+        self.assertEqual(
+            tails,
+            [
+                self._TAIL_W4_MM,
+                self._TAIL_W4_MB,
+                self._TAIL_W4_BB,
+                self._TAIL_W8_MM,
+                self._TAIL_W8_MB,
+                self._TAIL_W8_BB,
+            ],
+        )
+        columns = list(zip(*(_metrics(mode_cost) for mode_cost in frontier)))
+        # every one of the five weighted costs actually varies on this
+        # frontier, so single-dimension weights meet a real minimum
+        self.assertTrue(all(min(column) < max(column) for column in columns))
+        # the cheapest transport plan is the most expensive hashes plan and
+        # vice versa: no member dominates on the weighted dimensions
+        cheapest_transport = min(frontier, key=lambda mc: _metrics(mc)[0])
+        cheapest_hashes = min(frontier, key=lambda mc: _metrics(mc)[2])
+        self.assertNotEqual(cheapest_transport, cheapest_hashes)
+        self.assertEqual(_tail(cheapest_transport), self._TAIL_W8_MM)
+        self.assertEqual(_tail(cheapest_hashes), self._TAIL_W4_MM)
+
+    def test_single_positive_weight_picks_that_dimensions_minimum(self):
+        # one lit dimension on a trade-off frontier: winner, raw minimum and
+        # tail tie-break are all pinned rather than inferred from the sibling
+        # entry point
+        pinned = (
+            (0, self._TAIL_W8_MM),  # total transport 4768
+            (1, self._TAIL_W8_MM),  # single-group peak 2419
+            (2, self._TAIL_W4_MM),  # verifier hashes 4034
+            (3, self._TAIL_W8_BB),  # nodes 0, tie broken by checkpoint bytes
+            (4, self._TAIL_W4_BB),  # steps 1005, tie broken by modes tuple
+        )
+        frontier = merkle_verify_mode_frontier(16, _GROUPS, _BUDGETS)
+        for dimension, expected_tail in pinned:
+            weights = tuple(
+                1 if index == dimension else 0 for index in range(5)
+            )
+            with self.subTest(dimension=dimension):
+                result = recommend_merkle_verify_mode_deployment_weighted(
+                    16, _GROUPS, _BUDGETS, weights
+                )
+                values = _metrics(result)
+                column = [
+                    _metrics(mode_cost)[dimension] for mode_cost in frontier
+                ]
+                self.assertEqual(values[dimension], min(column))
+                self.assertEqual(_tail(result), expected_tail)
+
+    def test_equal_weights_picks_exact_pinned_plan_and_score(self):
+        # independent exact-Fraction recomputation pins the actual winner,
+        # not just consistency with the explaining entry point
+        result = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, _BUDGETS, (1, 1, 1, 1, 1)
+        )
+        self.assertEqual(_tail(result), self._TAIL_W4_BB)
+        frontier = merkle_verify_mode_frontier(16, _GROUPS, _BUDGETS)
+        rows = [_metrics(mode_cost) for mode_cost in frontier]
+        spans = tuple(
+            (min(row[i] for row in rows), max(row[i] for row in rows))
+            for i in range(5)
+        )
+
+        def exact_score(mode_cost):
+            score = Fraction(0)
+            for value, (low, high) in zip(_metrics(mode_cost), spans):
+                if high > low:
+                    score += Fraction(value - low, high - low)
+            return score / 5
+
+        winner_score = exact_score(result)
+        self.assertEqual(winner_score, Fraction(10223, 25555))
+        for mode_cost in frontier:
+            if mode_cost != result:
+                self.assertLess(winner_score, exact_score(mode_cost))
+
+    def test_score_ties_are_broken_by_the_documented_tail(self):
+        # nodes-only: both all-batch plans carry zero nodes and tie at score
+        # 0; the smaller checkpoint bytes (w=8) must win
+        nodes_result = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, _BUDGETS, (0, 0, 0, 1, 0)
+        )
+        self.assertEqual(_tail(nodes_result), self._TAIL_W8_BB)
+        # steps-only: the three w=4 plans share the 1005-step minimum and
+        # tie at score 0; checkpoint/leaf/w/height are equal, so the modes
+        # tuple lexicographic order picks ("batch", "batch")
+        steps_result = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, _BUDGETS, (0, 0, 0, 0, 1)
+        )
+        self.assertEqual(_tail(steps_result), self._TAIL_W4_BB)
+
+    def test_partial_zero_span_dimension_is_ignored(self):
+        # the hashes budget leaves only the three w=4 members, whose steps
+        # column is constant; the steps normalised cost is therefore zero
+        # for every row and a steps-only weight falls through to the tail
+        budgets = (None, 5000, 12000, None, 8, 5000)
+        frontier = merkle_verify_mode_frontier(16, _GROUPS, budgets)
+        self.assertEqual(len(frontier), 3)
+        steps_values = {_metrics(mode_cost)[4] for mode_cost in frontier}
+        self.assertEqual(steps_values, {1005})
+        result = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, budgets, (0, 0, 0, 0, 1)
+        )
+        self.assertEqual(_tail(result), self._TAIL_W4_BB)
+
+    def test_budget_boundaries_are_inclusive_and_exclusive(self):
+        # aggregate-transport boundary: exactly 4768 admits one plan, 4767
+        # admits nothing
+        result = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, (None, None, 4768, None, None, None), (1, 1, 1, 1, 1)
+        )
+        self.assertEqual(_tail(result), self._TAIL_W8_MM)
+        self.assertEqual(result.plan.total, 4768)
+        with self.assertRaises(ValueError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, _GROUPS, (None, None, 4767, None, None, None),
+                (1, 1, 1, 1, 1),
+            )
+        # checkpoint boundary: 17489 admits the three w=8 plans, 17488 none
+        boundary = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, (17489, None, None, None, None, None), (1, 1, 1, 1, 1)
+        )
+        self.assertEqual(_tail(boundary), self._TAIL_W8_MM)
+        with self.assertRaises(ValueError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, _GROUPS, (17488, None, None, None, None, None),
+                (1, 1, 1, 1, 1),
+            )
+        # verifier-hashes boundary: 4034 admits one w=4 plan, 4033 none
+        hashes_result = recommend_merkle_verify_mode_deployment_weighted(
+            16, _GROUPS, (None, None, None, None, None, 4034),
+            (1, 1, 1, 1, 1),
+        )
+        self.assertEqual(_tail(hashes_result), self._TAIL_W4_MM)
+        with self.assertRaises(ValueError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, _GROUPS, (None, None, None, None, None, 4033),
+                (1, 1, 1, 1, 1),
+            )
+
+    def test_multiple_invalid_arguments_keep_baseline_precedence(self):
+        valid_groups = _GROUPS
+        # groups type is screened before capacity, budgets and weights
+        with self.assertRaises(TypeError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                0, [valid_groups], "bad", 7
+            )
+        # capacity before budgets, even with a non-tuple budgets/weights
+        with self.assertRaises(ValueError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                0, valid_groups, "bad", 7
+            )
+        # budgets type before weights type
+        with self.assertRaises(TypeError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, valid_groups, "bad", 7
+            )
+        # an infeasible frontier raises before a non-tuple weights is seen
+        with self.assertRaises(ValueError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, valid_groups, (100, None, None, None, None, None), 7
+            )
+        # an illegal leaf index is a frontier ValueError screened before
+        # the wrong-length weights ValueError
+        with self.assertRaises(ValueError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, ((0, 0),), _BUDGETS, ()
+            )
+        # once the frontier is feasible, the weights TypeError surfaces
+        with self.assertRaises(TypeError):
+            recommend_merkle_verify_mode_deployment_weighted(
+                16, valid_groups, _BUDGETS, 7
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

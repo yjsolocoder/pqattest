@@ -24,6 +24,9 @@ function bind a proof to the receiver's expected public key and,
 optionally, an explicit leaf-index selection), multiproof_select to
 re-emit a chosen leaf subset of a verified multiproof as a fresh
 standalone v1 multiproof from the proof, its messages and the expected
+public key alone, and multiproof_merge to combine the leaf sets of
+several verified multiproofs into one fresh standalone v1 multiproof
+from the source proofs, their per-proof message tuples and the expected
 public key alone, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
@@ -321,6 +324,7 @@ from .merkle import (
     MerkleSigner,
     merkle_verify,
     multiproof_encode,
+    multiproof_merge,
     multiproof_select,
     multiproof_verify,
     multiproof_verify_bound,
@@ -512,6 +516,7 @@ __all__ = [
     "message_bits",
     "message_digest",
     "multiproof_encode",
+    "multiproof_merge",
     "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",

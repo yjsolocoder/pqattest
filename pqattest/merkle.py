@@ -21,7 +21,10 @@ receiver's expected public key and, optionally, an explicit leaf-index
 selection. :func:`multiproof_select` re-emits a chosen subset of a verified
 multiproof's leaves as a fresh standalone v1 multiproof — using only the
 source proof, its messages and the expected public key, with no access to
-the original signatures or any private key. Signer
+the original signatures or any private key. :func:`multiproof_merge` is
+the union counterpart: it combines the leaf sets of several verified
+multiproofs into one fresh v1 multiproof from the source proofs, their
+messages and the expected public key alone. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -77,6 +80,7 @@ __all__ = [
     "MerkleSigner",
     "merkle_verify",
     "multiproof_encode",
+    "multiproof_merge",
     "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",
@@ -3026,3 +3030,191 @@ def multiproof_select(
         for index in indices
     )
     return multiproof_encode(public_key, selected)
+
+
+def multiproof_merge(
+    message_groups: Any,
+    proofs: Any,
+    *,
+    public_key: Any,
+    context: Any = None,
+) -> bytes:
+    """Merge the leaf sets of several verified multiproofs into one proof.
+
+    Given only source :func:`multiproof_encode` proofs (``proofs``) and, for
+    each proof, every message it proves in that proof's leaf order
+    (``message_groups``), re-emit the union of their leaves as a fresh v1
+    multiproof — without access to the original single signatures or any
+    private key. The two positional arguments are non-empty tuples of equal
+    length and correspond item by item; each member of ``message_groups`` is
+    itself a tuple of ``bytes``/``bytearray``/``str`` messages (``str``
+    encoded as UTF-8), ordered exactly as the matching source proof's leaves.
+    The caller verifies the result with the union leaf order's messages, the
+    same public key and the same context via :func:`multiproof_verify` /
+    :func:`multiproof_verify_bound`, and can select subsets of it or feed it
+    into another merge.
+
+    Every source proof is fully authenticated before anything is returned,
+    including duplicate submissions of the same source: each proof must parse
+    under the exact structural rule of :func:`multiproof_verify`, every leaf
+    it carries must verify against its group's message under ``context``, and
+    the embedded public key must equal ``public_key`` value by value (``w``,
+    ``height`` and ``root``); a leaf shared with an earlier proof is never
+    skipped. The result keeps the original public key and W-OTS elements,
+    orders its leaves by their actual tree indices, and deduplicates shared
+    authentication nodes under the existing canonical rule. When the same
+    leaf occurs in more than one source proof, one copy is kept only when the
+    UTF-8 message bytes and every W-OTS element are equal across the
+    occurrences; otherwise ``ValueError`` is raised. Equal messages at
+    different leaves stay distinct. The bytes are identical to sorting the
+    union's original single signatures by index and feeding them to
+    :func:`multiproof_encode`; a single legal source is returned byte for
+    byte, and reordering sources, resubmitting a source or splitting the
+    merge into batches does not change the result.
+
+    ``public_key`` must be a :class:`MerklePublicKey`; ``context`` is
+    keyword-only and optional and follows the usual context rules
+    (``None``/empty means no context, ``str`` encoded as UTF-8). Any type
+    violation — a non-tuple container, a non-tuple message group, a proof
+    member that is not ``bytes``/``bytearray``, a message of another type, a
+    wrong ``public_key`` or ``context`` type — raises ``TypeError``, and type
+    checks precede all content checks. Empty input, unequal group counts, a
+    group whose message count differs from its proof's leaf count, a
+    malformed or non-canonical source encoding, a verification failure, a
+    public-key or context mismatch, an overlapping-leaf conflict, a
+    conflicting authentication node at the same coordinate, or a union that
+    exceeds the existing v1 format limits all raise ``ValueError`` and no
+    partial result is returned. No randomness is drawn, no input or signer
+    state is modified, and no wire-format version is added.
+    """
+    if not isinstance(message_groups, tuple):
+        raise TypeError("message_groups must be a tuple of message tuples")
+    if not isinstance(proofs, tuple):
+        raise TypeError("proofs must be a tuple of multiproof bytes")
+    for messages in message_groups:
+        if not isinstance(messages, tuple):
+            raise TypeError("every message group must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+    for data in proofs:
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("every proof must be bytes or bytearray")
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    context_bytes = _validate_context(context)
+    if not message_groups or not proofs:
+        raise ValueError("message_groups and proofs must not be empty")
+    if len(message_groups) != len(proofs):
+        raise ValueError("message_groups and proofs must have the same length")
+
+    # index -> (message bytes, W-OTS elements, verified leaf hash);
+    # coordinates -> carried canonical nodes from the source proofs
+    leaves: dict[int, tuple[bytes, tuple[bytes, ...], bytes]] = {}
+    nodes: dict[tuple[int, int], bytes] = {}
+    for position, data in enumerate(proofs):
+        messages = message_groups[position]
+        parsed = _multiproof_parse(data)
+        if parsed is None:
+            raise ValueError("a source multiproof is malformed")
+        proof_key, proof_leaves, proof_nodes = parsed
+        if len(messages) != len(proof_leaves):
+            raise ValueError(
+                "every message group must match its proof's leaf count"
+            )
+        if (
+            public_key.w != proof_key.w
+            or public_key.height != proof_key.height
+            or public_key.root != proof_key.root
+        ):
+            raise ValueError(
+                "public_key does not match a proof's embedded public key"
+            )
+        w = proof_key.w
+        height = proof_key.height
+        b, l1, l2 = _params(w)
+        leaf_hashes: dict[int, bytes] = {}
+        for leaf_position, (index, elements) in enumerate(proof_leaves):
+            message_bytes = _as_bytes(messages[leaf_position])
+            digits = _merkle_signing_digits(message_bytes, w, context_bytes)
+            recovered = tuple(
+                _chain_walk(element, b - 1 - digit)
+                for element, digit in zip(elements, digits)
+            )
+            leaf_hash = _leaf_hash(w, recovered)
+            leaf_hashes[index] = leaf_hash
+            previous = leaves.get(index)
+            if previous is not None:
+                previous_message, previous_elements, _ = previous
+                if previous_message != message_bytes:
+                    raise ValueError("conflicting messages at an overlapping leaf")
+                if previous_elements != elements:
+                    raise ValueError(
+                        "conflicting W-OTS signatures at an overlapping leaf"
+                    )
+            else:
+                leaves[index] = (message_bytes, elements, leaf_hash)
+        if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
+            raise ValueError("a source multiproof does not verify")
+        for coordinate, node in proof_nodes.items():
+            previous = nodes.get(coordinate)
+            if previous is not None and previous != node:
+                raise ValueError(
+                    "conflicting authentication nodes at the same coordinate"
+                )
+            nodes[coordinate] = node
+
+    # Recover every tree node the union determines: the verified leaf hashes,
+    # the carried proof nodes, and every internal node whose two children are
+    # both known, using the same level-by-level derivation as
+    # multiproof_select. A carried node at a coordinate another source proves
+    # or derives a different value for is a same-coordinate conflict. Each
+    # source folded to the root, so every sibling of a union leaf is
+    # determinable and the auth-path lookups below always hit consistently.
+    height = public_key.height
+    known: dict[tuple[int, int], bytes] = {}
+    for index, (_, _, leaf_hash) in leaves.items():
+        coordinate = (0, index)
+        carried = nodes.get(coordinate)
+        if carried is not None and carried != leaf_hash:
+            raise ValueError(
+                "conflicting authentication nodes at the same coordinate"
+            )
+        known[coordinate] = leaf_hash
+    for coordinate, node in nodes.items():
+        # A carried level-0 node whose coordinate is a union leaf was already
+        # checked against that leaf's hash above; every other carried node is
+        # an unknown sibling the merged auth paths must take as given.
+        if coordinate not in known:
+            known[coordinate] = node
+    for level in range(height):
+        for (node_level, index), node in list(known.items()):
+            if node_level != level:
+                continue
+            sibling = known.get((level, index ^ 1))
+            if sibling is None:
+                continue
+            if index & 1:
+                parent = _node_hash(sibling, node)
+            else:
+                parent = _node_hash(node, sibling)
+            coordinate = (level + 1, index >> 1)
+            previous = known.get(coordinate)
+            if previous is not None and previous != parent:
+                raise ValueError(
+                    "conflicting authentication nodes at the same coordinate"
+                )
+            known[coordinate] = parent
+
+    indices = sorted(leaves)
+    merged = tuple(
+        MerkleSignature(
+            index=index,
+            wots_signature=leaves[index][1],
+            auth_path=tuple(
+                known[(level, (index >> level) ^ 1)] for level in range(height)
+            ),
+        )
+        for index in indices
+    )
+    return multiproof_encode(public_key, merged)
+

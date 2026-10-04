@@ -18,7 +18,10 @@ public key further into one deterministic proof whose shared authentication
 nodes are deduplicated into a canonical node set;
 :func:`multiproof_verify_bound` additionally binds such a proof to the
 receiver's expected public key and, optionally, an explicit leaf-index
-selection. Signer
+selection. :func:`multiproof_select` re-emits a chosen subset of a verified
+multiproof's leaves as a fresh standalone v1 multiproof — using only the
+source proof, its messages and the expected public key, with no access to
+the original signatures or any private key. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -74,6 +77,7 @@ __all__ = [
     "MerkleSigner",
     "merkle_verify",
     "multiproof_encode",
+    "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",
 ]
@@ -2621,21 +2625,23 @@ def multiproof_encode(public_key: Any, signatures: Any) -> bytes:
     return b"".join(parts)
 
 
-def _multiproof_verify(
-    messages: Any, data: Any, *, context: bytes = b""
-) -> tuple[MerklePublicKey, tuple[int, ...]] | None:
-    """Verify a v1 multiproof, returning the proven key and leaf indices.
+def _multiproof_parse(
+    data: Any,
+) -> tuple[MerklePublicKey, tuple[tuple[int, tuple[bytes, ...]], ...], dict[tuple[int, int], bytes]] | None:
+    """Parse a v1 multiproof into its key, leaf blocks and proof nodes.
 
-    Runs the exact parse-and-verify rule of :func:`multiproof_verify`; on
-    success the embedded public key and the leaf indices (in proof order,
-    strictly increasing) are returned, on any failure ``None``.
-    ``context`` must already be normalised by :func:`_validate_context` and
-    is bound into every per-leaf message digest exactly like
-    :func:`merkle_verify`.
+    Runs the exact structural rule of :func:`multiproof_verify` — magic,
+    version, field widths, key encoding, strictly increasing in-range leaf
+    indices, per-leaf element counts, canonical node coordinates and order,
+    no truncation and no trailing data, and a node set equal to the canonical
+    sibling set of the leaf indices. On success returns ``(public_key,
+    leaves, proof_nodes)`` where ``leaves`` is a tuple of ``(index,
+    wots_signature)`` pairs in proof order and ``proof_nodes`` maps
+    ``(level, index)`` coordinates to their 32-byte hashes; on any structural
+    failure returns ``None``. No message is bound and no hash is checked
+    here — that is :func:`_multiproof_fold`'s part.
     """
     if not isinstance(data, (bytes, bytearray)):
-        return None
-    if not isinstance(messages, tuple):
         return None
     data = bytes(data)
     if len(data) < _MULTIPROOF_HEADER_BYTES:
@@ -2649,8 +2655,6 @@ def _multiproof_verify(
     node_count = int.from_bytes(data[15:17], "big")
     if key_length == 0 or leaf_count == 0:
         return None
-    if len(messages) != leaf_count:
-        return None
     offset = _MULTIPROOF_HEADER_BYTES
     key_end = offset + key_length
     if key_end > len(data):
@@ -2661,11 +2665,10 @@ def _multiproof_verify(
         return None
     w = public_key.w
     height = public_key.height
-    root = public_key.root
     b, l1, l2 = _params(w)
     chains = l1 + l2
 
-    leaves: dict[int, bytes] = {}
+    leaves: list[tuple[int, tuple[bytes, ...]]] = []
     offset = key_end
     previous_index = -1
     for _ in range(leaf_count):
@@ -2687,15 +2690,7 @@ def _multiproof_verify(
             for i in range(element_count)
         )
         offset = end
-        try:
-            digits = _merkle_signing_digits(messages[len(leaves)], w, context)
-        except TypeError:
-            return None
-        recovered = tuple(
-            _chain_walk(element, b - 1 - digit)
-            for element, digit in zip(wots_signature, digits)
-        )
-        leaves[index] = _leaf_hash(w, recovered)
+        leaves.append((index, wots_signature))
 
     proof_nodes: dict[tuple[int, int], bytes] = {}
     previous_coordinate: tuple[int, int] | None = None
@@ -2716,11 +2711,26 @@ def _multiproof_verify(
         proof_nodes[coordinate] = node
     if offset < len(data):
         return None
-    indices = tuple(sorted(leaves))
+    indices = tuple(index for index, _ in leaves)
     if set(proof_nodes) != set(_canonical_multiproof_nodes(indices, height)):
         return None
+    return public_key, tuple(leaves), proof_nodes
 
-    current = dict(leaves)
+
+def _multiproof_fold(
+    leaf_hashes: dict[int, bytes],
+    proof_nodes: dict[tuple[int, int], bytes],
+    height: int,
+    root: bytes,
+) -> bool:
+    """Fold recovered leaf hashes and proof nodes up to the root.
+
+    Merges level by level with the existing internal-node rule, consuming
+    each proof node exactly once, and returns ``True`` only when the merge
+    reaches ``root`` and every carried node was used.
+    """
+    current = dict(leaf_hashes)
+    proof_nodes = dict(proof_nodes)
     for level in range(height):
         parents: dict[int, bytes] = {}
         positions = sorted(current)
@@ -2734,16 +2744,54 @@ def _multiproof_verify(
                 continue
             proof_node = proof_nodes.pop((level, index ^ 1), None)
             if proof_node is None:
-                return None
+                return False
             if index & 1:
                 parents[index >> 1] = _node_hash(proof_node, node)
             else:
                 parents[index >> 1] = _node_hash(node, proof_node)
             i += 1
         current = parents
-    if not (len(current) == 1 and current.get(0) == root and not proof_nodes):
+    return len(current) == 1 and current.get(0) == root and not proof_nodes
+
+
+def _multiproof_verify(
+    messages: Any, data: Any, *, context: bytes = b""
+) -> tuple[MerklePublicKey, tuple[int, ...]] | None:
+    """Verify a v1 multiproof, returning the proven key and leaf indices.
+
+    Runs the exact parse-and-verify rule of :func:`multiproof_verify`; on
+    success the embedded public key and the leaf indices (in proof order,
+    strictly increasing) are returned, on any failure ``None``.
+    ``context`` must already be normalised by :func:`_validate_context` and
+    is bound into every per-leaf message digest exactly like
+    :func:`merkle_verify`.
+    """
+    if not isinstance(messages, tuple):
         return None
-    return public_key, indices
+    parsed = _multiproof_parse(data)
+    if parsed is None:
+        return None
+    public_key, leaves, proof_nodes = parsed
+    if len(messages) != len(leaves):
+        return None
+    w = public_key.w
+    height = public_key.height
+    root = public_key.root
+    b, l1, l2 = _params(w)
+    leaf_hashes: dict[int, bytes] = {}
+    for position, (index, wots_signature) in enumerate(leaves):
+        try:
+            digits = _merkle_signing_digits(messages[position], w, context)
+        except TypeError:
+            return None
+        recovered = tuple(
+            _chain_walk(element, b - 1 - digit)
+            for element, digit in zip(wots_signature, digits)
+        )
+        leaf_hashes[index] = _leaf_hash(w, recovered)
+    if not _multiproof_fold(leaf_hashes, proof_nodes, height, root):
+        return None
+    return public_key, tuple(index for index, _ in leaves)
 
 
 def multiproof_verify(
@@ -2843,3 +2891,138 @@ def multiproof_verify_bound(
     if any(index < 0 or index >= (1 << proof_key.height) for index in indices):
         return False
     return indices == proof_indices
+
+
+def multiproof_select(
+    messages: Any,
+    data: Any,
+    *,
+    public_key: Any,
+    indices: Any,
+    context: Any = None,
+) -> bytes:
+    """Extract an independent multiproof for a chosen leaf subset.
+
+    Given only a source :func:`multiproof_encode` proof (``data``), every
+    message it proves (``messages``, in the source proof's leaf order) and
+    the expected ``public_key``, re-emit the leaves named by ``indices`` as
+    a fresh v1 multiproof — without access to the original signatures or
+    any private key. ``indices`` names actual tree leaf indices, not
+    positions in ``messages``. The caller verifies the result with the
+    selected leaves' messages, the same public key and the same context via
+    :func:`multiproof_verify` / :func:`multiproof_verify_bound`.
+
+    The whole source proof is authenticated before anything is returned:
+    the proof must parse under the exact structural rule of
+    :func:`multiproof_verify`, every leaf — including the ones being
+    dropped — must verify against its message under ``context``, and the
+    embedded public key must equal ``public_key`` value by value (``w``,
+    ``height`` and ``root``). A corrupted dropped leaf's message or
+    signature therefore fails the call instead of being silently discarded.
+
+    ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple
+    whose members each follow the usual message rules
+    (``bytes``/``bytearray``/``str``); ``public_key`` must be a
+    :class:`MerklePublicKey`; ``indices`` must be a tuple of integers.
+    ``context`` is keyword-only and optional and follows the usual context
+    rules (``None``/empty means no context, ``str`` encoded as UTF-8); it
+    must be the context the source proof was made under. Any of these type
+    violations raises ``TypeError``. A boolean index, an empty selection,
+    duplicate or out-of-order indices, an index not present in the source
+    proof, a message count that differs from the proof's leaf count, a
+    structurally malformed source proof, a verification failure, and a
+    public-key or context mismatch all raise ``ValueError`` and no partial
+    result is returned.
+
+    The result uses the existing v1 format unchanged: it keeps the original
+    public key, leaf indices and W-OTS elements, and its authentication
+    nodes follow the existing canonical ordering and deduplication rule, so
+    the bytes are identical to feeding the selected original signatures to
+    :func:`multiproof_encode`. Selecting every leaf reproduces the source
+    bytes exactly; selecting from a proof that itself covers every leaf, or
+    selecting twice in a row, behaves like selecting the final leaf set
+    directly. Duplicate messages are treated as distinct leaf positions and
+    are never merged. No randomness is drawn and no input or signer state
+    is modified.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("multiproof data must be bytes or bytearray")
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    for message in messages:
+        _as_bytes(message)
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of integers")
+    for index in indices:
+        if not isinstance(index, int):
+            raise TypeError("every index must be an integer")
+    context_bytes = _validate_context(context)
+    if not indices:
+        raise ValueError("indices must not be empty")
+    if any(isinstance(index, bool) for index in indices):
+        raise ValueError("every index must be a non-boolean integer")
+    if any(former >= latter for former, latter in zip(indices, indices[1:])):
+        raise ValueError("indices must be strictly increasing and unique")
+    parsed = _multiproof_parse(data)
+    if parsed is None:
+        raise ValueError("the source multiproof is malformed")
+    proof_key, leaves, proof_nodes = parsed
+    if len(messages) != len(leaves):
+        raise ValueError("messages and proof leaves must have the same length")
+    if (
+        public_key.w != proof_key.w
+        or public_key.height != proof_key.height
+        or public_key.root != proof_key.root
+    ):
+        raise ValueError("public_key does not match the proof's embedded public key")
+    w = proof_key.w
+    height = proof_key.height
+    b, l1, l2 = _params(w)
+    leaf_hashes: dict[int, bytes] = {}
+    for position, (index, wots_signature) in enumerate(leaves):
+        digits = _merkle_signing_digits(messages[position], w, context_bytes)
+        recovered = tuple(
+            _chain_walk(element, b - 1 - digit)
+            for element, digit in zip(wots_signature, digits)
+        )
+        leaf_hashes[index] = _leaf_hash(w, recovered)
+    if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
+        raise ValueError("the source multiproof does not verify")
+    leaf_indices = {index for index, _ in leaves}
+    if any(index not in leaf_indices for index in indices):
+        raise ValueError("every selected index must be present in the source proof")
+
+    # Recover every tree node the proof determines: the verified leaf
+    # hashes, the carried proof nodes, and every internal node whose two
+    # children are both known. A selected leaf's ancestor at each level is
+    # computed by exactly the fold above, and its sibling is either another
+    # known node or a carried proof node, so the lookup below always hits.
+    known: dict[tuple[int, int], bytes] = dict(proof_nodes)
+    for index, leaf_hash in leaf_hashes.items():
+        known[(0, index)] = leaf_hash
+    for level in range(height):
+        for (node_level, index), node in list(known.items()):
+            if node_level != level:
+                continue
+            sibling = known.get((level, index ^ 1))
+            if sibling is None:
+                continue
+            if index & 1:
+                known[(level + 1, index >> 1)] = _node_hash(sibling, node)
+            else:
+                known[(level + 1, index >> 1)] = _node_hash(node, sibling)
+
+    elements_by_index = {index: elements for index, elements in leaves}
+    selected = tuple(
+        MerkleSignature(
+            index=index,
+            wots_signature=elements_by_index[index],
+            auth_path=tuple(
+                known[(level, (index >> level) ^ 1)] for level in range(height)
+            ),
+        )
+        for index in indices
+    )
+    return multiproof_encode(public_key, selected)

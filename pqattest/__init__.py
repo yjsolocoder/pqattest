@@ -21,7 +21,10 @@ MerklePublicKey / MerkleSignature / MerkleProof / MerkleBatchProof /
 merkle_verify / multiproof_encode / multiproof_verify /
 multiproof_verify_bound (the two proof classes' verify_bound and this
 function bind a proof to the receiver's expected public key and,
-optionally, an explicit leaf-index selection), static
+optionally, an explicit leaf-index selection) / multiproof_select
+(extract an independent multiproof for a strictly increasing selection
+of an already verified source multiproof's leaves, from the source
+bytes, messages, expected key and context alone), static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
 recommend_scheme_weighted to rank that cross-scheme frontier by a
@@ -318,6 +321,7 @@ from .merkle import (
     MerkleSigner,
     merkle_verify,
     multiproof_encode,
+    multiproof_select,
     multiproof_verify,
     multiproof_verify_bound,
 )
@@ -508,6 +512,7 @@ __all__ = [
     "message_bits",
     "message_digest",
     "multiproof_encode",
+    "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",
     "ots_pair_checkpoint",

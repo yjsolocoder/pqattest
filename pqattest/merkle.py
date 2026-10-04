@@ -24,6 +24,10 @@ source proof, its messages and the expected public key, with no access to
 the original signatures or any private key. :func:`multiproof_merge` is
 the union counterpart: it combines the leaf sets of several verified
 multiproofs into one fresh v1 multiproof from the source proofs, their
+messages and the expected public key alone. :func:`multiproof_expand` is
+the inverse of :func:`multiproof_encode`: it restores a verified
+multiproof to an ordinary :class:`MerkleBatchProof` of standalone
+:class:`MerkleSignature` values, again from the source proof, its
 messages and the expected public key alone. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
@@ -80,6 +84,7 @@ __all__ = [
     "MerkleSigner",
     "merkle_verify",
     "multiproof_encode",
+    "multiproof_expand",
     "multiproof_merge",
     "multiproof_select",
     "multiproof_verify",
@@ -3217,4 +3222,127 @@ def multiproof_merge(
         for index in indices
     )
     return multiproof_encode(public_key, merged)
+
+
+def multiproof_expand(
+    messages: Any,
+    data: Any,
+    *,
+    public_key: Any,
+    context: Any = None,
+) -> MerkleBatchProof:
+    """Restore a verified multiproof to an ordinary :class:`MerkleBatchProof`.
+
+    Given only a source :func:`multiproof_encode` proof (``data``), every
+    message it proves (``messages``, in the source proof's leaf order) and
+    the expected ``public_key``, rebuild the pre-compression standalone
+    :class:`MerkleSignature` values — one per leaf, each with its complete
+    authentication path — and return them as a :class:`MerkleBatchProof`,
+    without access to the original signatures, any private key or the
+    signer. The result keeps the source public key, the strictly increasing
+    actual leaf indices and each leaf's original W-OTS elements, so every
+    rebuilt signature is value-for-value equal to the signature that was
+    compressed and the batch serialisation is byte-for-byte the same as
+    directly wrapping those original signatures. Feeding the result's
+    public key and signatures back to :func:`multiproof_encode` reproduces
+    the source bytes exactly. Each rebuilt signature can also be verified
+    on its own with :func:`merkle_verify` or wrapped in a
+    :class:`MerkleProof`, and the whole batch passes
+    :meth:`MerkleBatchProof.verify`.
+
+    The whole source proof is authenticated before anything is returned:
+    it must parse under the exact structural rule of
+    :func:`multiproof_verify` (magic, version, lengths, counts, indices
+    and canonical authentication nodes, no truncation or trailing data),
+    every leaf must verify against its message under ``context`` with the
+    root recomputed through the existing fold rule, and the embedded
+    public key must equal ``public_key`` value by value (``w``, ``height``
+    and ``root``). A failure on any leaf — including an authentication
+    node that only the root check can expose — raises ``ValueError`` and
+    no partial result is returned.
+
+    ``data`` must be ``bytes`` or ``bytearray``; ``messages`` must be a
+    tuple whose members each follow the usual message rules
+    (``bytes``/``bytearray``/``str``); ``public_key`` must be a
+    :class:`MerklePublicKey`; ``context`` is keyword-only and must be
+    ``None`` or one of the usual message types (``None``/empty means no
+    context, a ``str`` is encoded as UTF-8), exactly like
+    :func:`multiproof_verify`. Any of these type violations raises
+    ``TypeError`` and type checks precede all content checks. An empty
+    message tuple, a message count that differs from the proof's leaf
+    count, a wrong or unbound message or context, a public-key mismatch,
+    a malformed or non-canonical source encoding, or a proof that does not
+    reach the expected root all raise ``ValueError``. The returned object
+    never references the caller's mutable byte buffers, no input is
+    modified, no randomness is drawn, no signing state is touched and no
+    wire format or version is added.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("multiproof data must be bytes or bytearray")
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    for message in messages:
+        _as_bytes(message)
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    context_bytes = _validate_context(context)
+    if not messages:
+        raise ValueError("messages must not be empty")
+    parsed = _multiproof_parse(data)
+    if parsed is None:
+        raise ValueError("the source multiproof is malformed")
+    proof_key, leaves, proof_nodes = parsed
+    if len(messages) != len(leaves):
+        raise ValueError("messages and proof leaves must have the same length")
+    if (
+        public_key.w != proof_key.w
+        or public_key.height != proof_key.height
+        or public_key.root != proof_key.root
+    ):
+        raise ValueError("public_key does not match the proof's embedded public key")
+    w = proof_key.w
+    height = proof_key.height
+    b, l1, l2 = _params(w)
+    leaf_hashes: dict[int, bytes] = {}
+    for position, (index, wots_signature) in enumerate(leaves):
+        digits = _merkle_signing_digits(messages[position], w, context_bytes)
+        recovered = tuple(
+            _chain_walk(element, b - 1 - digit)
+            for element, digit in zip(wots_signature, digits)
+        )
+        leaf_hashes[index] = _leaf_hash(w, recovered)
+    if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
+        raise ValueError("the source multiproof does not verify")
+
+    # Recover every tree node the proof determines: the verified leaf
+    # hashes, the carried proof nodes, and every internal node whose two
+    # children are both known. Each leaf folded to the root above, so the
+    # sibling of every leaf at each level is either another known node or
+    # a carried proof node, and the auth-path lookups below always hit.
+    known: dict[tuple[int, int], bytes] = dict(proof_nodes)
+    for index, leaf_hash in leaf_hashes.items():
+        known[(0, index)] = leaf_hash
+    for level in range(height):
+        for (node_level, index), node in list(known.items()):
+            if node_level != level:
+                continue
+            sibling = known.get((level, index ^ 1))
+            if sibling is None:
+                continue
+            if index & 1:
+                known[(level + 1, index >> 1)] = _node_hash(sibling, node)
+            else:
+                known[(level + 1, index >> 1)] = _node_hash(node, sibling)
+
+    signatures = tuple(
+        MerkleSignature(
+            index=index,
+            wots_signature=elements,
+            auth_path=tuple(
+                known[(level, (index >> level) ^ 1)] for level in range(height)
+            ),
+        )
+        for index, elements in leaves
+    )
+    return MerkleBatchProof(public_key=proof_key, signatures=signatures)
 

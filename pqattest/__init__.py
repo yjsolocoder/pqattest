@@ -27,7 +27,10 @@ standalone v1 multiproof from the proof, its messages and the expected
 public key alone, and multiproof_merge to combine the leaf sets of
 several verified multiproofs into one fresh standalone v1 multiproof
 from the source proofs, their per-proof message tuples and the expected
-public key alone, static
+public key alone, and multiproof_expand to restore a verified multiproof
+to an ordinary MerkleBatchProof of full signatures — each carrying its
+complete authentication path — from the proof, its messages and the
+expected public key alone, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
 recommend_scheme_weighted to rank that cross-scheme frontier by a
@@ -324,6 +327,7 @@ from .merkle import (
     MerkleSigner,
     merkle_verify,
     multiproof_encode,
+    multiproof_expand,
     multiproof_merge,
     multiproof_select,
     multiproof_verify,
@@ -516,6 +520,7 @@ __all__ = [
     "message_bits",
     "message_digest",
     "multiproof_encode",
+    "multiproof_expand",
     "multiproof_merge",
     "multiproof_select",
     "multiproof_verify",

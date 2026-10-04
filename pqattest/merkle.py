@@ -47,14 +47,18 @@ hashed exactly as the unbound baseline and existing v1 serialised bytes
 verify unchanged; when given, the same ``bytes``/``bytearray``/``str``
 (UTF-8 encoded) context must be supplied to both sides or verification
 fails. The batch entries — :meth:`MerkleSigner.sign_batch`,
-:meth:`MerkleSigner.sign_batch_with_checkpoint`,
+:meth:`MerkleSigner.sign_batch_with_checkpoint`, the explicit-selection
+entries :meth:`MerkleSigner.sign_selected`,
+:meth:`MerkleSigner.sign_selected_with_checkpoint` and
+:meth:`MerkleSigner.sign_selected_with_auth_state`,
 :meth:`MerkleBatchProof.verify`, :meth:`MerkleBatchProof.verify_bound`,
 :func:`multiproof_verify` and :func:`multiproof_verify_bound` —
 additionally accept a keyword-only ``contexts`` tuple that binds a
-separate context to each message positionally (``None``/empty members
-mean no context for that position); it cannot be combined with a
-non-empty shared ``context`` and is never written into any proof or
-checkpoint encoding.
+separate context to each message positionally (for the selection entries,
+to each chosen leaf at its tuple position; ``None``/empty members mean no
+context for that position); it cannot be combined with a non-empty shared
+``context`` and is never written into any proof, checkpoint or envelope
+encoding.
 """
 
 from __future__ import annotations
@@ -1584,7 +1588,9 @@ class MerkleSigner:
             return tuple(signatures)
 
     @staticmethod
-    def _validate_selected(indices: Any, messages: Any, context: Any) -> bytes:
+    def _validate_selected(
+        indices: Any, messages: Any, context: Any, contexts: Any = None
+    ) -> tuple[bytes, tuple[bytes, ...] | None]:
         """Validate an explicit leaf selection before the signing lock.
 
         Shared by :meth:`sign_selected`,
@@ -1593,15 +1599,20 @@ class MerkleSigner:
         constraints (what may be signed, in which order errors are raised,
         and that nothing is consumed before every check passes) live in
         exactly one place. Runs entirely outside the lock and never touches
-        state: it first normalises ``context`` (raising ``TypeError`` for an
-        unsupported context type), then enforces the selection's types and
-        structure in the fixed order containers, member types, emptiness,
-        equal length, non-boolean indices, strictly increasing indices —
-        returning the normalised context bytes on success. Exhaustion and
-        the index range are checked afterwards, inside the lock, by
-        :meth:`_sign_selected_locked`.
+        state. It first normalises ``context`` and ``contexts`` (raising
+        ``TypeError`` for an unsupported context type), then enforces the
+        selection's types and structure in the fixed order containers,
+        member types, emptiness, equal length (the per-message ``contexts``
+        tuple included), non-boolean indices, strictly increasing indices,
+        and finally the shared/per-context conflict — returning
+        ``(context_bytes, contexts_tuple)`` on success, where
+        ``contexts_tuple`` is ``None`` in legacy shared-``context`` mode and
+        otherwise holds one normalised context per selected position.
+        Exhaustion and the index range are checked afterwards, inside the
+        lock, by :meth:`_sign_selected_locked`.
         """
         context_bytes = _validate_context(context)
+        contexts_tuple = _validate_contexts(contexts)
         if not isinstance(indices, tuple):
             raise TypeError("indices must be a tuple of integers")
         if not isinstance(messages, tuple):
@@ -1615,13 +1626,19 @@ class MerkleSigner:
             raise ValueError("indices must not be empty")
         if len(indices) != len(messages):
             raise ValueError("indices and messages must have the same length")
+        if contexts_tuple is not None and len(contexts_tuple) != len(messages):
+            raise ValueError("contexts and messages must have the same length")
         if any(isinstance(index, bool) for index in indices):
             raise ValueError("every index must be a non-boolean integer")
         if any(
             former >= latter for former, latter in zip(indices, indices[1:])
         ):
             raise ValueError("indices must be strictly increasing and unique")
-        return context_bytes
+        if contexts_tuple is not None and context_bytes:
+            raise ValueError(
+                "contexts cannot be combined with a non-empty context"
+            )
+        return context_bytes, contexts_tuple
 
     def _sign_selected_locked(
         self,
@@ -1629,6 +1646,7 @@ class MerkleSigner:
         messages: tuple[Any, ...],
         context_bytes: bytes,
         pack: Callable[[int], Any] | None = None,
+        contexts_tuple: tuple[bytes, ...] | None = None,
     ) -> tuple[tuple[MerkleSignature, ...], Any]:
         """Validate the range, sign the selection and advance exactly once.
 
@@ -1639,7 +1657,9 @@ class MerkleSigner:
         structurally valid request on an exhausted signer raises
         :class:`KeyExhaustedError` while a not-yet-exhausted signer raises
         ``ValueError`` for an index below ``next_index`` or past the last
-        leaf. Every signature is produced first; when ``pack`` is given it
+        leaf. Every signature is produced first, each message bound to the
+        context at its tuple position when ``contexts_tuple`` is given and
+        otherwise to the shared ``context_bytes``; when ``pack`` is given it
         builds the state artifact (a candidate checkpoint, or an envelope
         over one) at the candidate next index, and any exception it raises
         propagates untouched with nothing committed — only once it returns
@@ -1658,9 +1678,17 @@ class MerkleSigner:
                 "every index must be between the current next leaf and "
                 "the last leaf"
             )
+
+        def selected_context(position: int) -> bytes:
+            return (
+                contexts_tuple[position]
+                if contexts_tuple is not None
+                else context_bytes
+            )
+
         signatures = tuple(
-            self._signature_at(index, message, context_bytes)
-            for index, message in zip(indices, messages)
+            self._signature_at(index, message, selected_context(position))
+            for position, (index, message) in enumerate(zip(indices, messages))
         )
         new_next_index = indices[-1] + 1
         # Build the state output before advancing: any failure must consume
@@ -1671,7 +1699,12 @@ class MerkleSigner:
         return signatures, artifact
 
     def sign_selected(
-        self, indices: Any, messages: Any, *, context: Any = None
+        self,
+        indices: Any,
+        messages: Any,
+        *,
+        context: Any = None,
+        contexts: Any = None,
     ) -> tuple[MerkleSignature, ...]:
         """Sign one message per explicitly chosen leaf, voiding the gaps.
 
@@ -1689,11 +1722,14 @@ class MerkleSigner:
         structure, then exhaustion, then the index range:
 
         * a non-tuple ``indices`` or ``messages``, an index member that is not
-          an integer, or an unsupported message member type raises
-          ``TypeError`` (a ``bool`` is an ``int`` subclass, so it survives this
-          bullet and is rejected by the structural one below);
-        * an empty tuple on either side, a length mismatch, a boolean index,
-          a duplicate or non-increasing index raises ``ValueError``;
+          an integer, an unsupported message member type, a non-tuple
+          ``contexts`` or an unsupported context member raises ``TypeError``
+          (a ``bool`` is an ``int`` subclass, so it survives this bullet and
+          is rejected by the structural one below);
+        * an empty tuple on either side, a length mismatch between indices,
+          messages and ``contexts``, a boolean index, a duplicate or
+          non-increasing index, or a non-empty shared ``context`` combined
+          with ``contexts`` raises ``ValueError``;
         * on an exhausted signer (no leaf left to spend) the call raises
           :class:`KeyExhaustedError`;
         * an index below the current ``next_index`` or past the last leaf
@@ -1702,8 +1738,26 @@ class MerkleSigner:
         ``context`` is keyword-only and optional and follows the usual
         context rules (``None``/empty means no context, ``str`` encoded as
         UTF-8); the same context is bound into every selected message digest
-        and the verifier must pass it unchanged. Only once every check
-        passes does the method enter the signing lock
+        and the verifier must pass it unchanged.
+
+        ``contexts`` is keyword-only and optional and binds a separate
+        context per chosen leaf: ``None`` (the default) keeps the
+        shared-``context`` behaviour above, while a tuple applies its members
+        positionally to ``(indices, messages)`` — each member is ``None``,
+        ``bytes``, ``bytearray`` or ``str`` (a ``str`` encoded as UTF-8,
+        ``None`` and empty values meaning "no context" for that leaf) — so
+        the same message chosen on different leaves may carry different
+        contexts, and the result is value-for-value identical to advancing
+        from the same starting state to each chosen leaf in turn and signing
+        each message with its own context. Every signature verifies on its
+        own through the existing single-signature entries with the matching
+        context; a wrong or missing context makes verification return
+        ``False``, and the batch proof or multiproof assembled afterwards
+        verifies through the existing ``contexts`` verification entries.
+        Contexts enter the message digests only — they are never written
+        into any state, checkpoint, envelope or proof encoding.
+
+        Only once every check passes does the method enter the signing lock
         and produce, in tuple order, one signature per chosen leaf, committing
         the advance exactly once. The whole call shares the same lock as
         :meth:`sign`, :meth:`sign_batch`, :meth:`advance_to` and
@@ -1712,20 +1766,27 @@ class MerkleSigner:
         call consumes no leaf and returns no partial result. When the chosen
         indices are exactly consecutive from ``next_index``, the result is
         value-for-value identical to :meth:`sign_batch` on the same messages
-        from the same state; every signature verifies under the long-term
-        public key, and ``multiproof_encode``/``multiproof_verify`` bind a
-        deduplicated proof for the batch to exactly these leaves. No
-        randomness is drawn.
+        (with the same ``contexts``) from the same state; every signature
+        verifies under the long-term public key, and
+        ``multiproof_encode``/``multiproof_verify`` bind a deduplicated proof
+        for the batch to exactly these leaves. No randomness is drawn.
         """
-        context_bytes = self._validate_selected(indices, messages, context)
+        context_bytes, contexts_tuple = self._validate_selected(
+            indices, messages, context, contexts
+        )
         with self._lock:
             signatures, _ = self._sign_selected_locked(
-                indices, messages, context_bytes
+                indices, messages, context_bytes, contexts_tuple=contexts_tuple
             )
             return signatures
 
     def sign_selected_with_checkpoint(
-        self, indices: Any, messages: Any, *, context: Any = None
+        self,
+        indices: Any,
+        messages: Any,
+        *,
+        context: Any = None,
+        contexts: Any = None,
     ) -> tuple[tuple[MerkleSignature, ...], bytes]:
         """Sign an explicit leaf set and snapshot the advanced state atomically.
 
@@ -1734,6 +1795,18 @@ class MerkleSigner:
         ``bytes``/``bytearray``/``str`` (``str`` encoded as UTF-8) is bound
         into every selected message digest, and the same context must be
         passed unchanged to the matching verification entry.
+
+        ``contexts`` is keyword-only and optional and binds a separate
+        context per chosen leaf, exactly as in :meth:`sign_selected`:
+        ``None`` (the default) keeps the shared-``context`` behaviour, while
+        a tuple applies its members positionally (``None``/empty means no
+        context for that leaf, a ``str`` is encoded as UTF-8), so duplicate
+        messages on different leaves may carry different contexts and the
+        result is value-for-value identical to advancing from the same
+        starting state and single-signing each chosen leaf with its own
+        context. The contexts are bound into the message digests only — they
+        are not written into the returned checkpoint, which is byte-identical
+        to the checkpoint of the same advanced state without contexts.
 
         Combines :meth:`sign_selected` and :meth:`checkpoint` in one atomic
         call. Returns ``(signatures, checkpoint)``: ``signatures`` is a tuple
@@ -1749,15 +1822,17 @@ class MerkleSigner:
         signatures still go straight into :func:`multiproof_encode` for a
         deduplicated multi-proof.
 
-        ``indices`` and ``messages`` follow exactly the rules of
-        :meth:`sign_selected`, validated in the same fixed order — first the
-        types and structure, then exhaustion, then the index range:
+        ``indices``, ``messages`` and ``contexts`` follow exactly the rules
+        of :meth:`sign_selected`, validated in the same fixed order — first
+        the types and structure, then exhaustion, then the index range:
 
-        * a non-tuple ``indices`` or ``messages``, an index member that is not
-          an integer, or an unsupported message member type raises
-          ``TypeError``;
-        * an empty tuple on either side, a length mismatch, a boolean index,
-          a duplicate or non-increasing index raises ``ValueError``;
+        * a non-tuple ``indices`` or ``messages``, an index member that is
+          not an integer, an unsupported message or context member type, or a
+          non-tuple ``contexts`` raises ``TypeError``;
+        * an empty tuple on either side, a length mismatch between indices,
+          messages and ``contexts``, a boolean index, a duplicate or
+          non-increasing index, or a non-empty shared ``context`` combined
+          with ``contexts`` raises ``ValueError``;
         * on an exhausted signer (no leaf left to spend) the call raises
           :class:`KeyExhaustedError`;
         * an index below the current ``next_index`` or past the last leaf
@@ -1776,7 +1851,9 @@ class MerkleSigner:
         durable storage and rollback protection remain the caller's
         responsibility.
         """
-        context_bytes = self._validate_selected(indices, messages, context)
+        context_bytes, contexts_tuple = self._validate_selected(
+            indices, messages, context, contexts
+        )
         with self._lock:
             signatures, checkpoint = self._sign_selected_locked(
                 indices,
@@ -1785,6 +1862,7 @@ class MerkleSigner:
                 pack=lambda new_next_index: self._checkpoint_bytes(
                     new_next_index
                 ),
+                contexts_tuple=contexts_tuple,
             )
             return signatures, checkpoint
 
@@ -1796,6 +1874,7 @@ class MerkleSigner:
         key: Any,
         generation: Any,
         context: Any = None,
+        contexts: Any = None,
     ) -> tuple[tuple[MerkleSignature, ...], bytes]:
         """Sign an explicit leaf set and return the advanced state as an envelope.
 
@@ -1804,6 +1883,19 @@ class MerkleSigner:
         ``bytes``/``bytearray``/``str`` (``str`` encoded as UTF-8) is bound
         into every selected message digest, and the same context must be
         passed unchanged to the matching verification entry.
+
+        ``contexts`` is keyword-only and optional and binds a separate
+        context per chosen leaf, exactly as in :meth:`sign_selected`:
+        ``None`` (the default) keeps the shared-``context`` behaviour, while
+        a tuple applies its members positionally (``None``/empty means no
+        context for that leaf, a ``str`` is encoded as UTF-8), so duplicate
+        messages on different leaves may carry different contexts and the
+        result is value-for-value identical to advancing from the same
+        starting state and single-signing each chosen leaf with its own
+        context. The contexts are bound into the message digests only — they
+        are not written into the checkpoint wrapped by the returned envelope,
+        which is byte-for-byte the same envelope as for the same advanced
+        state without contexts.
 
         Behaves like :meth:`sign_selected_with_checkpoint` — the same explicit
         leaf allocation, the same tuple of :class:`MerkleSignature` values and
@@ -1819,19 +1911,23 @@ class MerkleSigner:
         never match a selection against an envelope taken at the wrong point
         under concurrency.
 
-        ``indices`` and ``messages`` follow exactly the rules of
-        :meth:`sign_selected`; ``key`` must be a non-empty
+        ``indices``, ``messages`` and ``contexts`` follow exactly the rules
+        of :meth:`sign_selected`; ``key`` must be a non-empty
         ``bytes``/``bytearray`` shared secret and ``generation`` must be a
         non-boolean integer in ``0 .. 2**64 - 1``. Every input is validated
-        before any state change, in the fixed order types and structure, then
-        ``key``/``generation``, then exhaustion, then the index range:
+        before any state change, in the fixed order types and structure
+        (including the ``contexts`` container, members, length and conflict),
+        then ``key``/``generation``, then exhaustion, then the index range:
 
         * a non-tuple ``indices`` or ``messages``, an index member that is not
-          an integer, an unsupported message member type, or a wrong
-          key/generation type raises ``TypeError``;
-        * an empty tuple on either side, a length mismatch, a boolean index,
-          a duplicate or non-increasing index, an empty key or an
-          out-of-range generation raises ``ValueError``;
+          an integer, an unsupported message or context member type, a
+          non-tuple ``contexts``, or a wrong key/generation type raises
+          ``TypeError``;
+        * an empty tuple on either side, a length mismatch between indices,
+          messages and ``contexts``, a boolean index, a duplicate or
+          non-increasing index, a non-empty shared ``context`` combined with
+          ``contexts``, an empty key or an out-of-range generation raises
+          ``ValueError``;
         * on an exhausted signer (no leaf left to spend) the call raises
           :class:`KeyExhaustedError`;
         * an index below the current ``next_index`` or past the last leaf
@@ -1849,7 +1945,9 @@ class MerkleSigner:
         only; it provides neither encryption nor protection against replay or
         rollback on its own.
         """
-        context_bytes = self._validate_selected(indices, messages, context)
+        context_bytes, contexts_tuple = self._validate_selected(
+            indices, messages, context, contexts
+        )
         # The envelope inputs are checked only after the selection's types
         # and structure, matching the fixed order of the other auth-state
         # entries; exhaustion and the index range follow inside the lock.
@@ -1867,7 +1965,11 @@ class MerkleSigner:
 
         with self._lock:
             signatures, envelope = self._sign_selected_locked(
-                indices, messages, context_bytes, pack=pack
+                indices,
+                messages,
+                context_bytes,
+                pack=pack,
+                contexts_tuple=contexts_tuple,
             )
             return signatures, envelope
 

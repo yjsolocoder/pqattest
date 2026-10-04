@@ -46,7 +46,17 @@ Every signing and verification entry optionally accepts a keyword-only
 hashed exactly as the unbound baseline and existing v1 serialised bytes
 verify unchanged; when given, the same ``bytes``/``bytearray``/``str``
 (UTF-8 encoded) context must be supplied to both sides or verification
-fails.
+fails. The consecutive-batch entries — :meth:`MerkleSigner.sign_batch`,
+:meth:`MerkleSigner.sign_batch_with_checkpoint`,
+:meth:`MerkleBatchProof.verify`, :meth:`MerkleBatchProof.verify_bound`,
+:func:`multiproof_verify` and :func:`multiproof_verify_bound` —
+additionally accept a keyword-only ``contexts`` tuple for per-message
+context binding: ``None`` (the default) keeps the shared-``context``
+behaviour exactly, while a tuple binds one context per message position
+(``None``/empty members mean no context for that message); per-message
+mode is mutually exclusive with a non-empty shared ``context``. Contexts
+are never written into signatures, proofs or checkpoints, and no wire
+format changes.
 """
 
 from __future__ import annotations
@@ -206,6 +216,27 @@ def _merkle_signing_digits(
 ) -> tuple[int, ...]:
     """W-OTS signing digits for ``message`` bound to ``context``."""
     return _signing_digits(_context_message(context, message), w)
+
+
+def _normalize_per_message_contexts(contexts: Any) -> tuple[bytes, ...]:
+    """Normalise a per-message ``contexts`` tuple for the batch APIs.
+
+    Each member follows :func:`_validate_context` (``None``/empty equals the
+    empty context, ``bytes``/``bytearray`` copied to ``bytes`` and a ``str``
+    UTF-8 encoded). A non-tuple container or a member of any other type
+    raises ``TypeError``.
+    """
+    if not isinstance(contexts, tuple):
+        raise TypeError("contexts must be a tuple of contexts")
+    return tuple(_validate_context(item) for item in contexts)
+
+
+def _check_context_conflict(context_bytes: bytes, per_message: Any) -> None:
+    """Reject combining per-message contexts with a non-empty shared context."""
+    if per_message is not None and context_bytes:
+        raise ValueError(
+            "per-message contexts cannot be combined with a non-empty context"
+        )
 
 
 def _leaf_hash(w: int, elements: tuple[bytes, ...]) -> bytes:
@@ -779,7 +810,9 @@ class MerkleBatchProof:
             raise ValueError("trailing data after the batch proof encoding")
         return cls(public_key=public_key, signatures=tuple(signatures))
 
-    def verify(self, messages: Any, *, context: Any = None) -> bool:
+    def verify(
+        self, messages: Any, *, context: Any = None, contexts: Any = None
+    ) -> bool:
         """Verify every embedded signature against the embedded public key.
 
         ``messages`` must be a ``tuple`` of the same length as
@@ -796,17 +829,49 @@ class MerkleBatchProof:
         as UTF-8) must be the one shared by every signed message in the
         batch, in the same order. A context of any other type raises
         ``TypeError``.
+
+        ``contexts`` is keyword-only and optional and selects per-message
+        context binding: ``None`` (the default) keeps the shared-``context``
+        path, while a tuple must have one member per message — provided in
+        the proof's leaf order — and each member (``None``/``bytes``/
+        ``bytearray``/``str``; a ``str`` is UTF-8 encoded, ``None``/empty
+        means no context for that one message) must match the context the
+        corresponding signature was made under. Per-message mode is mutually
+        exclusive with a non-empty shared ``context``. Context types and the
+        shared-context conflict are checked before everything else: a
+        non-tuple ``contexts`` or a member of another type raises
+        ``TypeError`` and combining ``contexts`` with a non-empty
+        ``context`` raises ``ValueError``; a ``contexts`` count different
+        from the message count, like every other mismatch, returns
+        ``False``.
         """
         context_bytes = _validate_context(context)
+        per_message = (
+            _normalize_per_message_contexts(contexts)
+            if contexts is not None
+            else None
+        )
+        _check_context_conflict(context_bytes, per_message)
         if not isinstance(messages, tuple):
+            return False
+        if per_message is not None and len(per_message) != len(messages):
             return False
         if len(messages) != len(self.signatures):
             return False
         return all(
             merkle_verify(
-                message, signature, self.public_key, context=context_bytes
+                message,
+                signature,
+                self.public_key,
+                context=(
+                    per_message[position]
+                    if per_message is not None
+                    else context_bytes
+                ),
             )
-            for message, signature in zip(messages, self.signatures)
+            for position, (message, signature) in enumerate(
+                zip(messages, self.signatures)
+            )
         )
 
     def verify_bound(
@@ -816,6 +881,7 @@ class MerkleBatchProof:
         public_key: Any,
         indices: Any = None,
         context: Any = None,
+        contexts: Any = None,
     ) -> bool:
         """Verify every signature and bind the batch to an expected key/leaves.
 
@@ -833,6 +899,19 @@ class MerkleBatchProof:
         context must be the one shared by every signed message; the wrong
         context makes the bound check return ``False``, and a context of a
         wrong type raises ``TypeError``.
+
+        ``contexts`` is keyword-only and optional and enables per-message
+        context binding exactly as on :meth:`verify`: ``None`` (the default)
+        keeps the shared-``context`` path, while a tuple holds one context
+        per message in the proof's leaf order; each member must match the
+        context of the signature in the same slot, and a mismatch makes the
+        bound check return ``False``. Per-message mode rejects a non-empty
+        shared ``context``. Context types and the conflict are checked
+        first: a non-tuple ``contexts`` or a bad member raises
+        ``TypeError`` and a non-empty shared ``context`` in per-message mode
+        raises ``ValueError``; a ``contexts`` count different from the
+        message count returns ``False``. The expected ``public_key`` and the
+        explicit ``indices`` constraints apply unchanged.
 
         ``public_key`` must be a :class:`MerklePublicKey`; any other type
         raises ``TypeError``. ``indices=None`` imposes no constraint on the
@@ -852,6 +931,12 @@ class MerkleBatchProof:
         if not isinstance(public_key, MerklePublicKey):
             raise TypeError("public_key must be a MerklePublicKey")
         context_bytes = _validate_context(context)
+        per_message = (
+            _normalize_per_message_contexts(contexts)
+            if contexts is not None
+            else None
+        )
+        _check_context_conflict(context_bytes, per_message)
         if indices is not None:
             if not isinstance(indices, tuple):
                 raise TypeError("indices must be a tuple of integers")
@@ -871,11 +956,22 @@ class MerkleBatchProof:
                 return False
             if not isinstance(messages, tuple) or len(messages) != len(signatures):
                 return False
+            if per_message is not None and len(per_message) != len(messages):
+                return False
             if not all(
                 merkle_verify(
-                    message, signature, embedded_key, context=context_bytes
+                    message,
+                    signature,
+                    embedded_key,
+                    context=(
+                        per_message[position]
+                        if per_message is not None
+                        else context_bytes
+                    ),
                 )
-                for message, signature in zip(messages, signatures)
+                for position, (message, signature) in enumerate(
+                    zip(messages, signatures)
+                )
             ):
                 return False
             if (
@@ -1405,8 +1501,47 @@ class MerkleSigner:
             self._next_index += 1
             return signature
 
+    @staticmethod
+    def _validate_batch_inputs(
+        messages: Any, context: Any, contexts: Any
+    ) -> tuple[bytes, tuple[bytes, ...] | None]:
+        """Validate the shared inputs of the consecutive-batch signers.
+
+        Shared by :meth:`sign_batch` and
+        :meth:`sign_batch_with_checkpoint` so their error order lives in one
+        place. Runs entirely outside the lock and never touches state: first
+        every type is checked — the shared ``context``, the ``messages``
+        container and each message member, then the ``contexts`` container
+        and each of its members — then the per-message/context count and the
+        conflict between ``contexts`` and a non-empty shared ``context``.
+        Exhaustion and capacity are checked afterwards, inside the lock.
+        Returns ``(context_bytes, per_message_contexts)`` where the second
+        value is ``None`` on the legacy shared-context path.
+        """
+        context_bytes = _validate_context(context)
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+        per_message = (
+            _normalize_per_message_contexts(contexts)
+            if contexts is not None
+            else None
+        )
+        if per_message is not None and len(per_message) != len(messages):
+            raise ValueError("contexts and messages must have the same length")
+        _check_context_conflict(context_bytes, per_message)
+        return context_bytes, per_message
+
+    @staticmethod
+    def _batch_item_context(
+        offset: int, context_bytes: bytes, per_message: tuple[bytes, ...] | None
+    ) -> bytes:
+        """Pick the context for batch item ``offset``."""
+        return per_message[offset] if per_message is not None else context_bytes
+
     def sign_batch(
-        self, messages: Any, *, context: Any = None
+        self, messages: Any, *, context: Any = None, contexts: Any = None
     ) -> tuple[MerkleSignature, ...]:
         """Sign every message in ``messages`` atomically, one leaf each, in order.
 
@@ -1417,7 +1552,28 @@ class MerkleSigner:
         (``None``/empty means no context, ``str`` encoded as UTF-8) and is
         bound into every message digest with the same rule as :meth:`sign`;
         the verifier must pass the very same context, in the same message
-        order. The whole batch runs under
+        order.
+
+        ``contexts`` is keyword-only and optional and selects per-message
+        context binding: ``None`` (the default) keeps the legacy
+        shared-``context`` behaviour exactly, while a tuple binds the member
+        at each position into the message at the same position. Members may
+        be ``None``, ``bytes``, ``bytearray`` or ``str`` (``str`` encoded as
+        UTF-8); ``None`` and an empty value are equivalent and mean no
+        context for that one message. Per-message mode is mutually exclusive
+        with a non-empty shared ``context``. The result is value-for-value
+        identical — leaf indices included — to calling :meth:`sign` on each
+        message in sequence from the same starting state with the matching
+        context, and every returned signature verifies on its own with
+        :func:`merkle_verify`.
+
+        Checks run in a fixed order — message and context types first, then
+        the ``contexts``/message count and the shared-context conflict, and
+        only then the remaining-leaf capacity — so a non-tuple ``messages``
+        or ``contexts``, or an illegal member, raises ``TypeError``; a count
+        mismatch or a non-empty shared ``context`` in per-message mode raises
+        ``ValueError``; a batch larger than the number of remaining leaves
+        raises :class:`KeyExhaustedError`. The whole batch runs under
         the same lock as :meth:`sign` and :meth:`checkpoint`: leaves are
         allocated consecutively from the current ``next_index`` and the state
         advances exactly once, after every signature has been generated, so a
@@ -1427,29 +1583,32 @@ class MerkleSigner:
         to calling :meth:`sign` on each message in sequence from the same
         state, and encoded by the existing ``to_bytes`` codec unchanged.
 
-        The call is all-or-nothing: a batch larger than the number of
-        remaining leaves raises :class:`KeyExhaustedError`, and any
-        ``TypeError`` from an illegal message or context leaves the signer
-        untouched —
+        The call is all-or-nothing: any failure leaves the signer untouched —
         no leaf is consumed and no partial result is returned either way.
-        An empty tuple returns an empty tuple and does not change the state.
+        An empty tuple returns an empty tuple and does not change the state
+        (an empty ``contexts`` tuple behaves exactly the same). Contexts are
+        never written into the signatures.
         """
-        context_bytes = _validate_context(context)
+        context_bytes, per_message = self._validate_batch_inputs(
+            messages, context, contexts
+        )
         with self._lock:
-            if not isinstance(messages, tuple):
-                raise TypeError("messages must be a tuple of messages")
             base = self._next_index
             leaf_count = len(self._private_keys)
-            signatures = []
-            for offset, message in enumerate(messages):
-                index = base + offset
-                if index >= leaf_count:
-                    raise KeyExhaustedError(
-                        "not enough Merkle leaves remain for the batch"
-                    )
-                signatures.append(self._signature_at(index, message, context_bytes))
+            if len(messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the batch"
+                )
+            signatures = tuple(
+                self._signature_at(
+                    base + offset,
+                    message,
+                    self._batch_item_context(offset, context_bytes, per_message),
+                )
+                for offset, message in enumerate(messages)
+            )
             self._next_index = base + len(signatures)
-            return tuple(signatures)
+            return signatures
 
     @staticmethod
     def _validate_selected(indices: Any, messages: Any, context: Any) -> bytes:
@@ -1780,7 +1939,7 @@ class MerkleSigner:
             return signature, self._checkpoint_bytes()
 
     def sign_batch_with_checkpoint(
-        self, messages: Any, *, context: Any = None
+        self, messages: Any, *, context: Any = None, contexts: Any = None
     ) -> tuple[tuple[MerkleSignature, ...], bytes]:
         """Sign a whole batch and snapshot the advanced state atomically.
 
@@ -1791,6 +1950,18 @@ class MerkleSigner:
         unchanged (with the same message order) to the matching verification
         entry.
 
+        ``contexts`` is keyword-only and optional and enables per-message
+        context binding exactly as on :meth:`sign_batch`: ``None`` (the
+        default) keeps the legacy shared-``context`` path, while a tuple
+        binds each member (``None``/``bytes``/``bytearray``/``str``; a
+        ``str`` is UTF-8 encoded, ``None``/empty means no context for that
+        message) into the message at the same position. Per-message mode
+        rejects a non-empty shared ``context`` with ``ValueError``. The
+        signatures are value-for-value identical to those of consecutive
+        :meth:`sign` calls from the same starting state with the matching
+        contexts, and each one verifies independently with
+        :func:`merkle_verify`.
+
         Combines :meth:`sign_batch` and :meth:`checkpoint` in one atomic
         call. Returns ``(signatures, checkpoint)``: ``signatures`` is a
         tuple with one :class:`MerkleSignature` per message, in the same
@@ -1800,16 +1971,19 @@ class MerkleSigner:
         ``to_bytes`` codec unchanged — and ``checkpoint`` is the ``bytes``
         that :meth:`checkpoint` returns for the advanced state,
         byte-for-byte the same v1 encoding holding the new ``next_index``
-        and every private key. Pairing the two halves in one call keeps the
-        batch and the state it advanced to together, so a caller can never
-        match signatures against a checkpoint taken at the wrong point
-        under concurrency.
+        and every private key; a signer restored from it resumes at the
+        first leaf after the batch. Pairing the two halves in one call keeps
+        the batch and the state it advanced to together, so a caller can
+        never match signatures against a checkpoint taken at the wrong point
+        under concurrency. Contexts are written into neither the signatures
+        nor the checkpoint.
 
-        ``messages`` must be a ``tuple`` whose members each follow the
-        usual message rules (``bytes``/``bytearray``/``str``); every member
-        is validated before the capacity check, so a non-tuple argument or
-        an illegal member raises ``TypeError`` even on an exhausted signer.
-        The whole batch then runs under the same lock as :meth:`sign`,
+        Validation follows the same fixed order as :meth:`sign_batch`:
+        message and context member/container types first (``TypeError``),
+        then the ``contexts``/message count and the shared-context conflict
+        (``ValueError``), and only then the remaining-leaf capacity, so an
+        illegal type raises even on an exhausted signer. The whole batch
+        then runs under the same lock as :meth:`sign`,
         :meth:`sign_batch`, :meth:`advance_to`, the index properties and
         :meth:`checkpoint`: leaves are allocated consecutively from the
         current ``next_index`` and the state advances exactly once, after
@@ -1817,18 +1991,17 @@ class MerkleSigner:
         sees a half-consumed batch. A batch larger than the number of
         remaining leaves raises :class:`KeyExhaustedError`; every failure
         happens without spending a leaf and returns no partial result. An
-        empty tuple is legal: it returns ``((), checkpoint)`` where the
+        empty tuple is legal (with an empty ``contexts`` tuple or no
+        ``contexts`` at all): it returns ``((), checkpoint)`` where the
         checkpoint snapshots the unchanged state. The returned checkpoint
         still carries every private key in the clear and offers no
         authentication, encryption or atomic persistence — confidentiality,
         durable storage and rollback protection remain the caller's
         responsibility.
         """
-        context_bytes = _validate_context(context)
-        if not isinstance(messages, tuple):
-            raise TypeError("messages must be a tuple of messages")
-        for message in messages:
-            _as_bytes(message)
+        context_bytes, per_message = self._validate_batch_inputs(
+            messages, context, contexts
+        )
         with self._lock:
             base = self._next_index
             leaf_count = len(self._private_keys)
@@ -1837,7 +2010,11 @@ class MerkleSigner:
                     "not enough Merkle leaves remain for the batch"
                 )
             signatures = tuple(
-                self._signature_at(base + offset, message, context_bytes)
+                self._signature_at(
+                    base + offset,
+                    message,
+                    self._batch_item_context(offset, context_bytes, per_message),
+                )
                 for offset, message in enumerate(messages)
             )
             self._next_index = base + len(signatures)
@@ -2764,7 +2941,11 @@ def _multiproof_fold(
 
 
 def _multiproof_verify(
-    messages: Any, data: Any, *, context: bytes = b""
+    messages: Any,
+    data: Any,
+    *,
+    context: bytes = b"",
+    per_message: tuple[bytes, ...] | None = None,
 ) -> tuple[MerklePublicKey, tuple[int, ...]] | None:
     """Verify a v1 multiproof, returning the proven key and leaf indices.
 
@@ -2773,7 +2954,9 @@ def _multiproof_verify(
     strictly increasing) are returned, on any failure ``None``.
     ``context`` must already be normalised by :func:`_validate_context` and
     is bound into every per-leaf message digest exactly like
-    :func:`merkle_verify`.
+    :func:`merkle_verify`; when ``per_message`` is given instead it carries
+    one already-normalised context per message position and ``context``
+    must be empty.
     """
     if not isinstance(messages, tuple):
         return None
@@ -2783,6 +2966,8 @@ def _multiproof_verify(
     public_key, leaves, proof_nodes = parsed
     if len(messages) != len(leaves):
         return None
+    if per_message is not None and len(per_message) != len(messages):
+        return None
     w = public_key.w
     height = public_key.height
     root = public_key.root
@@ -2790,7 +2975,10 @@ def _multiproof_verify(
     leaf_hashes: dict[int, bytes] = {}
     for position, (index, wots_signature) in enumerate(leaves):
         try:
-            digits = _merkle_signing_digits(messages[position], w, context)
+            item_context = (
+                per_message[position] if per_message is not None else context
+            )
+            digits = _merkle_signing_digits(messages[position], w, item_context)
         except TypeError:
             return None
         recovered = tuple(
@@ -2804,7 +2992,7 @@ def _multiproof_verify(
 
 
 def multiproof_verify(
-    messages: Any, data: Any, *, context: Any = None
+    messages: Any, data: Any, *, context: Any = None, contexts: Any = None
 ) -> bool:
     """Verify a :func:`multiproof_encode` proof against one message per leaf.
 
@@ -2827,9 +3015,34 @@ def multiproof_verify(
     bound into every message digest in the given tuple order — a proof made
     under one context returns ``False`` under another. A context of any other
     type raises ``TypeError``.
+
+    ``contexts`` is keyword-only and optional and selects per-message
+    context binding: ``None`` (the default) keeps the shared-``context``
+    path, while a tuple must provide one context per message in the proof's
+    leaf order; each member (``None``/``bytes``/``bytearray``/``str``; a
+    ``str`` is UTF-8 encoded, ``None``/empty means no context for that one
+    message) must match the context the corresponding leaf was signed under.
+    Per-message mode is mutually exclusive with a non-empty shared
+    ``context``. Context types and the shared-context conflict are checked
+    before the proof: a non-tuple ``contexts`` or a member of another type
+    raises ``TypeError`` and combining ``contexts`` with a non-empty
+    ``context`` raises ``ValueError``; a ``contexts`` count different from
+    the message count, like every other proof or content failure, returns
+    ``False``.
     """
     context_bytes = _validate_context(context)
-    return _multiproof_verify(messages, data, context=context_bytes) is not None
+    per_message = (
+        _normalize_per_message_contexts(contexts)
+        if contexts is not None
+        else None
+    )
+    _check_context_conflict(context_bytes, per_message)
+    return (
+        _multiproof_verify(
+            messages, data, context=context_bytes, per_message=per_message
+        )
+        is not None
+    )
 
 
 def multiproof_verify_bound(
@@ -2839,6 +3052,7 @@ def multiproof_verify_bound(
     public_key: Any,
     indices: Any = None,
     context: Any = None,
+    contexts: Any = None,
 ) -> bool:
     """Verify a multiproof and bind it to an expected key and leaf selection.
 
@@ -2856,6 +3070,18 @@ def multiproof_verify_bound(
     wrong context returns ``False`` and a context of a wrong type raises
     ``TypeError``.
 
+    ``contexts`` is keyword-only and optional and enables per-message
+    context binding exactly as on :func:`multiproof_verify`: ``None`` (the
+    default) keeps the shared-``context`` path, while a tuple holds one
+    context per message in the proof's leaf order and each member must match
+    the signing context of that leaf; any mismatch returns ``False``.
+    Per-message mode rejects a non-empty shared ``context``. Context types
+    and the conflict are checked first: a non-tuple ``contexts`` or a bad
+    member raises ``TypeError`` and a non-empty shared ``context`` in
+    per-message mode raises ``ValueError``; a ``contexts`` count different
+    from the message count returns ``False``. The expected ``public_key``
+    and explicit ``indices`` constraints apply unchanged.
+
     ``public_key`` must be a :class:`MerklePublicKey`; any other type raises
     ``TypeError``. ``indices=None`` imposes no extra constraint on the leaf
     selection. An explicit ``indices`` must be a tuple — any other container
@@ -2870,13 +3096,21 @@ def multiproof_verify_bound(
     if not isinstance(public_key, MerklePublicKey):
         raise TypeError("public_key must be a MerklePublicKey")
     context_bytes = _validate_context(context)
+    per_message = (
+        _normalize_per_message_contexts(contexts)
+        if contexts is not None
+        else None
+    )
+    _check_context_conflict(context_bytes, per_message)
     if indices is not None:
         if not isinstance(indices, tuple):
             raise TypeError("indices must be a tuple of integers")
         for index in indices:
             if not isinstance(index, int):
                 raise TypeError("every index must be an integer")
-    result = _multiproof_verify(messages, data, context=context_bytes)
+    result = _multiproof_verify(
+        messages, data, context=context_bytes, per_message=per_message
+    )
     if result is None:
         return False
     proof_key, proof_indices = result

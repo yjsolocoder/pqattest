@@ -478,6 +478,423 @@ class TestMultiproofMergeSourceAuthentication(unittest.TestCase):
             )
 
 
+def make_full_per_leaf(height=3, w=4):
+    signer = make_signer(height=height, w=w)
+    count = 1 << height
+    messages = tuple(f"message-{i}" for i in range(count))
+    contexts = tuple(f"ctx-{i}" for i in range(count))
+    signatures = signer.sign_batch(messages, contexts=contexts)
+    return signer.public_key, messages, contexts, signatures
+
+
+class TestMultiproofMergeContextGroups(unittest.TestCase):
+    def test_per_leaf_context_merge_matches_encode(self):
+        for w in (4, 8):
+            for height in (1, 2, 3, 5):
+                public_key, messages, contexts, signatures = make_full_per_leaf(
+                    height=height, w=w
+                )
+                leaf_count = 1 << height
+                splits = [
+                    ((0,), (leaf_count - 1,)),
+                    (
+                        tuple(range(0, leaf_count, 2)),
+                        tuple(range(1, leaf_count, 2)),
+                    ),
+                    (
+                        tuple(range(leaf_count // 2)),
+                        tuple(range(leaf_count // 2, leaf_count)),
+                    ),
+                ]
+                for left, right in splits:
+                    with self.subTest(w=w, height=height, split=(left, right)):
+                        merged = multiproof_merge(
+                            (
+                                group_for(messages, left),
+                                group_for(messages, right),
+                            ),
+                            (
+                                proof_for(public_key, signatures, left),
+                                proof_for(public_key, signatures, right),
+                            ),
+                            public_key=public_key,
+                            context_groups=(
+                                group_for(contexts, left),
+                                group_for(contexts, right),
+                            ),
+                        )
+                        union = tuple(sorted(set(left) | set(right)))
+                        self.assertEqual(
+                            merged, proof_for(public_key, signatures, union)
+                        )
+                        self.assertTrue(
+                            multiproof_verify_bound(
+                                group_for(messages, union),
+                                merged,
+                                public_key=public_key,
+                                indices=union,
+                                contexts=group_for(contexts, union),
+                            )
+                        )
+
+    def test_sparse_height_eight(self):
+        for w in (4, 8):
+            public_key, messages, contexts, signatures = make_full_per_leaf(
+                height=8, w=w
+            )
+            groups = [(0,), (255,), (100, 101, 200)]
+            merged = multiproof_merge(
+                tuple(group_for(messages, g) for g in groups),
+                tuple(proof_for(public_key, signatures, g) for g in groups),
+                public_key=public_key,
+                context_groups=tuple(group_for(contexts, g) for g in groups),
+            )
+            union = (0, 100, 101, 200, 255)
+            self.assertEqual(merged, proof_for(public_key, signatures, union))
+
+    def test_single_source_returns_source_bytes(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=3)
+        for indices in [(0,), (7,), tuple(range(8))]:
+            with self.subTest(indices=indices):
+                proof = proof_for(public_key, signatures, indices)
+                merged = multiproof_merge(
+                    (group_for(messages, indices),),
+                    (proof,),
+                    public_key=public_key,
+                    context_groups=(group_for(contexts, indices),),
+                )
+                self.assertEqual(merged, proof)
+
+    def test_member_form_variants_normalise(self):
+        signer = make_signer(height=2)
+        messages = ("a", "b", "c", "d")
+        contexts = (None, "ctx", b"", "other")
+        signatures = signer.sign_batch(messages, contexts=contexts)
+        public_key = signer.public_key
+        left = (0, 1)
+        right = (1, 2, 3)
+        merged = multiproof_merge(
+            (group_for(messages, left), group_for(messages, right)),
+            (
+                proof_for(public_key, signatures, left),
+                proof_for(public_key, signatures, right),
+            ),
+            public_key=public_key,
+            context_groups=(
+                (None, b"ctx"),
+                (bytearray(b"ctx"), bytearray(), "other"),
+            ),
+        )
+        union = (0, 1, 2, 3)
+        self.assertEqual(merged, proof_for(public_key, signatures, union))
+        self.assertTrue(
+            multiproof_verify(
+                messages,
+                merged,
+                contexts=(None, "ctx", None, "other"),
+            )
+        )
+
+    def test_omitted_and_none_keep_shared_context_behaviour(self):
+        public_key, messages, signatures = make_full(height=3, context="ctx")
+        left = (1, 2)
+        right = (6,)
+        groups = (group_for(messages, left), group_for(messages, right))
+        proofs = (
+            proof_for(public_key, signatures, left),
+            proof_for(public_key, signatures, right),
+        )
+        baseline = multiproof_merge(
+            groups, proofs, public_key=public_key, context="ctx"
+        )
+        explicit_none = multiproof_merge(
+            groups,
+            proofs,
+            public_key=public_key,
+            context="ctx",
+            context_groups=None,
+        )
+        self.assertEqual(baseline, explicit_none)
+
+    def test_empty_shared_context_combines_with_context_groups(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=2)
+        indices = (0, 3)
+        proof = proof_for(public_key, signatures, indices)
+        group = group_for(messages, indices)
+        context_group = group_for(contexts, indices)
+        expected = multiproof_merge(
+            (group,),
+            (proof,),
+            public_key=public_key,
+            context_groups=(context_group,),
+        )
+        for empty in (None, b"", bytearray(), ""):
+            with self.subTest(context=empty):
+                self.assertEqual(
+                    multiproof_merge(
+                        (group,),
+                        (proof,),
+                        public_key=public_key,
+                        context=empty,
+                        context_groups=(context_group,),
+                    ),
+                    expected,
+                )
+
+    def test_non_empty_shared_context_conflicts(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=2)
+        indices = (0, 3)
+        proof = proof_for(public_key, signatures, indices)
+        for bad_context in ("ctx", b"ctx", bytearray(b"x")):
+            with self.subTest(context=bad_context):
+                with self.assertRaises(ValueError):
+                    multiproof_merge(
+                        (group_for(messages, indices),),
+                        (proof,),
+                        public_key=public_key,
+                        context=bad_context,
+                        context_groups=(group_for(contexts, indices),),
+                    )
+
+    def test_context_groups_type_errors(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=2)
+        indices = (0, 1)
+        proof = proof_for(public_key, signatures, indices)
+        group = group_for(messages, indices)
+        context_group = group_for(contexts, indices)
+
+        def merge(**kwargs):
+            kwargs.setdefault("public_key", public_key)
+            return multiproof_merge((group,), (proof,), **kwargs)
+
+        with self.assertRaises(TypeError):
+            merge(context_groups=[context_group])
+        with self.assertRaises(TypeError):
+            merge(context_groups="ctx")
+        with self.assertRaises(TypeError):
+            merge(context_groups=(list(context_group),))
+        with self.assertRaises(TypeError):
+            merge(context_groups=("ctx",))
+        with self.assertRaises(TypeError):
+            merge(context_groups=((1, "ctx-1"),))
+        with self.assertRaises(TypeError):
+            merge(context_groups=((object(), None),))
+        # Type checks precede all content checks.
+        with self.assertRaises(TypeError):
+            multiproof_merge((), (), public_key=public_key, context_groups=[])
+        with self.assertRaises(TypeError):
+            multiproof_merge(
+                (group,),
+                (proof,),
+                public_key="not-a-key",
+                context_groups=(context_group,),
+            )
+
+    def test_context_groups_value_errors(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=2)
+        left = (0, 1)
+        right = (2, 3)
+        groups = (group_for(messages, left), group_for(messages, right))
+        proofs = (
+            proof_for(public_key, signatures, left),
+            proof_for(public_key, signatures, right),
+        )
+        context_groups = (
+            group_for(contexts, left),
+            group_for(contexts, right),
+        )
+
+        def merge(cg):
+            return multiproof_merge(
+                groups, proofs, public_key=public_key, context_groups=cg
+            )
+
+        # Empty outer tuple: group count differs from the proof count.
+        with self.assertRaises(ValueError):
+            merge(())
+        # Group count mismatch.
+        with self.assertRaises(ValueError):
+            merge(context_groups[:1])
+        with self.assertRaises(ValueError):
+            merge(context_groups + (("x",),))
+        # Empty inner group.
+        with self.assertRaises(ValueError):
+            merge(((), context_groups[1]))
+        # Inner count differs from the message/leaf count.
+        with self.assertRaises(ValueError):
+            merge((context_groups[0][:1], context_groups[1]))
+        with self.assertRaises(ValueError):
+            merge((context_groups[0] + ("extra",), context_groups[1]))
+
+    def test_overlapping_leaf_context_conflict_fails(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=3)
+        left = (0, 2, 3)
+        right = (3, 5)
+        with self.assertRaises(ValueError):
+            multiproof_merge(
+                (group_for(messages, left), group_for(messages, right)),
+                (
+                    proof_for(public_key, signatures, left),
+                    proof_for(public_key, signatures, right),
+                ),
+                public_key=public_key,
+                context_groups=(
+                    group_for(contexts, left),
+                    ("ctx-3-wrong", "ctx-5"),
+                ),
+            )
+
+    def test_overlapping_leaf_same_context_merges(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=3)
+        left = (0, 2, 3)
+        right = (3, 5)
+        merged = multiproof_merge(
+            (group_for(messages, left), group_for(messages, right)),
+            (
+                proof_for(public_key, signatures, left),
+                proof_for(public_key, signatures, right),
+            ),
+            public_key=public_key,
+            context_groups=(
+                group_for(contexts, left),
+                (b"ctx-3", bytearray(b"ctx-5")),
+            ),
+        )
+        union = (0, 2, 3, 5)
+        self.assertEqual(merged, proof_for(public_key, signatures, union))
+
+    def test_source_order_duplicates_and_staging(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=4)
+        groups = [(0, 1, 2), (3, 4, 5), (1, 5, 9, 13), (14, 15)]
+        proofs = [
+            proof_for(public_key, signatures, indices) for indices in groups
+        ]
+        message_groups = [group_for(messages, g) for g in groups]
+        context_groups = [group_for(contexts, g) for g in groups]
+        first = multiproof_merge(
+            tuple(message_groups),
+            tuple(proofs),
+            public_key=public_key,
+            context_groups=tuple(context_groups),
+        )
+        order = (3, 1, 0, 2)
+        reordered = multiproof_merge(
+            tuple(message_groups[i] for i in order),
+            tuple(proofs[i] for i in order),
+            public_key=public_key,
+            context_groups=tuple(context_groups[i] for i in order),
+        )
+        self.assertEqual(first, reordered)
+        duplicated = multiproof_merge(
+            tuple(message_groups[i] for i in (0, 0, 1, 2, 2, 3)),
+            tuple(proofs[i] for i in (0, 0, 1, 2, 2, 3)),
+            public_key=public_key,
+            context_groups=tuple(context_groups[i] for i in (0, 0, 1, 2, 2, 3)),
+        )
+        self.assertEqual(first, duplicated)
+        union_ab = tuple(sorted(set(groups[0]) | set(groups[1])))
+        stage_one = multiproof_merge(
+            (message_groups[0], message_groups[1]),
+            (proofs[0], proofs[1]),
+            public_key=public_key,
+            context_groups=(context_groups[0], context_groups[1]),
+        )
+        union_cd = tuple(sorted(set(groups[2]) | set(groups[3])))
+        stage_two = multiproof_merge(
+            (message_groups[2], message_groups[3]),
+            (proofs[2], proofs[3]),
+            public_key=public_key,
+            context_groups=(context_groups[2], context_groups[3]),
+        )
+        staged = multiproof_merge(
+            (group_for(messages, union_ab), group_for(messages, union_cd)),
+            (stage_one, stage_two),
+            public_key=public_key,
+            context_groups=(
+                group_for(contexts, union_ab),
+                group_for(contexts, union_cd),
+            ),
+        )
+        self.assertEqual(first, staged)
+
+    def test_merged_result_requires_matching_contexts(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=3)
+        left = (1, 2)
+        right = (6,)
+        merged = multiproof_merge(
+            (group_for(messages, left), group_for(messages, right)),
+            (
+                proof_for(public_key, signatures, left),
+                proof_for(public_key, signatures, right),
+            ),
+            public_key=public_key,
+            context_groups=(
+                group_for(contexts, left),
+                group_for(contexts, right),
+            ),
+        )
+        union = (1, 2, 6)
+        union_messages = group_for(messages, union)
+        self.assertFalse(multiproof_verify(union_messages, merged))
+        self.assertFalse(
+            multiproof_verify(union_messages, merged, context="ctx-1")
+        )
+        self.assertFalse(
+            multiproof_verify(
+                union_messages,
+                merged,
+                contexts=("ctx-1", "ctx-2", "wrong"),
+            )
+        )
+        self.assertTrue(
+            multiproof_verify_bound(
+                union_messages,
+                merged,
+                public_key=public_key,
+                indices=union,
+                contexts=group_for(contexts, union),
+            )
+        )
+
+    def test_context_groups_public_key_mismatch_fails(self):
+        public_key, messages, contexts, signatures = make_full_per_leaf(height=2)
+        other = make_signer(height=2, start=1000).public_key
+        indices = (0, 1)
+        with self.assertRaises(ValueError):
+            multiproof_merge(
+                (group_for(messages, indices),),
+                (proof_for(public_key, signatures, indices),),
+                public_key=other,
+                context_groups=(group_for(contexts, indices),),
+            )
+
+    def test_context_groups_do_not_leak_into_proof_bytes(self):
+        # The merged bytes depend only on the union's original signatures:
+        # sources signed with per-leaf contexts and sources signed with the
+        # shared context that matches leaf by leaf merge to the same bytes.
+        signer = make_signer(height=3)
+        messages = tuple(f"message-{i}" for i in range(8))
+        contexts = tuple(f"ctx-{i}" for i in range(8))
+        per_leaf = signer.sign_batch(messages, contexts=contexts)
+        public_key = signer.public_key
+        left = (0, 2, 3)
+        right = (3, 5, 7)
+        merged = multiproof_merge(
+            (group_for(messages, left), group_for(messages, right)),
+            (
+                proof_for(public_key, per_leaf, left),
+                proof_for(public_key, per_leaf, right),
+            ),
+            public_key=public_key,
+            context_groups=(
+                group_for(contexts, left),
+                group_for(contexts, right),
+            ),
+        )
+        union = (0, 2, 3, 5, 7)
+        self.assertEqual(merged, proof_for(public_key, per_leaf, union))
+
+
 class TestMultiproofMergeValidation(unittest.TestCase):
     def setUp(self):
         self.public_key, self.messages, self.signatures = make_full(height=2)

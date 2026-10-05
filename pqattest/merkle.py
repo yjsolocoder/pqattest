@@ -54,13 +54,16 @@ entries :meth:`MerkleSigner.sign_selected`,
 :meth:`MerkleSigner.sign_multiproof_with_checkpoint`,
 :meth:`MerkleSigner.sign_multiproof_with_auth_state`,
 :meth:`MerkleBatchProof.verify`, :meth:`MerkleBatchProof.verify_bound`,
-:func:`multiproof_verify` and :func:`multiproof_verify_bound` —
+:func:`multiproof_verify`, :func:`multiproof_verify_bound`,
+:func:`multiproof_select` and :func:`multiproof_expand` —
 additionally accept a keyword-only ``contexts`` tuple that binds a
 separate context to each message positionally (for the selection entries,
-to each chosen leaf at its tuple position; ``None``/empty members mean no
-context for that position); it cannot be combined with a non-empty shared
-``context`` and is never written into any proof, checkpoint or envelope
-encoding.
+to each chosen leaf at its tuple position; for :func:`multiproof_select`
+and :func:`multiproof_expand`, to every leaf of the source proof in its
+leaf order, rather than to the chosen subset; ``None``/empty members mean
+no context for that position); it cannot be combined with a non-empty
+shared ``context`` and is never written into any proof, checkpoint or
+envelope encoding.
 """
 
 from __future__ import annotations
@@ -3315,6 +3318,7 @@ def multiproof_select(
     public_key: Any,
     indices: Any,
     context: Any = None,
+    contexts: Any = None,
 ) -> bytes:
     """Extract an independent multiproof for a chosen leaf subset.
 
@@ -3330,10 +3334,11 @@ def multiproof_select(
     The whole source proof is authenticated before anything is returned:
     the proof must parse under the exact structural rule of
     :func:`multiproof_verify`, every leaf — including the ones being
-    dropped — must verify against its message under ``context``, and the
+    dropped — must verify against its message under its context, and the
     embedded public key must equal ``public_key`` value by value (``w``,
-    ``height`` and ``root``). A corrupted dropped leaf's message or
-    signature therefore fails the call instead of being silently discarded.
+    ``height`` and ``root``). A corrupted dropped leaf's message, context
+    or signature therefore fails the call instead of being silently
+    discarded.
 
     ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple
     whose members each follow the usual message rules
@@ -3349,6 +3354,27 @@ def multiproof_select(
     public-key or context mismatch all raise ``ValueError`` and no partial
     result is returned.
 
+    ``contexts`` is keyword-only and optional and instead binds a separate
+    context per source leaf: ``None`` (the default) keeps the shared-
+    ``context`` behaviour, while a tuple applies its members positionally
+    to *every* leaf of the source proof in the source proof's leaf order —
+    that is, aligned with ``messages`` and the proof's leaves, not with
+    ``indices`` (``indices`` still names actual tree leaf indices). Each
+    member is ``None``, ``bytes``, ``bytearray`` or ``str`` (a ``str``
+    encoded as UTF-8, ``None`` and empty values meaning "no context" for
+    that leaf), exactly as if every leaf had been signed through the
+    single-signature entries with its own context. A non-tuple
+    ``contexts`` or a member of another type raises ``TypeError``;
+    combining ``contexts`` with a non-empty ``context`` raises
+    ``ValueError`` (an empty shared ``context`` is allowed); an empty
+    ``contexts`` tuple or one whose length differs from the message count
+    — and therefore the source proof's leaf count — raises
+    ``ValueError``. Every leaf, selected or dropped, is verified under the
+    context at its own position, so a wrong context on a dropped leaf
+    still fails the call. The extracted proof carries no context itself:
+    the caller verifies it with the selected leaves' messages and the
+    matching per-leaf ``contexts``.
+
     The result uses the existing v1 format unchanged: it keeps the original
     public key, leaf indices and W-OTS elements, and its authentication
     nodes follow the existing canonical ordering and deduplication rule, so
@@ -3357,8 +3383,9 @@ def multiproof_select(
     bytes exactly; selecting from a proof that itself covers every leaf, or
     selecting twice in a row, behaves like selecting the final leaf set
     directly. Duplicate messages are treated as distinct leaf positions and
-    are never merged. No randomness is drawn and no input or signer state
-    is modified.
+    are never merged. No randomness is drawn, no signing quota is consumed,
+    no input or signer state is modified, no returned bytes alias a caller
+    buffer, and no wire format or version is added.
     """
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("multiproof data must be bytes or bytearray")
@@ -3374,18 +3401,28 @@ def multiproof_select(
         if not isinstance(index, int):
             raise TypeError("every index must be an integer")
     context_bytes = _validate_context(context)
+    contexts_tuple = _validate_contexts(contexts)
     if not indices:
         raise ValueError("indices must not be empty")
     if any(isinstance(index, bool) for index in indices):
         raise ValueError("every index must be a non-boolean integer")
     if any(former >= latter for former, latter in zip(indices, indices[1:])):
         raise ValueError("indices must be strictly increasing and unique")
+    if contexts_tuple is not None:
+        if context_bytes:
+            raise ValueError("contexts cannot be combined with a non-empty context")
+        if not contexts_tuple:
+            raise ValueError("contexts must not be empty")
+        if len(contexts_tuple) != len(messages):
+            raise ValueError("contexts and messages must have the same length")
     parsed = _multiproof_parse(data)
     if parsed is None:
         raise ValueError("the source multiproof is malformed")
     proof_key, leaves, proof_nodes = parsed
     if len(messages) != len(leaves):
         raise ValueError("messages and proof leaves must have the same length")
+    if contexts_tuple is not None and len(contexts_tuple) != len(leaves):
+        raise ValueError("contexts must have one entry per source proof leaf")
     if (
         public_key.w != proof_key.w
         or public_key.height != proof_key.height
@@ -3397,7 +3434,10 @@ def multiproof_select(
     b, l1, l2 = _params(w)
     leaf_hashes: dict[int, bytes] = {}
     for position, (index, wots_signature) in enumerate(leaves):
-        digits = _merkle_signing_digits(messages[position], w, context_bytes)
+        leaf_context = (
+            contexts_tuple[position] if contexts_tuple is not None else context_bytes
+        )
+        digits = _merkle_signing_digits(messages[position], w, leaf_context)
         recovered = tuple(
             _chain_walk(element, b - 1 - digit)
             for element, digit in zip(wots_signature, digits)
@@ -3687,6 +3727,7 @@ def multiproof_expand(
     *,
     public_key: Any,
     context: Any = None,
+    contexts: Any = None,
 ) -> MerkleBatchProof:
     """Restore a verified multiproof to an ordinary :class:`MerkleBatchProof`.
 
@@ -3711,7 +3752,7 @@ def multiproof_expand(
     it must parse under the exact structural rule of
     :func:`multiproof_verify` (magic, version, lengths, counts, indices
     and canonical authentication nodes, no truncation or trailing data),
-    every leaf must verify against its message under ``context`` with the
+    every leaf must verify against its message under its context with the
     root recomputed through the existing fold rule, and the embedded
     public key must equal ``public_key`` value by value (``w``, ``height``
     and ``root``). A failure on any leaf — including an authentication
@@ -3729,10 +3770,28 @@ def multiproof_expand(
     message tuple, a message count that differs from the proof's leaf
     count, a wrong or unbound message or context, a public-key mismatch,
     a malformed or non-canonical source encoding, or a proof that does not
-    reach the expected root all raise ``ValueError``. The returned object
-    never references the caller's mutable byte buffers, no input is
-    modified, no randomness is drawn, no signing state is touched and no
-    wire format or version is added.
+    reach the expected root all raise ``ValueError``.
+
+    ``contexts`` is keyword-only and optional and instead binds a separate
+    context per source leaf exactly as in :func:`multiproof_select` and
+    :func:`multiproof_verify`: ``None`` (the default) keeps the shared-
+    ``context`` behaviour, while a tuple applies its members positionally
+    to every source leaf in the source proof's leaf order, aligned with
+    ``messages`` (``None``/empty means no context for that leaf, a ``str``
+    is encoded as UTF-8). A non-tuple ``contexts`` or a member of another
+    type raises ``TypeError``; combining ``contexts`` with a non-empty
+    ``context`` raises ``ValueError`` (an empty shared ``context`` is
+    allowed); an empty ``contexts`` tuple or one whose length differs from
+    the message count — and therefore the source proof's leaf count —
+    raises ``ValueError``. Every leaf is verified under the context at its
+    own position before anything is returned. The restored batch carries
+    no context itself: the caller verifies it with the corresponding
+    messages and per-leaf ``contexts`` via
+    :meth:`MerkleBatchProof.verify` / :meth:`MerkleBatchProof.verify_bound`,
+    and equal messages at different leaves keep their own signatures and
+    contexts. The returned object never references the caller's mutable
+    byte buffers, no input is modified, no randomness is drawn, no signing
+    state or quota is touched, and no wire format or version is added.
     """
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("multiproof data must be bytes or bytearray")
@@ -3743,14 +3802,24 @@ def multiproof_expand(
     if not isinstance(public_key, MerklePublicKey):
         raise TypeError("public_key must be a MerklePublicKey")
     context_bytes = _validate_context(context)
+    contexts_tuple = _validate_contexts(contexts)
     if not messages:
         raise ValueError("messages must not be empty")
+    if contexts_tuple is not None:
+        if context_bytes:
+            raise ValueError("contexts cannot be combined with a non-empty context")
+        if not contexts_tuple:
+            raise ValueError("contexts must not be empty")
+        if len(contexts_tuple) != len(messages):
+            raise ValueError("contexts and messages must have the same length")
     parsed = _multiproof_parse(data)
     if parsed is None:
         raise ValueError("the source multiproof is malformed")
     proof_key, leaves, proof_nodes = parsed
     if len(messages) != len(leaves):
         raise ValueError("messages and proof leaves must have the same length")
+    if contexts_tuple is not None and len(contexts_tuple) != len(leaves):
+        raise ValueError("contexts must have one entry per source proof leaf")
     if (
         public_key.w != proof_key.w
         or public_key.height != proof_key.height
@@ -3762,7 +3831,10 @@ def multiproof_expand(
     b, l1, l2 = _params(w)
     leaf_hashes: dict[int, bytes] = {}
     for position, (index, wots_signature) in enumerate(leaves):
-        digits = _merkle_signing_digits(messages[position], w, context_bytes)
+        leaf_context = (
+            contexts_tuple[position] if contexts_tuple is not None else context_bytes
+        )
+        digits = _merkle_signing_digits(messages[position], w, leaf_context)
         recovered = tuple(
             _chain_walk(element, b - 1 - digit)
             for element, digit in zip(wots_signature, digits)

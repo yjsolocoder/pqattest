@@ -27,7 +27,9 @@ standalone v1 multiproof from the proof, its messages and the expected
 public key alone, and multiproof_merge to combine the leaf sets of
 several verified multiproofs into one fresh standalone v1 multiproof
 from the source proofs, their per-proof message tuples and the expected
-public key alone, and multiproof_expand to restore a verified
+public key alone, with an optional keyword-only context_groups tuple
+giving one context per source proof leaf so proofs whose leaves were
+signed under different contexts merge too, and multiproof_expand to restore a verified
 multiproof to an ordinary MerkleBatchProof of standalone signatures
 with complete authentication paths from the source proof, its messages
 and the expected public key alone, static

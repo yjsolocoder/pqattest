@@ -24,7 +24,10 @@ source proof, its messages and the expected public key, with no access to
 the original signatures or any private key. :func:`multiproof_merge` is
 the union counterpart: it combines the leaf sets of several verified
 multiproofs into one fresh v1 multiproof from the source proofs, their
-messages and the expected public key alone. :func:`multiproof_expand` is
+messages and the expected public key alone, with an optional
+keyword-only ``context_groups`` tuple supplying one context per source
+proof leaf so the same key's leaves signed under different contexts
+merge as well. :func:`multiproof_expand` is
 the inverse of :func:`multiproof_encode`: it restores a verified
 multiproof to an ordinary :class:`MerkleBatchProof` of standalone
 :class:`MerkleSignature` values, again from the source proof, its
@@ -3421,6 +3424,7 @@ def multiproof_merge(
     *,
     public_key: Any,
     context: Any = None,
+    context_groups: Any = None,
 ) -> bytes:
     """Merge the leaf sets of several verified multiproofs into one proof.
 
@@ -3433,42 +3437,61 @@ def multiproof_merge(
     itself a tuple of ``bytes``/``bytearray``/``str`` messages (``str``
     encoded as UTF-8), ordered exactly as the matching source proof's leaves.
     The caller verifies the result with the union leaf order's messages, the
-    same public key and the same context via :func:`multiproof_verify` /
+    same public key and the same contexts via :func:`multiproof_verify` /
     :func:`multiproof_verify_bound`, and can select subsets of it or feed it
     into another merge.
 
     Every source proof is fully authenticated before anything is returned,
     including duplicate submissions of the same source: each proof must parse
     under the exact structural rule of :func:`multiproof_verify`, every leaf
-    it carries must verify against its group's message under ``context``, and
-    the embedded public key must equal ``public_key`` value by value (``w``,
-    ``height`` and ``root``); a leaf shared with an earlier proof is never
-    skipped. The result keeps the original public key and W-OTS elements,
-    orders its leaves by their actual tree indices, and deduplicates shared
-    authentication nodes under the existing canonical rule. When the same
-    leaf occurs in more than one source proof, one copy is kept only when the
-    UTF-8 message bytes and every W-OTS element are equal across the
-    occurrences; otherwise ``ValueError`` is raised. Equal messages at
-    different leaves stay distinct. The bytes are identical to sorting the
-    union's original single signatures by index and feeding them to
+    it carries must verify against its group's message under that leaf's
+    context, and the embedded public key must equal ``public_key`` value by
+    value (``w``, ``height`` and ``root``); a leaf shared with an earlier
+    proof is never skipped. The result keeps the original public key and
+    W-OTS elements, orders its leaves by their actual tree indices, and
+    deduplicates shared authentication nodes under the existing canonical
+    rule. When the same leaf occurs in more than one source proof, one copy
+    is kept only when the UTF-8 message bytes, the context bytes and every
+    W-OTS element are equal across the occurrences; otherwise ``ValueError``
+    is raised. Equal messages (or contexts) at different leaves stay
+    distinct. The bytes are identical to sorting the union's original
+    single signatures by index and feeding them to
     :func:`multiproof_encode`; a single legal source is returned byte for
     byte, and reordering sources, resubmitting a source or splitting the
     merge into batches does not change the result.
 
     ``public_key`` must be a :class:`MerklePublicKey`; ``context`` is
     keyword-only and optional and follows the usual context rules
-    (``None``/empty means no context, ``str`` encoded as UTF-8). Any type
-    violation — a non-tuple container, a non-tuple message group, a proof
-    member that is not ``bytes``/``bytearray``, a message of another type, a
-    wrong ``public_key`` or ``context`` type — raises ``TypeError``, and type
-    checks precede all content checks. Empty input, unequal group counts, a
-    group whose message count differs from its proof's leaf count, a
-    malformed or non-canonical source encoding, a verification failure, a
-    public-key or context mismatch, an overlapping-leaf conflict, a
-    conflicting authentication node at the same coordinate, or a union that
-    exceeds the existing v1 format limits all raise ``ValueError`` and no
-    partial result is returned. No randomness is drawn, no input or signer
-    state is modified, and no wire-format version is added.
+    (``None``/empty means no context, ``str`` encoded as UTF-8) and, unless
+    ``context_groups`` is given, is bound into every leaf of every source.
+
+    ``context_groups`` is keyword-only and optional and switches the merge
+    to per-leaf contexts: ``None`` (the default) keeps the shared-
+    ``context`` behaviour unchanged, while a tuple must correspond item by
+    item to ``proofs`` — each member is itself a tuple with one context per
+    leaf of its source proof, ordered in that proof's leaf order, and each
+    context is ``None``, ``bytes``, ``bytearray`` or ``str`` (a ``str``
+    encoded as UTF-8, ``None`` and empty values meaning "no context" for
+    that leaf), so proofs of the same key whose leaves were signed under
+    different contexts can be merged. In this mode the shared ``context``
+    must be empty; combining ``context_groups`` with a non-empty ``context``
+    raises ``ValueError``. Like every other per-leaf context, the contexts
+    are bound into the message digests only and are never written into the
+    result bytes.
+
+    Any type violation — a non-tuple outer container, a non-tuple message
+    or context group, a proof member that is not ``bytes``/``bytearray``, a
+    message or context of another type, a wrong ``public_key`` or
+    ``context`` type — raises ``TypeError``, and all type checks precede
+    all length and content checks. Empty input, unequal group counts, an
+    empty context group, a group whose context count differs from its
+    message or proof leaf count, a malformed or non-canonical source
+    encoding, a verification failure, a public-key or context mismatch, an
+    overlapping-leaf conflict, a conflicting authentication node at the
+    same coordinate, or a union that exceeds the existing v1 format limits
+    all raise ``ValueError`` and no partial result is returned. No
+    randomness is drawn, no input or signer state is modified, and no
+    wire-format version is added.
     """
     if not isinstance(message_groups, tuple):
         raise TypeError("message_groups must be a tuple of message tuples")
@@ -3485,17 +3508,45 @@ def multiproof_merge(
     if not isinstance(public_key, MerklePublicKey):
         raise TypeError("public_key must be a MerklePublicKey")
     context_bytes = _validate_context(context)
+    explicit_groups = context_groups is not None
+    if explicit_groups:
+        if not isinstance(context_groups, tuple):
+            raise TypeError("context_groups must be a tuple of context tuples")
+        group_contexts = tuple(
+            _validate_contexts(contexts) for contexts in context_groups
+        )
+        if any(contexts is None for contexts in group_contexts):
+            raise TypeError("every context group must be a tuple of contexts")
     if not message_groups or not proofs:
         raise ValueError("message_groups and proofs must not be empty")
     if len(message_groups) != len(proofs):
         raise ValueError("message_groups and proofs must have the same length")
+    if explicit_groups:
+        if context_bytes:
+            raise ValueError(
+                "context_groups cannot be combined with a non-empty context"
+            )
+        if len(group_contexts) != len(message_groups):
+            raise ValueError(
+                "context_groups and message_groups must have the same length"
+            )
+        for position, contexts in enumerate(group_contexts):
+            if not contexts:
+                raise ValueError("every context group must not be empty")
+            if len(contexts) != len(message_groups[position]):
+                raise ValueError(
+                    "every context group must match its message group's length"
+                )
+    else:
+        group_contexts = None
 
-    # index -> (message bytes, W-OTS elements, verified leaf hash);
-    # coordinates -> carried canonical nodes from the source proofs
-    leaves: dict[int, tuple[bytes, tuple[bytes, ...], bytes]] = {}
+    # index -> (message bytes, context bytes, W-OTS elements, verified leaf
+    # hash); coordinates -> carried canonical nodes from the source proofs
+    leaves: dict[int, tuple[bytes, bytes, tuple[bytes, ...], bytes]] = {}
     nodes: dict[tuple[int, int], bytes] = {}
     for position, data in enumerate(proofs):
         messages = message_groups[position]
+        contexts = group_contexts[position] if group_contexts is not None else None
         parsed = _multiproof_parse(data)
         if parsed is None:
             raise ValueError("a source multiproof is malformed")
@@ -3503,6 +3554,10 @@ def multiproof_merge(
         if len(messages) != len(proof_leaves):
             raise ValueError(
                 "every message group must match its proof's leaf count"
+            )
+        if contexts is not None and len(contexts) != len(proof_leaves):
+            raise ValueError(
+                "every context group must match its proof's leaf count"
             )
         if (
             public_key.w != proof_key.w
@@ -3518,7 +3573,10 @@ def multiproof_merge(
         leaf_hashes: dict[int, bytes] = {}
         for leaf_position, (index, elements) in enumerate(proof_leaves):
             message_bytes = _as_bytes(messages[leaf_position])
-            digits = _merkle_signing_digits(message_bytes, w, context_bytes)
+            leaf_context = (
+                contexts[leaf_position] if contexts is not None else context_bytes
+            )
+            digits = _merkle_signing_digits(message_bytes, w, leaf_context)
             recovered = tuple(
                 _chain_walk(element, b - 1 - digit)
                 for element, digit in zip(elements, digits)
@@ -3527,15 +3585,22 @@ def multiproof_merge(
             leaf_hashes[index] = leaf_hash
             previous = leaves.get(index)
             if previous is not None:
-                previous_message, previous_elements, _ = previous
+                previous_message, previous_context, previous_elements, _ = previous
                 if previous_message != message_bytes:
                     raise ValueError("conflicting messages at an overlapping leaf")
+                if previous_context != leaf_context:
+                    raise ValueError("conflicting contexts at an overlapping leaf")
                 if previous_elements != elements:
                     raise ValueError(
                         "conflicting W-OTS signatures at an overlapping leaf"
                     )
             else:
-                leaves[index] = (message_bytes, elements, leaf_hash)
+                leaves[index] = (
+                    message_bytes,
+                    leaf_context,
+                    elements,
+                    leaf_hash,
+                )
         if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
             raise ValueError("a source multiproof does not verify")
         for coordinate, node in proof_nodes.items():
@@ -3555,7 +3620,7 @@ def multiproof_merge(
     # determinable and the auth-path lookups below always hit consistently.
     height = public_key.height
     known: dict[tuple[int, int], bytes] = {}
-    for index, (_, _, leaf_hash) in leaves.items():
+    for index, (_, _, _, leaf_hash) in leaves.items():
         coordinate = (0, index)
         carried = nodes.get(coordinate)
         if carried is not None and carried != leaf_hash:
@@ -3592,7 +3657,7 @@ def multiproof_merge(
     merged = tuple(
         MerkleSignature(
             index=index,
-            wots_signature=leaves[index][1],
+            wots_signature=leaves[index][2],
             auth_path=tuple(
                 known[(level, (index >> level) ^ 1)] for level in range(height)
             ),

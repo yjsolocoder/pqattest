@@ -1032,6 +1032,7 @@ class MerkleSigner:
     Leaves are allocated in increasing order starting at 0; a leaf is consumed
     only by a successful :meth:`sign`, :meth:`sign_batch`,
     :meth:`sign_selected`, :meth:`sign_selected_with_checkpoint`,
+    :meth:`sign_selected_with_seed_checkpoint`,
     :meth:`sign_selected_with_auth_state`,
     :meth:`sign_with_checkpoint`, :meth:`sign_batch_with_checkpoint`,
     :meth:`sign_batch_with_seed_checkpoint`,
@@ -1640,7 +1641,8 @@ class MerkleSigner:
         """Validate an explicit leaf selection before the signing lock.
 
         Shared by :meth:`sign_selected`,
-        :meth:`sign_selected_with_checkpoint` and
+        :meth:`sign_selected_with_checkpoint`,
+        :meth:`sign_selected_with_seed_checkpoint` and
         :meth:`sign_selected_with_auth_state` so the one-time-key usage
         constraints (what may be signed, in which order errors are raised,
         and that nothing is consumed before every check passes) live in
@@ -1696,7 +1698,7 @@ class MerkleSigner:
     ) -> tuple[tuple[MerkleSignature, ...], Any]:
         """Validate the range, sign the selection and advance exactly once.
 
-        Shared state-advancement core of the three explicit-selection
+        Shared state-advancement core of the explicit-selection
         entries; the caller holds the signing lock and has already passed
         :meth:`_validate_selected` (plus any envelope key/generation
         checks). Exhaustion is reported before the index range, so a
@@ -1906,6 +1908,101 @@ class MerkleSigner:
                 messages,
                 context_bytes,
                 pack=lambda new_next_index: self._checkpoint_bytes(
+                    new_next_index
+                ),
+                contexts_tuple=contexts_tuple,
+            )
+            return signatures, checkpoint
+
+    def sign_selected_with_seed_checkpoint(
+        self,
+        indices: Any,
+        messages: Any,
+        *,
+        context: Any = None,
+        contexts: Any = None,
+    ) -> tuple[tuple[MerkleSignature, ...], bytes]:
+        """Sign an explicit leaf set and return the compact seed checkpoint.
+
+        Available only on a signer created by :meth:`from_seed` (or restored
+        by :meth:`from_seed_checkpoint`): combines :meth:`sign_selected` and
+        :meth:`seed_checkpoint` in one atomic call. Returns
+        ``(signatures, seed_checkpoint)``: ``signatures`` is a tuple with one
+        :class:`MerkleSignature` per chosen leaf, in the same tuple order —
+        value-for-value identical to calling :meth:`sign_selected` with the
+        same ``indices``, ``messages`` and contexts from the same starting
+        state, drawing no extra randomness — and ``seed_checkpoint`` is the
+        existing versioned 109-byte encoding unchanged, byte-for-byte
+        identical to calling :meth:`seed_checkpoint` once the selection has
+        been committed, holding ``next_index`` equal to the last chosen index
+        plus one. Every skipped leaf below the last chosen one is voided
+        permanently, exactly as in :meth:`sign_selected`. A signer restored
+        from the blob with :meth:`from_seed_checkpoint` keeps the same public
+        key, ``next_index`` and ``remaining`` and continues signing
+        identically to this instance at the same state; a selection ending on
+        the last leaf restores a signer with :attr:`remaining` equal to ``0``.
+        The signatures go straight into the existing single-signature,
+        batch-proof and multiproof verification entries.
+
+        ``indices``, ``messages``, ``context`` and ``contexts`` follow
+        exactly the rules of :meth:`sign_selected` — ``context`` is
+        keyword-only and optional (``None``/empty means no context, a ``str``
+        is encoded as UTF-8 and bound into every selected message digest),
+        and ``contexts`` binds a separate context per chosen leaf
+        positionally (``None``/empty means no context for that leaf).
+        Contexts enter the message digests only: the checkpoint carries
+        neither the messages nor the contexts, so the same seed, parameters
+        and final index produce the same checkpoint bytes regardless of what
+        was signed. Validation happens in a fixed order before any leaf is
+        consumed — first the types and structure, then whether this signer
+        keeps its seed, then exhaustion, then the index range:
+
+        * a non-tuple ``indices`` or ``messages``, an index member that is
+          not an integer, an unsupported message or context member type, or a
+          non-tuple ``contexts`` raises ``TypeError``;
+        * an empty tuple on either side, a length mismatch between indices,
+          messages and ``contexts``, a boolean index, a duplicate or
+          non-increasing index, or a non-empty shared ``context`` combined
+          with ``contexts`` raises ``ValueError``;
+        * a randomly constructed signer, or one restored from the full
+          :meth:`checkpoint` format, raises ``ValueError`` even when it
+          originally descended from a seed;
+        * on an exhausted seed-derived signer (no leaf left to spend) the
+          call raises :class:`KeyExhaustedError`;
+        * an index below the current ``next_index`` or past the last leaf
+          raises ``ValueError``.
+
+        The signatures and the candidate checkpoint are both built under the
+        same lock as :meth:`sign`, :meth:`sign_batch`, :meth:`sign_selected`,
+        :meth:`advance_to`, :meth:`checkpoint` and :meth:`seed_checkpoint`,
+        and the advance is committed exactly once only after both halves
+        exist, so the whole call linearises as one operation: under
+        concurrency a leaf is allocated at most once, no thread ever observes
+        a half-signed selection, and the returned checkpoint reflects the
+        state at the end of this call with no later call's advance mixed in.
+        Every failure happens without spending or voiding a leaf and returns
+        no partial result. Unlike :meth:`sign_batch_with_seed_checkpoint`, an
+        empty selection is rejected, matching :meth:`sign_selected`. The blob
+        contains the seed — and therefore every private key — in the clear
+        and the trailing hash only detects accidental corruption, so
+        confidentiality, durable storage and rollback protection remain the
+        caller's responsibility; the call only returns the state bytes and
+        performs no file writes, random sampling or key generation.
+        """
+        context_bytes, contexts_tuple = self._validate_selected(
+            indices, messages, context, contexts
+        )
+        with self._lock:
+            if self._seed is None:
+                raise ValueError(
+                    "sign_selected_with_seed_checkpoint is only available on "
+                    "a seed-derived signer"
+                )
+            signatures, checkpoint = self._sign_selected_locked(
+                indices,
+                messages,
+                context_bytes,
+                pack=lambda new_next_index: self._seed_checkpoint_bytes(
                     new_next_index
                 ),
                 contexts_tuple=contexts_tuple,

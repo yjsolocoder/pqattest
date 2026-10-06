@@ -4262,6 +4262,7 @@ def multiproof_partition(
     contexts: Any = None,
     max_verify_hashes: Any = None,
     max_total_verify_hashes: Any = None,
+    prefer: Any = "compact",
 ) -> tuple[bytes, ...]:
     """Split a verified multiproof into budgeted standalone multiproofs.
 
@@ -4313,17 +4314,35 @@ def multiproof_partition(
     source proof that satisfies every active budget as a single packet is
     returned unchanged as a one-tuple.
 
-    Among every fragmentation feasible under every active budget the result
+    ``prefer`` is keyword-only and optional and selects which fragmentation
+    objective is minimised among every fragmentation feasible under every
+    active budget. It must be exactly the string ``"compact"`` (the
+    default) or ``"verify"`` — no other value, case variant or padded form
+    is accepted. A non-string ``prefer`` raises ``TypeError``; any other
+    string raises ``ValueError``. With ``"compact"`` (or the argument
+    omitted) the result, the exceptions raised and the emitted bytes are
+    exactly the ones produced without the argument: the result
     lexicographically minimises ``(packet count, total encoded bytes, tuple
-    of the packets' last-leaf actual indices)``: the fewest packets first,
+    of the packets' last-leaf actual indices)`` — the fewest packets first,
     then the smallest total number of encoded bytes, and — should several
     fragmentations still tie — the one whose successive fragment end indices
-    compare smallest. Each packet is byte-for-byte identical to the result
-    of :func:`multiproof_select` on the source proof for that same fragment
-    (the original public key, leaf indices and W-OTS elements are kept, and
-    authentication nodes follow the existing canonical ordering and
-    deduplication rule), so the caller verifies packet ``k`` with that
-    fragment's messages and contexts through
+    compare smallest. With ``"verify"`` the comparison set is still every
+    feasible consecutive fragmentation under every active budget — not only
+    the fewest-packet ones — and the result lexicographically minimises
+    ``(total verification hashes, packet count, total encoded bytes, tuple
+    of the packets' last-leaf actual indices)``: the smallest sum of the
+    packets' ``wots + leaf + multi`` bills (each computed exactly as for
+    ``max_verify_hashes``, with work shared between fragments billed to
+    every packet that spends it) first, then the fewest packets, then the
+    smallest total number of encoded bytes, then the lexicographically
+    smallest tuple of successive fragment end indices. A source proof that
+    satisfies every active budget as a single packet is returned unchanged
+    as a one-tuple under either objective. Each packet is byte-for-byte
+    identical to the result of :func:`multiproof_select` on the source proof
+    for that same fragment (the original public key, leaf indices and W-OTS
+    elements are kept, and authentication nodes follow the existing
+    canonical ordering and deduplication rule), so the caller verifies
+    packet ``k`` with that fragment's messages and contexts through
     :func:`multiproof_verify` / :func:`multiproof_verify_bound`, and merging
     the packets again with :func:`multiproof_merge` restores the source
     bytes exactly.
@@ -4354,9 +4373,10 @@ def multiproof_partition(
     Every type is checked before any content, exactly as in
     :func:`multiproof_select`: a wrong ``data`` or ``messages`` type, a
     non-``MerklePublicKey`` key, a non-integer ``max_bytes``,
-    ``max_verify_hashes`` or ``max_total_verify_hashes``, or a wrong
-    ``context``/``contexts`` type raises
-    ``TypeError``. A boolean or non-positive budget, an empty message tuple,
+    ``max_verify_hashes`` or ``max_total_verify_hashes``, a non-string
+    ``prefer``, or a wrong ``context``/``contexts`` type raises
+    ``TypeError``. A boolean or non-positive budget, a ``prefer`` string
+    other than ``"compact"`` or ``"verify"``, an empty message tuple,
     a message count that differs from the proof's leaf count, a structurally
     malformed source proof, a failing leaf signature or root fold, a
     public-key or context mismatch, and the absence of any feasible
@@ -4387,6 +4407,8 @@ def multiproof_partition(
         max_total_verify_hashes, int
     ):
         raise TypeError("max_total_verify_hashes must be an integer or None")
+    if not isinstance(prefer, str):
+        raise TypeError("prefer must be a string")
     context_bytes = _validate_context(context)
     contexts_tuple = _validate_contexts(contexts)
     if isinstance(max_bytes, bool) or max_bytes <= 0:
@@ -4404,6 +4426,8 @@ def multiproof_partition(
         raise ValueError(
             "max_total_verify_hashes must be a positive, non-boolean integer"
         )
+    if prefer not in ("compact", "verify"):
+        raise ValueError('prefer must be "compact" or "verify"')
     if not messages:
         raise ValueError("messages must not be empty")
     if contexts_tuple is not None:
@@ -4557,6 +4581,76 @@ def multiproof_partition(
     infeasible = (
         "no fragmentation of the multiproof fits " + " and ".join(budget_names)
     )
+    if prefer == "verify":
+        # Minimise the total verification-hash bill first, then the packet
+        # count, the total encoded bytes and the successive fragment end
+        # indices. The dynamic program is the one used under a total-hash
+        # budget below — every prefix partition's hash bill is tracked and
+        # Pareto-pruned — except that the total budget only caps the bills
+        # when max_total_verify_hashes is given, and the winning state is
+        # the one with the smallest (hashes, packet count, encoded bytes,
+        # end indices) key rather than the smallest (packet count, encoded
+        # bytes, end indices) one. The same dominance argument applies: a
+        # prefix state with a no-larger hash bill and a lexicographically
+        # no-worse (count, bytes, ends) key than another state of the same
+        # prefix stays no worse after any common continuation, because the
+        # continuation appends identical fragments — and therefore identical
+        # hash, size, count and end-index increments — to both.
+        best: list[dict[int, tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]] | None] = [  # noqa: E501
+            None
+        ] * (len(leaves) + 1)
+        best[0] = {0: (0, 0, (), ())}
+        for start in range(len(leaves)):
+            states = best[start]
+            if not states:
+                continue
+            frontier: list[
+                tuple[int, tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]]  # noqa: E501
+            ] = []
+            for hashes in sorted(states):
+                state = states[hashes]
+                if frontier and state[:3] >= frontier[-1][1][:3]:
+                    continue
+                frontier.append((hashes, state))
+            end = start + 1
+            while end <= len(leaves):
+                packet_indices = source_indices[start:end]
+                packet_size = fragment_size(start, end)
+                if packet_size > max_bytes:
+                    break
+                packet_hashes = verify_hashes(packet_indices)
+                if max_verify_hashes is not None and (
+                    packet_hashes > max_verify_hashes
+                ):
+                    break
+                targets = best[end]
+                if targets is None:
+                    targets = best[end] = {}
+                for hashes, state in frontier:
+                    new_hashes = hashes + packet_hashes
+                    if max_total_verify_hashes is not None and (
+                        new_hashes > max_total_verify_hashes
+                    ):
+                        continue
+                    candidate = (
+                        state[0] + 1,
+                        state[1] + packet_size,
+                        state[2] + (leaves[end - 1][0],),
+                        state[3] + ((start, end),),
+                    )
+                    current = targets.get(new_hashes)
+                    if current is None or candidate[:3] < current[:3]:
+                        targets[new_hashes] = candidate
+                end += 1
+        final_states = best[len(leaves)]
+        if not final_states:
+            raise ValueError(infeasible)
+        winner = min(
+            final_states.items(),
+            key=lambda item: (item[0], item[1][0], item[1][1], item[1][2]),
+        )[1]
+        return tuple(fragment_bytes(start, end) for start, end in winner[3])
+
     if max_total_verify_hashes is None:
         best: list[tuple[int, int, tuple[int, ...]] | None] = [None] * (
             len(leaves) + 1

@@ -34,8 +34,9 @@ messages and the expected public key alone.
 their source order, into the minimum number of consecutive fragments
 whose fresh standalone v1 multiproofs each fit a per-packet byte budget
 and, optionally, a per-packet verification-hash budget taken from
-:func:`merkle_verify_profile`, again from the source proof, its messages
-and the expected public key alone. Signer
+:func:`merkle_verify_profile`, optionally under a total
+verification-hash budget summed over the returned packets, again from
+the source proof, its messages and the expected public key alone. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -4140,6 +4141,7 @@ def multiproof_partition(
     context: Any = None,
     contexts: Any = None,
     max_verify_hashes: Any = None,
+    max_total_verify_hashes: Any = None,
 ) -> tuple[bytes, ...]:
     """Split a verified multiproof into budgeted standalone multiproofs.
 
@@ -4170,12 +4172,32 @@ def multiproof_partition(
     processing nor any hashing done while splitting is counted. Packets are
     billed independently: hash work shared between fragments is counted in
     every packet that spends it. Equality with the limit is allowed. A
-    source proof that satisfies both budgets on its own (including a source
-    that only fails the hash budget despite fitting the byte budget) is
-    returned unchanged as a one-tuple whenever the single-packet result
-    fits; if the source itself exceeds either budget it is repartitioned.
+    source proof that satisfies every applicable budget on its own
+    (including a source that only fails a hash budget despite fitting the
+    byte budget) is returned unchanged as a one-tuple whenever the
+    single-packet result fits; if the source itself exceeds any budget it
+    is repartitioned.
 
-    Among every fragmentation feasible under both budgets the result
+    ``max_total_verify_hashes`` is keyword-only and optional: when ``None``
+    (the default) no whole-result hash budget applies and the result is
+    exactly the one produced without the argument. When given a positive,
+    non-boolean integer, the verification-hash bills of the returned
+    packets — each exactly the ``wots + leaf + multi`` total described for
+    ``max_verify_hashes``, computed from the packet's own actual leaf set —
+    must add up to at most this total, and equality with the limit is
+    allowed. Because packets are billed independently, the total can
+    legitimately exceed what :func:`merkle_verify_profile` reports for the
+    unsplit source leaf set; the unsplit proof's own profile is never used
+    as a substitute, and message-digest, context-processing and splitting
+    work is not counted. The limit applies on top of both per-packet
+    budgets: a fragmentation is feasible only when every packet fits
+    ``max_bytes`` and ``max_verify_hashes`` and the packets' hash bills
+    together fit ``max_total_verify_hashes``, so when the fragmentation
+    that would win without the total budget busts it but another
+    fragmentation remains feasible, the best feasible one is returned
+    instead.
+
+    Among every fragmentation feasible under all applicable budgets the result
     lexicographically minimises ``(packet count, total encoded bytes, tuple
     of the packets' last-leaf actual indices)``: the fewest packets first,
     then the smallest total number of encoded bytes, and — should several
@@ -4194,7 +4216,8 @@ def multiproof_partition(
     whose members each follow the usual message rules
     (``bytes``/``bytearray``/``str``); ``public_key`` must be a
     :class:`MerklePublicKey`; ``max_bytes`` must be a non-boolean positive
-    integer, as must ``max_verify_hashes`` when it is not ``None``.
+    integer, as must ``max_verify_hashes`` and ``max_total_verify_hashes``
+    when they are not ``None``.
     ``context`` is keyword-only and optional and follows the usual context
     rules (``None``/empty means no context, ``str`` encoded as UTF-8); it
     must be the context the source proof was made under.
@@ -4214,14 +4237,17 @@ def multiproof_partition(
 
     Every type is checked before any content, exactly as in
     :func:`multiproof_select`: a wrong ``data`` or ``messages`` type, a
-    non-``MerklePublicKey`` key, a non-integer ``max_bytes`` or
-    ``max_verify_hashes``, or a wrong ``context``/``contexts`` type raises
+    non-``MerklePublicKey`` key, a non-integer ``max_bytes``,
+    ``max_verify_hashes`` or ``max_total_verify_hashes``, or a wrong
+    ``context``/``contexts`` type raises
     ``TypeError``. A boolean or non-positive budget, an empty message tuple,
     a message count that differs from the proof's leaf count, a structurally
     malformed source proof, a failing leaf signature or root fold, a
     public-key or context mismatch, and the absence of any feasible
     fragmentation (for example a single leaf's own proof already exceeds a
-    budget, or its hash count exceeds ``max_verify_hashes``) all raise
+    budget, its hash count exceeds ``max_verify_hashes``, or every
+    fragmentation's combined hash bill exceeds ``max_total_verify_hashes``)
+    all raise
     ``ValueError`` and no partial result is returned; the source proof is
     fully authenticated even when it fits in one packet and even when a
     budget is generous. No input is modified, the returned bytes never
@@ -4243,6 +4269,10 @@ def multiproof_partition(
         max_verify_hashes, int
     ):
         raise TypeError("max_verify_hashes must be an integer or None")
+    if max_total_verify_hashes is not None and not isinstance(
+        max_total_verify_hashes, int
+    ):
+        raise TypeError("max_total_verify_hashes must be an integer or None")
     context_bytes = _validate_context(context)
     contexts_tuple = _validate_contexts(contexts)
     if isinstance(max_bytes, bool) or max_bytes <= 0:
@@ -4252,6 +4282,13 @@ def multiproof_partition(
     ):
         raise ValueError(
             "max_verify_hashes must be a positive, non-boolean integer"
+        )
+    if max_total_verify_hashes is not None and (
+        isinstance(max_total_verify_hashes, bool)
+        or max_total_verify_hashes <= 0
+    ):
+        raise ValueError(
+            "max_total_verify_hashes must be a positive, non-boolean integer"
         )
     if not messages:
         raise ValueError("messages must not be empty")
@@ -4310,11 +4347,18 @@ def multiproof_partition(
         profile = merkle_verify_profile(w, height, indices)
         return profile.wots + profile.leaf + profile.multi
 
-    if len(source_bytes) <= max_bytes and (
-        max_verify_hashes is None
-        or verify_hashes(source_indices) <= max_verify_hashes
-    ):
-        return (source_bytes,)
+    if len(source_bytes) <= max_bytes:
+        if max_verify_hashes is None and max_total_verify_hashes is None:
+            return (source_bytes,)
+        source_hashes = verify_hashes(source_indices)
+        if (
+            max_verify_hashes is None
+            or source_hashes <= max_verify_hashes
+        ) and (
+            max_total_verify_hashes is None
+            or source_hashes <= max_total_verify_hashes
+        ):
+            return (source_bytes,)
 
     # Recover every tree node the proof determines, exactly as in
     # multiproof_select: verified leaf hashes, carried proof nodes and every
@@ -4387,61 +4431,89 @@ def multiproof_partition(
     # merkle_verify_profile adds a positive W-OTS/leaf contribution per leaf
     # and never loses an internal-node hash by including an extra leaf. The
     # feasible ends for each start therefore form a prefix under either
-    # budget, found by the linear scan below.
+    # per-packet budget, found by the linear scan below.
     #
-    # Dynamic programming over end positions keeps, keyed lexicographically
-    # by (packet count, total encoded bytes, successive end indices), the
-    # best partition of each prefix: the fewest packets wins regardless of
-    # bytes, then the smallest total, then the lexicographically smallest
-    # tuple of fragment end indices. Predecessors are stored for recovery and
-    # only the winning packets are serialised at the end.
-    best: list[tuple[int, int, tuple[int, ...]] | None] = [None] * (
-        len(leaves) + 1
-    )
-    predecessor: list[int | None] = [None] * (len(leaves) + 1)
-    best[0] = (0, 0, ())
+    # Dynamic programming over end positions keeps, for every prefix, the
+    # Pareto frontier of its partitions under (packet count, total encoded
+    # bytes, accumulated hash bill, successive end indices): a state is
+    # dropped as soon as another is at least as good on every component,
+    # because any completion of the dropped state then completes the kept
+    # one at least as well — the hash bill matters only through the total
+    # budget, so without one it is ignored and the frontier collapses to
+    # the single best (packet count, total bytes, end indices) state per
+    # prefix, coinciding with the per-packet-budgets-only search. The
+    # winner lexicographically minimises (packet count, total encoded
+    # bytes, successive end indices) among the states whose combined hash
+    # bill fits max_total_verify_hashes. Predecessors are stored for
+    # recovery and only the winning packets are serialised at the end.
+    track_hashes = max_total_verify_hashes is not None
+
+    def dominates(state: tuple, other: tuple) -> bool:
+        """Whether every completion of ``other`` suits ``state`` as well."""
+        if state[0] > other[0] or state[1] > other[1] or state[3] > other[3]:
+            return False
+        return not track_hashes or state[2] <= other[2]
+
+    # States are (packet count, total encoded bytes, combined hash bill,
+    # tuple of the packets' last-leaf actual indices, predecessor state,
+    # the state's own (start, end) cut).
+    frontier: list[list[tuple]] = [[] for _ in range(len(leaves) + 1)]
+    frontier[0].append((0, 0, 0, (), None, None))
     for start in range(len(leaves)):
-        if best[start] is None:
+        if not frontier[start]:
             continue
-        prefix_count, prefix_bytes, prefix_ends = best[start]
         end = start + 1
         while end <= len(leaves):
             packet_indices = source_indices[start:end]
             packet_size = fragment_size(start, end)
             if packet_size > max_bytes:
                 break
-            if max_verify_hashes is not None and (
-                verify_hashes(packet_indices) > max_verify_hashes
-            ):
-                break
-            candidate = (
-                prefix_count + 1,
-                prefix_bytes + packet_size,
-                prefix_ends + (leaves[end - 1][0],),
-            )
-            current = best[end]
-            if (
-                current is None
-                or candidate[:2] < current[:2]
-                or (candidate[:2] == current[:2] and candidate[2] < current[2])
-            ):
-                best[end] = candidate
-                predecessor[end] = start
+            packet_hashes = 0
+            if max_verify_hashes is not None or track_hashes:
+                packet_hashes = verify_hashes(packet_indices)
+                if max_verify_hashes is not None and (
+                    packet_hashes > max_verify_hashes
+                ):
+                    break
+            cut = (start, end)
+            last_index = leaves[end - 1][0]
+            for state in frontier[start]:
+                candidate = (
+                    state[0] + 1,
+                    state[1] + packet_size,
+                    state[2] + packet_hashes,
+                    state[3] + (last_index,),
+                    state,
+                    cut,
+                )
+                if track_hashes and candidate[2] > max_total_verify_hashes:
+                    continue
+                states = frontier[end]
+                if any(dominates(kept, candidate) for kept in states):
+                    continue
+                states[:] = [
+                    kept for kept in states if not dominates(candidate, kept)
+                ]
+                states.append(candidate)
             end += 1
-    if best[len(leaves)] is None:
+    if not frontier[len(leaves)]:
+        budgets = ["max_bytes"]
         if max_verify_hashes is not None:
-            raise ValueError(
-                "no fragmentation of the multiproof fits max_bytes and "
-                "max_verify_hashes"
-            )
-        raise ValueError("no fragmentation of the multiproof fits max_bytes")
-
+            budgets.append("max_verify_hashes")
+        if max_total_verify_hashes is not None:
+            budgets.append("max_total_verify_hashes")
+        raise ValueError(
+            "no fragmentation of the multiproof fits " + " and ".join(budgets)
+        )
+    best_state = min(
+        frontier[len(leaves)],
+        key=lambda state: (state[0], state[1], state[3]),
+    )
     cuts: list[tuple[int, int]] = []
-    end = len(leaves)
-    while end > 0:
-        start = predecessor[end]
-        cuts.append((start, end))
-        end = start
+    state = best_state
+    while state[5] is not None:
+        cuts.append(state[5])
+        state = state[4]
     cuts.reverse()
     return tuple(fragment_bytes(start, end) for start, end in cuts)
 

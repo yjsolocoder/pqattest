@@ -34,7 +34,8 @@ and the expected public key alone, and multiproof_partition to split a
 verified multiproof's leaves, in their source order, into the minimum
 number of consecutive standalone v1 multiproofs that each fit a
 per-packet byte budget and, optionally, a per-packet verification-hash
-budget taken from merkle_verify_profile, again from the source proof,
+budget taken from merkle_verify_profile plus a total verification-hash
+budget summed over the returned packets, again from the source proof,
 its messages and the expected public key alone, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /

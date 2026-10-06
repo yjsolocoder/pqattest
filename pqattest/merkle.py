@@ -32,9 +32,10 @@ messages and the expected public key alone.
 :func:`multiproof_partition` is the transport counterpart of
 :func:`multiproof_select`: it splits a verified multiproof's leaves, in
 their source order, into the minimum number of consecutive fragments
-whose fresh standalone v1 multiproofs each fit a per-packet byte budget,
-again from the source proof, its messages and the expected public key
-alone. Signer
+whose fresh standalone v1 multiproofs each fit a per-packet byte budget
+and, optionally, a per-packet verification-hash budget measured by
+:func:`merkle_verify_profile`, again from the source proof, its
+messages and the expected public key alone. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -4130,12 +4131,28 @@ def multiproof_expand(
     return MerkleBatchProof(public_key=proof_key, signatures=signatures)
 
 
+def _fragment_verify_hashes(
+    w: int, height: int, indices: tuple[int, ...]
+) -> int:
+    """Verification-hash metering of one fragment, via
+    :func:`merkle_verify_profile`: the ``wots`` W-OTS chain-step upper
+    bound plus the ``leaf`` leaf hashes plus the ``multi`` deduplicated
+    internal-node hashes. Imported lazily because :mod:`pqattest.params`
+    imports from this module.
+    """
+    from .params import merkle_verify_profile
+
+    profile = merkle_verify_profile(w, height, indices)
+    return profile.wots + profile.leaf + profile.multi
+
+
 def multiproof_partition(
     messages: Any,
     data: Any,
     *,
     public_key: Any,
     max_bytes: Any,
+    max_verify_hashes: Any = None,
     context: Any = None,
     contexts: Any = None,
 ) -> tuple[bytes, ...]:
@@ -4154,21 +4171,40 @@ def multiproof_partition(
     including its public key and authentication nodes, is at most
     ``max_bytes`` bytes (equality is allowed).
 
-    Among every feasible fragmentation the result lexicographically
-    minimises ``(packet count, total encoded bytes, tuple of the packets'
-    last-leaf actual indices)``: the fewest packets first, then the smallest
-    total number of encoded bytes, and — should several fragmentations still
-    tie — the one whose successive fragment end indices compare smallest.
-    Each packet is byte-for-byte identical to the result of
-    :func:`multiproof_select` on the source proof for that same fragment
-    (the original public key, leaf indices and W-OTS elements are kept, and
-    authentication nodes follow the existing canonical ordering and
-    deduplication rule), so the caller verifies packet ``k`` with that
-    fragment's messages and contexts through
-    :func:`multiproof_verify` / :func:`multiproof_verify_bound`, and merging
-    the packets again with :func:`multiproof_merge` restores the source
-    bytes exactly. When the source proof itself fits the budget, the result
-    is the one-tuple holding the source bytes unchanged.
+    ``max_verify_hashes`` is keyword-only and optional. When it is ``None``
+    (the default) only the byte budget applies and the result and exception
+    behaviour are unchanged. When given a positive integer it is a second
+    per-packet budget on verification work: for each fragment the hash count
+    is exactly the ``wots + leaf + multi`` sum reported by
+    :func:`merkle_verify_profile` for ``public_key``'s ``w`` and ``height``
+    and that fragment's actual leaf-index set — the upper bound on W-OTS
+    chain steps, one leaf hash per fragment leaf, and the deduplicated
+    internal-node hashes of the fragment's own multi-proof merge. The count
+    never uses the messages' actual chain steps and excludes message
+    digests, context processing and the hashing this repacking itself does;
+    every packet is metered independently. The bound is inclusive: a packet
+    whose count equals ``max_verify_hashes`` is accepted. A non-integer
+    value raises ``TypeError``; a boolean, zero or negative integer raises
+    ``ValueError``.
+
+    Among every fragmentation whose packets satisfy both budgets the
+    result lexicographically minimises ``(packet count, total encoded
+    bytes, tuple of the packets' last-leaf actual indices)``: the fewest
+    packets first, then the smallest total number of encoded bytes, and —
+    should several fragmentations still tie — the one whose successive
+    fragment end indices compare smallest. Each packet is byte-for-byte
+    identical to the result of :func:`multiproof_select` on the source
+    proof for that same fragment (the original public key, leaf indices
+    and W-OTS elements are kept, and authentication nodes follow the
+    existing canonical ordering and deduplication rule), so the caller
+    verifies packet ``k`` with that fragment's messages and contexts
+    through :func:`multiproof_verify` /
+    :func:`multiproof_verify_bound`, and merging the packets again with
+    :func:`multiproof_merge` restores the source bytes exactly. When the
+    source proof itself satisfies both budgets, the result is the
+    one-tuple holding the source bytes unchanged — even if a single
+    packet would otherwise be re-split, a hash budget the source exceeds
+    forces a repartition just like a byte budget does.
 
     ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple
     whose members each follow the usual message rules
@@ -4193,19 +4229,20 @@ def multiproof_partition(
 
     Every type is checked before any content, exactly as in
     :func:`multiproof_select`: a wrong ``data`` or ``messages`` type, a
-    non-``MerklePublicKey`` key, a non-integer ``max_bytes``, or a wrong
-    ``context``/``contexts`` type raises ``TypeError``. A boolean or
-    non-positive budget, an empty message tuple, a message count that
-    differs from the proof's leaf count, a structurally malformed source
-    proof, a failing leaf signature or root fold, a public-key or context
-    mismatch, and the absence of any feasible fragmentation (for example a
-    single leaf's own proof already exceeds the budget) all raise
-    ``ValueError`` and no partial result is returned; the source proof is
-    fully authenticated even when it fits in one packet. No input is
-    modified, the returned bytes never reference a caller's mutable
-    buffer, the result is deterministic for equal inputs, no randomness is
-    drawn and no signing state or signature quota is touched; no wire
-    format or version is added.
+    non-``MerklePublicKey`` key, a non-integer ``max_bytes`` or
+    ``max_verify_hashes``, or a wrong ``context``/``contexts`` type raises
+    ``TypeError``. A boolean or non-positive budget, an empty message
+    tuple, a message count that differs from the proof's leaf count, a
+    structurally malformed source proof, a failing leaf signature or root
+    fold, a public-key or context mismatch, and the absence of any
+    feasible fragmentation (for example a single leaf's own proof already
+    exceeds one of the budgets) all raise ``ValueError`` and no partial
+    result is returned; the source proof is fully authenticated even when
+    it fits in one packet and even when the budgets are very loose. No
+    input is modified, the returned bytes never reference a caller's
+    mutable buffer, the result is deterministic for equal inputs, no
+    randomness is drawn and no signing state or signature quota is
+    touched; no wire format or version is added.
     """
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("multiproof data must be bytes or bytearray")
@@ -4217,10 +4254,18 @@ def multiproof_partition(
         raise TypeError("public_key must be a MerklePublicKey")
     if not isinstance(max_bytes, int):
         raise TypeError("max_bytes must be an integer")
+    if max_verify_hashes is not None and not isinstance(max_verify_hashes, int):
+        raise TypeError("max_verify_hashes must be an integer or None")
     context_bytes = _validate_context(context)
     contexts_tuple = _validate_contexts(contexts)
     if isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive, non-boolean integer")
+    if max_verify_hashes is not None and (
+        isinstance(max_verify_hashes, bool) or max_verify_hashes <= 0
+    ):
+        raise ValueError(
+            "max_verify_hashes must be a positive, non-boolean integer"
+        )
     if not messages:
         raise ValueError("messages must not be empty")
     if contexts_tuple is not None:
@@ -4261,7 +4306,14 @@ def multiproof_partition(
     if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
         raise ValueError("the source multiproof does not verify")
     source_bytes = bytes(data)
-    if len(source_bytes) <= max_bytes:
+    source_indices = tuple(index for index, _ in leaves)
+    source_within_bytes = len(source_bytes) <= max_bytes
+    source_within_hashes = (
+        max_verify_hashes is None
+        or _fragment_verify_hashes(w, height, source_indices)
+        <= max_verify_hashes
+    )
+    if source_within_bytes and source_within_hashes:
         return (source_bytes,)
 
     # Recover every tree node the proof determines, exactly as in
@@ -4285,7 +4337,6 @@ def multiproof_partition(
                 known[(level + 1, index >> 1)] = _node_hash(node, sibling)
 
     elements_by_index = {index: elements for index, elements in leaves}
-    source_indices = tuple(index for index, _ in leaves)
     key_length = len(public_key.to_bytes())
     chains = l1 + l2
     leaf_block_bytes = 4 + ELEMENT_BYTES * chains
@@ -4326,14 +4377,28 @@ def multiproof_partition(
             + len(coordinates) * _MULTIPROOF_NODE_BYTES
         )
 
+    def fragment_hashes(start: int, end: int) -> int:
+        """Per-fragment verification-hash count (``wots + leaf + multi``).
+
+        Exactly the count :func:`merkle_verify_profile` reports for this
+        packet's public-key parameters and its actual leaf set; appending a
+        leaf adds its W-OTS chain-step bound and one leaf hash and at most
+        ``height`` deduplicated internal hashes, so the count is strictly
+        increasing in the fragment length.
+        """
+        return _fragment_verify_hashes(w, height, source_indices[start:end])
+
     # Every feasible fragmentation is a segmentation of the ordered leaves
-    # into in-budget fragments. The encoded fragment size is strictly
-    # increasing in its leaf count: appending one leaf adds a fixed
+    # into fragments satisfying both budgets. The encoded fragment size is
+    # strictly increasing in its leaf count: appending one leaf adds a fixed
     # 4 + 32*chains-byte leaf block, while the canonical node set can lose at
     # most one sibling per level (height <= 8, each node 35 bytes), and
     # 4 + 32*chains - 35*height is positive for both supported w values. The
-    # feasible ends for each start therefore form a prefix, found by the
-    # linear scan below.
+    # verification-hash count is likewise strictly increasing: the new leaf
+    # contributes one leaf hash plus its chains * (b - 1) chain steps, while
+    # the deduplicated internal-node count can rise by at most ``height``.
+    # The feasible ends for each start therefore form a prefix under either
+    # budget, found by the linear scan below.
     #
     # Dynamic programming over end positions keeps, keyed lexicographically
     # by (packet count, total encoded bytes, successive end indices), the
@@ -4355,6 +4420,11 @@ def multiproof_partition(
             packet_size = fragment_size(start, end)
             if packet_size > max_bytes:
                 break
+            if (
+                max_verify_hashes is not None
+                and fragment_hashes(start, end) > max_verify_hashes
+            ):
+                break
             candidate = (
                 prefix_count + 1,
                 prefix_bytes + packet_size,
@@ -4370,7 +4440,11 @@ def multiproof_partition(
                 predecessor[end] = start
             end += 1
     if best[len(leaves)] is None:
-        raise ValueError("no fragmentation of the multiproof fits max_bytes")
+        raise ValueError(
+            "no fragmentation of the multiproof fits max_bytes"
+            if max_verify_hashes is None
+            else "no fragmentation of the multiproof fits both budgets"
+        )
 
     cuts: list[tuple[int, int]] = []
     end = len(leaves)

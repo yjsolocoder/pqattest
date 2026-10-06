@@ -4,6 +4,7 @@ import unittest
 
 from pqattest import (
     MerkleSigner,
+    merkle_verify_profile,
     multiproof_encode,
     multiproof_expand,
     multiproof_merge,
@@ -70,6 +71,61 @@ def packet_key(packets):
         sum(len(packet) for packet in packets),
         tuple(_multiproof_parse(packet)[1][-1][0] for packet in packets),
     )
+
+
+def verify_hashes(public_key, packet):
+    """wots + leaf + multi the profile bills a packet's leaf set."""
+    _, leaves, _ = _multiproof_parse(packet)
+    indices = tuple(index for index, _ in leaves)
+    profile = merkle_verify_profile(public_key.w, public_key.height, indices)
+    return profile.wots + profile.leaf + profile.multi
+
+
+def brute_force_two_budget_key(
+    messages, proof, public_key, byte_budget, hash_budget, contexts=None
+):
+    """Exhaustively minimise the partition key under both per-packet budgets.
+
+    As :func:`brute_force_key`, but every fragment must also fit the
+    ``wots + leaf + multi`` verification-hash budget derived through
+    :func:`merkle_verify_profile` for that fragment's actual leaf set.
+    """
+    batch = multiproof_expand(
+        messages, proof, public_key=public_key, contexts=contexts
+    )
+    signatures = batch.signatures
+    n = len(signatures)
+    sizes, hashes = {}, {}
+    for start in range(n):
+        for end in range(start + 1, n + 1):
+            fragment = tuple(signatures[start:end])
+            sizes[(start, end)] = len(
+                multiproof_encode(public_key, fragment)
+            )
+            profile = merkle_verify_profile(
+                public_key.w,
+                public_key.height,
+                tuple(signature.index for signature in fragment),
+            )
+            hashes[(start, end)] = profile.wots + profile.leaf + profile.multi
+    best = None
+    for cuts in range(1, n + 1):
+        for inner in itertools.combinations(range(1, n), cuts - 1):
+            bounds = (0,) + inner + (n,)
+            total = 0
+            ends = ()
+            for start, end in zip(bounds, bounds[1:]):
+                size = sizes[(start, end)]
+                work = hashes[(start, end)]
+                if size > byte_budget or work > hash_budget:
+                    break
+                total += size
+                ends += (signatures[end - 1].index,)
+            else:
+                candidate = (cuts, total, ends)
+                if best is None or candidate < best:
+                    best = candidate
+    return best
 
 
 def brute_force_key(messages, proof, public_key, budget, contexts=None):
@@ -420,6 +476,477 @@ class TestMultiproofPartitionOptimality(unittest.TestCase):
             max_bytes=len(proof),
         )
         self.assertEqual(len(packets), 1)
+
+
+class TestMultiproofPartitionVerifyHashBudget(unittest.TestCase):
+    def test_none_and_omitted_match_exact_results(self):
+        for w in (4, 8):
+            public_key, messages, _, proof = make_proof(w=w, height=4)
+            kwargs = dict(public_key=public_key, max_bytes=len(proof) // 3)
+            omitted = multiproof_partition(messages, proof, **kwargs)
+            explicit = multiproof_partition(
+                messages, proof, max_verify_hashes=None, **kwargs
+            )
+            self.assertEqual(explicit, omitted)
+            # One packet that fits the byte budget is returned unchanged
+            # exactly as without the hash argument.
+            packets = multiproof_partition(
+                messages,
+                proof,
+                public_key=public_key,
+                max_bytes=len(proof),
+                max_verify_hashes=None,
+            )
+            self.assertEqual(packets, (proof,))
+
+    def test_source_fits_both_budgets_returns_source_unchanged(self):
+        for w in (4, 8):
+            for height in (1, 3, 8):
+                public_key, messages, _, proof = make_proof(w=w, height=height)
+                source_work = verify_hashes(public_key, proof)
+                for budget in (source_work, source_work + 1, 10**9):
+                    with self.subTest(w=w, height=height, budget=budget):
+                        packets = multiproof_partition(
+                            messages,
+                            proof,
+                            public_key=public_key,
+                            max_bytes=len(proof),
+                            max_verify_hashes=budget,
+                        )
+                        self.assertEqual(packets, (proof,))
+
+    def test_hash_budget_alone_forces_repartition(self):
+        # A byte budget that comfortably fits the source does not stop the
+        # hash budget from forcing a split.
+        for w in (4, 8):
+            public_key, messages, _, proof = make_proof(w=w, height=5)
+            source_work = verify_hashes(public_key, proof)
+            packets = multiproof_partition(
+                messages,
+                proof,
+                public_key=public_key,
+                max_bytes=10**9,
+                max_verify_hashes=source_work - 1,
+            )
+            self.assertGreater(len(packets), 1)
+            position = 0
+            for packet in packets:
+                _, leaves, _ = _multiproof_parse(packet)
+                count = len(leaves)
+                fragment = messages[position : position + count]
+                self.assertTrue(multiproof_verify(fragment, packet))
+                self.assertLessEqual(
+                    verify_hashes(public_key, packet), source_work - 1
+                )
+                position += count
+            self.assertEqual(position, len(messages))
+
+    def test_single_leaf_hash_floor(self):
+        for w in (4, 8):
+            for height in (1, 3, 8):
+                public_key, messages, _, proof = make_proof(
+                    w=w, height=height
+                )
+                one = multiproof_select(
+                    messages,
+                    proof,
+                    public_key=public_key,
+                    indices=(0,),
+                )
+                floor = verify_hashes(public_key, one)
+                with self.subTest(w=w, height=height):
+                    # The floor itself is feasible and forces singletons.
+                    packets = multiproof_partition(
+                        messages,
+                        proof,
+                        public_key=public_key,
+                        max_bytes=10**9,
+                        max_verify_hashes=floor,
+                    )
+                    self.assertEqual(len(packets), len(messages))
+                    for packet in packets:
+                        self.assertEqual(
+                            len(_multiproof_parse(packet)[1]), 1
+                        )
+                        self.assertEqual(
+                            verify_hashes(public_key, packet), floor
+                        )
+                    # One hash fewer is infeasible.
+                    with self.assertRaises(ValueError):
+                        multiproof_partition(
+                            messages,
+                            proof,
+                            public_key=public_key,
+                            max_bytes=10**9,
+                            max_verify_hashes=floor - 1,
+                        )
+
+    def test_both_budgets_bind_per_packet(self):
+        public_key, messages, _, proof = make_proof(height=4)
+        packets = multiproof_partition(
+            messages,
+            proof,
+            public_key=public_key,
+            max_bytes=len(proof) // 4,
+            max_verify_hashes=verify_hashes(public_key, proof) // 3,
+        )
+        self.assertGreater(len(packets), 1)
+        position = 0
+        groups = []
+        for packet in packets:
+            _, leaves, _ = _multiproof_parse(packet)
+            count = len(leaves)
+            fragment = messages[position : position + count]
+            self.assertLessEqual(len(packet), len(proof) // 4)
+            self.assertLessEqual(
+                verify_hashes(public_key, packet),
+                verify_hashes(public_key, proof) // 3,
+            )
+            self.assertTrue(
+                multiproof_verify_bound(
+                    fragment,
+                    packet,
+                    public_key=public_key,
+                    indices=tuple(index for index, _ in leaves),
+                )
+            )
+            groups.append(fragment)
+            position += count
+        self.assertEqual(position, len(messages))
+        self.assertEqual(
+            multiproof_merge(
+                tuple(groups), packets, public_key=public_key
+            ),
+            proof,
+        )
+
+    def test_hash_budget_is_message_independent_upper_bound(self):
+        # Different messages must not change the hash bill: the profile
+        # counts chain-step upper bounds, so duplicate / arbitrary messages
+        # produce the same feasible partition.
+        signer = make_signer(height=3)
+        messages = tuple(f"message-{i}" for i in range(8))
+        signatures = signer.sign_batch(messages)
+        public_key = signer.public_key
+        proof = multiproof_encode(public_key, signatures)
+        budget = verify_hashes(public_key, proof) // 3
+        packets = multiproof_partition(
+            messages,
+            proof,
+            public_key=public_key,
+            max_bytes=10**9,
+            max_verify_hashes=budget,
+        )
+        duplicate_signer = make_signer(height=3)
+        duplicate_proof = multiproof_encode(
+            public_key,
+            duplicate_signer.sign_batch(("same",) * 8),
+        )
+        # The duplicate proof covers the same leaf set: reusing its
+        # different messages with the same budget must yield the same
+        # packet end-index key.
+        duplicate_packets = multiproof_partition(
+            ("same",) * 8,
+            duplicate_proof,
+            public_key=public_key,
+            max_bytes=10**9,
+            max_verify_hashes=budget,
+        )
+        self.assertEqual(packet_key(packets), packet_key(duplicate_packets))
+
+    def test_sparse_leaves_under_hash_budget(self):
+        keep = (0, 3, 7, 11, 15)
+        public_key, messages, _, proof = make_proof(height=4, keep=keep)
+        budget = verify_hashes(public_key, proof) - 1
+        packets = multiproof_partition(
+            messages,
+            proof,
+            public_key=public_key,
+            max_bytes=10**9,
+            max_verify_hashes=budget,
+        )
+        self.assertGreater(len(packets), 1)
+        covered = ()
+        position = 0
+        for packet in packets:
+            _, leaves, _ = _multiproof_parse(packet)
+            count = len(leaves)
+            self.assertTrue(
+                multiproof_verify(
+                    messages[position : position + count], packet
+                )
+            )
+            self.assertLessEqual(
+                verify_hashes(public_key, packet), budget
+            )
+            covered += tuple(index for index, _ in leaves)
+            position += count
+        self.assertEqual(covered, keep)
+
+    def test_packets_equal_select_and_remerge_under_hash_budget(self):
+        for w in (4, 8):
+            public_key, messages, _, proof = make_proof(w=w, height=4)
+            packets = multiproof_partition(
+                messages,
+                proof,
+                public_key=public_key,
+                max_bytes=len(proof) // 2,
+                max_verify_hashes=verify_hashes(public_key, proof) // 3,
+            )
+            position = 0
+            groups = []
+            for packet in packets:
+                _, leaves, _ = _multiproof_parse(packet)
+                count = len(leaves)
+                indices = tuple(index for index, _ in leaves)
+                self.assertEqual(
+                    packet,
+                    multiproof_select(
+                        messages,
+                        proof,
+                        public_key=public_key,
+                        indices=indices,
+                    ),
+                )
+                groups.append(messages[position : position + count])
+                position += count
+            self.assertEqual(
+                multiproof_merge(
+                    tuple(groups), packets, public_key=public_key
+                ),
+                proof,
+            )
+
+    def test_per_leaf_contexts_with_hash_budget(self):
+        signer = make_signer(height=4)
+        keep = (0, 3, 7, 11, 15)
+        messages = tuple(f"message-{i}" for i in keep)
+        contexts = tuple(f"ctx-{i}" for i in keep)
+        signatures = signer.sign_selected(
+            tuple(keep), messages, contexts=contexts
+        )
+        public_key = signer.public_key
+        proof = multiproof_encode(public_key, signatures)
+        packets = multiproof_partition(
+            messages,
+            proof,
+            public_key=public_key,
+            max_bytes=10**9,
+            contexts=contexts,
+            max_verify_hashes=verify_hashes(public_key, proof) - 1,
+        )
+        self.assertGreaterEqual(len(packets), 2)
+        position = 0
+        for packet in packets:
+            _, leaves, _ = _multiproof_parse(packet)
+            count = len(leaves)
+            fragment = messages[position : position + count]
+            fragment_contexts = contexts[position : position + count]
+            self.assertTrue(
+                multiproof_verify(
+                    fragment, packet, contexts=fragment_contexts
+                )
+            )
+            self.assertFalse(multiproof_verify(fragment, packet))
+            position += count
+
+    def test_matches_exhaustive_enumeration_under_both_budgets(self):
+        rng = random.Random(4144)
+        cases = 0
+        for height in range(1, 9):
+            for w in (4, 8):
+                signer = make_signer(height=height, w=w)
+                total = 1 << height
+                all_messages = tuple(f"m{i}" for i in range(total))
+                all_signatures = signer.sign_batch(all_messages)
+                subsets = (
+                    [tuple(range(total))] if total <= 8 else []
+                )
+                for size in (1, 2, 3, min(5, total)):
+                    if size >= total:
+                        continue
+                    for _ in range(2):
+                        subset = tuple(
+                            sorted(rng.sample(range(total), size))
+                        )
+                        if subset not in subsets:
+                            subsets.append(subset)
+                for subset in subsets:
+                    signatures = tuple(
+                        all_signatures[i] for i in subset
+                    )
+                    proof = multiproof_encode(
+                        signer.public_key, signatures
+                    )
+                    messages = tuple(all_messages[i] for i in subset)
+                    one = multiproof_encode(
+                        signer.public_key, (signatures[0],)
+                    )
+                    two = multiproof_encode(
+                        signer.public_key,
+                        tuple(signatures[: min(2, len(signatures))]),
+                    )
+                    source_work = verify_hashes(signer.public_key, proof)
+                    one_work = verify_hashes(signer.public_key, one)
+                    byte_budgets = (
+                        len(proof),
+                        len(one),
+                        len(two),
+                        (len(proof) + len(one)) // 2,
+                        len(one) - 1,
+                    )
+                    hash_budgets = (
+                        source_work,
+                        source_work // 2,
+                        source_work // 3,
+                        max(1, source_work - 1),
+                        one_work,
+                        one_work - 1,
+                    )
+                    for byte_budget in byte_budgets:
+                        for hash_budget in hash_budgets:
+                            if byte_budget < 1 or hash_budget < 1:
+                                continue
+                            try:
+                                packets = multiproof_partition(
+                                    messages,
+                                    proof,
+                                    public_key=signer.public_key,
+                                    max_bytes=byte_budget,
+                                    max_verify_hashes=hash_budget,
+                                )
+                            except ValueError:
+                                packets = None
+                            expected = brute_force_two_budget_key(
+                                messages,
+                                proof,
+                                signer.public_key,
+                                byte_budget,
+                                hash_budget,
+                            )
+                            self.assertIs(
+                                packets is None,
+                                expected is None,
+                                (
+                                    height,
+                                    w,
+                                    subset,
+                                    byte_budget,
+                                    hash_budget,
+                                ),
+                            )
+                            if packets is not None:
+                                self.assertEqual(
+                                    packet_key(packets),
+                                    expected,
+                                    (
+                                        height,
+                                        w,
+                                        subset,
+                                        byte_budget,
+                                        hash_budget,
+                                    ),
+                                )
+                                cases += 1
+        self.assertGreater(cases, 100)
+
+
+class TestMultiproofPartitionVerifyHashValidation(unittest.TestCase):
+    def setUp(self):
+        self.public_key, self.messages, _, self.proof = make_proof(
+            height=2
+        )
+        self.budget = 10**9
+
+    def partition(self, **kwargs):
+        kwargs.setdefault("public_key", self.public_key)
+        kwargs.setdefault("max_bytes", self.budget)
+        kwargs.setdefault("max_verify_hashes", self.budget)
+        return multiproof_partition(
+            self.messages, self.proof, **kwargs
+        )
+
+    def test_hash_budget_type_errors(self):
+        for bad in (1.5, "100", 1.0, [100], object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    self.partition(max_verify_hashes=bad)
+
+    def test_hash_budget_value_errors(self):
+        for bad in (True, False, 0, -1, -10**6):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.partition(max_verify_hashes=bad)
+
+    def test_hash_type_check_precedes_its_content_check(self):
+        # A float budget is a TypeError even though it is also non-positive.
+        with self.assertRaises(TypeError):
+            multiproof_partition(
+                self.messages,
+                self.proof,
+                public_key=self.public_key,
+                max_bytes=self.budget,
+                max_verify_hashes=-1.5,
+            )
+
+    def test_all_type_checks_precede_content_checks(self):
+        # Bad max_verify_hashes type precedes malformed data and empty
+        # messages, and precedes a (content-level) non-positive max_bytes.
+        with self.assertRaises(TypeError):
+            multiproof_partition(
+                (),
+                b"",
+                public_key=self.public_key,
+                max_bytes=0,
+                max_verify_hashes="100",
+            )
+        # A content-error boolean hash budget must not mask an earlier
+        # TypeError on max_bytes.
+        with self.assertRaises(TypeError):
+            multiproof_partition(
+                self.messages,
+                self.proof,
+                public_key=self.public_key,
+                max_bytes=1.5,
+                max_verify_hashes=True,
+            )
+
+    def test_infeasible_under_only_hash_budget_raises(self):
+        one = multiproof_select(
+            self.messages,
+            self.proof,
+            public_key=self.public_key,
+            indices=(0,),
+        )
+        floor = verify_hashes(self.public_key, one)
+        with self.assertRaises(ValueError):
+            multiproof_partition(
+                self.messages,
+                self.proof,
+                public_key=self.public_key,
+                max_bytes=self.budget,
+                max_verify_hashes=floor - 1,
+            )
+
+    def test_source_fully_verified_under_generous_hash_budget(self):
+        corrupted = bytearray(self.proof)
+        corrupted[-1] ^= 0x01
+        with self.assertRaises(ValueError):
+            multiproof_partition(
+                self.messages,
+                bytes(corrupted),
+                public_key=self.public_key,
+                max_bytes=self.budget,
+                max_verify_hashes=self.budget,
+            )
+        with self.assertRaises(ValueError):
+            multiproof_partition(
+                self.messages[:3],
+                self.proof,
+                public_key=self.public_key,
+                max_bytes=self.budget,
+                max_verify_hashes=self.budget,
+            )
 
 
 class TestMultiproofPartitionContexts(unittest.TestCase):

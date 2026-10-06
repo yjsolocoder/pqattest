@@ -33,8 +33,9 @@ with complete authentication paths from the source proof, its messages
 and the expected public key alone, and multiproof_partition to split a
 verified multiproof's leaves, in their source order, into the minimum
 number of consecutive standalone v1 multiproofs that each fit a
-per-packet byte budget, again from the source proof, its messages and
-the expected public key alone, static
+per-packet byte budget and, optionally, a per-packet verification-hash
+budget taken from merkle_verify_profile, again from the source proof,
+its messages and the expected public key alone, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
 recommend_scheme_weighted to rank that cross-scheme frontier by a

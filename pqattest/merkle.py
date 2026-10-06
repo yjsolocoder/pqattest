@@ -2500,6 +2500,127 @@ class MerkleSigner:
             self._next_index = base + len(signatures)
             return proof, self._checkpoint_bytes()
 
+    def sign_multiproof_with_seed_checkpoint(
+        self, messages: Any, *, context: Any = None, contexts: Any = None
+    ) -> tuple[bytes, bytes]:
+        """Sign a tuple of messages and return the multiproof plus a seed checkpoint.
+
+        Combines :meth:`sign_batch`, :func:`multiproof_encode` and
+        :meth:`seed_checkpoint` in one atomic call — the compact counterpart
+        of :meth:`sign_multiproof_with_checkpoint`, available only on a
+        signer created by :meth:`from_seed` (or restored by
+        :meth:`from_seed_checkpoint`). Returns ``(proof, blob)``: ``proof``
+        is byte-for-byte identical to calling :func:`multiproof_encode` on
+        this signer's :attr:`public_key` and the tuple of consecutive
+        signatures produced for ``messages`` from the current
+        :attr:`next_index` — the same bytes :func:`multiproof_verify`
+        accepts together with ``messages`` — and ``blob`` is the existing
+        v1 seed-checkpoint encoding unchanged, byte-for-byte identical to
+        calling :meth:`seed_checkpoint` immediately after the batch: the
+        fixed 109-byte blob holding the seed and the new ``next_index``
+        instead of every private key. A signer restored from it with
+        :meth:`from_seed_checkpoint` keeps the same public key and resumes
+        signing exactly at the batch's final position; a checkpoint taken
+        right when the batch exactly exhausts the tree restores a signer
+        with :attr:`remaining` equal to ``0``, so any later legal non-empty
+        batch still reports exhaustion.
+
+        ``messages`` must be a non-empty ``tuple`` whose members each follow
+        the usual message rules (``bytes``/``bytearray``/``str``; a ``str``
+        is encoded as UTF-8); the batch allocates consecutive leaves from
+        the current :attr:`next_index` in message order, and a repeated
+        message simply occupies one leaf per occurrence. ``context`` is
+        keyword-only and optional: ``None`` and an empty value both mean no
+        context; any other ``bytes``/``bytearray``/``str`` (``str`` encoded
+        as UTF-8) is bound into every message digest. ``contexts`` is
+        keyword-only and optional and binds a separate context per message,
+        exactly as in :meth:`sign_batch`: ``None`` (the default) keeps the
+        shared-``context`` behaviour, while a tuple must have the same
+        length as ``messages`` and applies its members positionally — each
+        member is ``None``, ``bytes``, ``bytearray`` or ``str`` (``None``
+        and empty values mean "no context" for that position) — and may
+        only be combined with an empty shared ``context``. Contexts enter
+        the message digests only and are never written into the returned
+        proof or checkpoint; the verifier recovers them through the
+        ``context``/``contexts`` parameters of :func:`multiproof_verify`.
+
+        Validation happens in a fixed order before any leaf is consumed:
+        first every input type (a non-tuple ``messages`` or ``contexts``
+        container, or an illegal message or context member, raises
+        ``TypeError``), then an empty ``messages`` tuple, a ``contexts``
+        count different from the message count, or a non-empty shared
+        ``context`` combined with ``contexts`` (each raises ``ValueError``),
+        then whether this signer keeps its seed — a randomly constructed
+        signer or one restored from the full :meth:`checkpoint` format
+        raises ``ValueError`` even when it originally descended from a seed
+        — and finally the remaining-leaf capacity, where a batch larger
+        than the number of remaining leaves raises
+        :class:`KeyExhaustedError`. A proof structure the v1 multiproof
+        format cannot express raises ``ValueError``. Every failure happens
+        without spending a leaf and returns no partial result; the state is
+        advanced only once the proof bytes have been built, so a failed
+        encode cannot leave the signer half-way.
+
+        The whole call runs under the same lock as :meth:`sign`,
+        :meth:`sign_batch`, :meth:`advance_to`, the index properties,
+        :meth:`checkpoint` and :meth:`seed_checkpoint`: leaves are allocated
+        consecutively from the current ``next_index`` and the proof, the
+        state advance and the snapshot form one linearised operation, so
+        under concurrency the batch's leaves are never interleaved with
+        another call's allocations, the returned checkpoint never reflects
+        a later call's advance, and a concurrent observer never sees a
+        half-consumed batch. No randomness is drawn anywhere in the call
+        and the inputs are not mutated. The returned checkpoint contains
+        the seed — and therefore every private key — in the clear, and the
+        trailing hash only detects accidental corruption, so
+        confidentiality, durable storage and rollback protection remain the
+        caller's responsibility.
+        """
+        context_bytes = _validate_context(context)
+        contexts_tuple = _validate_contexts(contexts)
+        if not isinstance(messages, tuple):
+            raise TypeError("messages must be a tuple of messages")
+        for message in messages:
+            _as_bytes(message)
+        if not messages:
+            raise ValueError("messages must not be empty")
+        if contexts_tuple is not None:
+            if len(contexts_tuple) != len(messages):
+                raise ValueError(
+                    "contexts and messages must have the same length"
+                )
+            if context_bytes:
+                raise ValueError(
+                    "contexts cannot be combined with a non-empty context"
+                )
+            per_contexts = contexts_tuple
+        else:
+            per_contexts = (context_bytes,) * len(messages)
+        with self._lock:
+            if self._seed is None:
+                raise ValueError(
+                    "sign_multiproof_with_seed_checkpoint is only available "
+                    "on a seed-derived signer"
+                )
+            base = self._next_index
+            leaf_count = len(self._private_keys)
+            if len(messages) > leaf_count - base:
+                raise KeyExhaustedError(
+                    "not enough Merkle leaves remain for the multiproof"
+                )
+            signatures = tuple(
+                self._signature_at(base + offset, message, per_contexts[offset])
+                for offset, message in enumerate(messages)
+            )
+            # Encode before advancing: a structural failure must consume no
+            # leaf, and no observer must ever see the advanced state without
+            # the finished proof.
+            proof = multiproof_encode(self._public_key, signatures)
+            new_next_index = base + len(signatures)
+            checkpoint = self._seed_checkpoint_bytes(new_next_index)
+            self._next_index = new_next_index
+            return proof, checkpoint
+
     def sign_with_auth_state(
         self, message: Any, *, key: Any, generation: Any, context: Any = None
     ) -> tuple[MerkleSignature, bytes]:

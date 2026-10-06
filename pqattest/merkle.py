@@ -28,7 +28,13 @@ messages and the expected public key alone. :func:`multiproof_expand` is
 the inverse of :func:`multiproof_encode`: it restores a verified
 multiproof to an ordinary :class:`MerkleBatchProof` of standalone
 :class:`MerkleSignature` values, again from the source proof, its
-messages and the expected public key alone. Signer
+messages and the expected public key alone.
+:func:`multiproof_partition` is the transport counterpart of
+:func:`multiproof_select`: it splits a verified multiproof's leaves, in
+their source order, into the minimum number of consecutive fragments
+whose fresh standalone v1 multiproofs each fit a per-packet byte budget,
+again from the source proof, its messages and the expected public key
+alone. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -60,8 +66,9 @@ entries :meth:`MerkleSigner.sign_selected`,
 :func:`multiproof_select` and :func:`multiproof_expand` —
 additionally accept a keyword-only ``contexts`` tuple that binds a
 separate context to each message positionally (for the selection entries,
-to each chosen leaf at its tuple position; for :func:`multiproof_select`
-and :func:`multiproof_expand`, to every leaf of the source proof in its
+to each chosen leaf at its tuple position; for :func:`multiproof_select`,
+:func:`multiproof_partition` and :func:`multiproof_expand`, to every
+leaf of the source proof in its
 leaf order, so the context of a dropped leaf is still checked;
 ``None``/empty members mean no context for that position); it cannot be
 combined with a non-empty shared ``context`` and is never written into
@@ -105,6 +112,7 @@ __all__ = [
     "multiproof_encode",
     "multiproof_expand",
     "multiproof_merge",
+    "multiproof_partition",
     "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",
@@ -4120,4 +4128,257 @@ def multiproof_expand(
         for index, elements in leaves
     )
     return MerkleBatchProof(public_key=proof_key, signatures=signatures)
+
+
+def multiproof_partition(
+    messages: Any,
+    data: Any,
+    *,
+    public_key: Any,
+    max_bytes: Any,
+    context: Any = None,
+    contexts: Any = None,
+) -> tuple[bytes, ...]:
+    """Split a verified multiproof into budgeted standalone multiproofs.
+
+    Given only a source :func:`multiproof_encode` proof (``data``), every
+    message it proves (``messages``, in the source proof's leaf order) and
+    the expected ``public_key``, partition its leaves into one or more
+    non-empty consecutive fragments — consecutive in message position, so
+    the actual tree leaf indices may be sparse — and re-emit each fragment
+    as a fresh independently verifiable v1 multiproof, without access to the
+    original single signatures or any private key. The returned tuple is
+    ordered by source leaf order and its packets cover the source leaves
+    exactly once: no leaf is missing, repeated or merged, even when several
+    leaves carry the same message. Each packet's complete encoding,
+    including its public key and authentication nodes, is at most
+    ``max_bytes`` bytes (equality is allowed).
+
+    Among every feasible fragmentation the result lexicographically
+    minimises ``(packet count, total encoded bytes, tuple of the packets'
+    last-leaf actual indices)``: the fewest packets first, then the smallest
+    total number of encoded bytes, and — should several fragmentations still
+    tie — the one whose successive fragment end indices compare smallest.
+    Each packet is byte-for-byte identical to the result of
+    :func:`multiproof_select` on the source proof for that same fragment
+    (the original public key, leaf indices and W-OTS elements are kept, and
+    authentication nodes follow the existing canonical ordering and
+    deduplication rule), so the caller verifies packet ``k`` with that
+    fragment's messages and contexts through
+    :func:`multiproof_verify` / :func:`multiproof_verify_bound`, and merging
+    the packets again with :func:`multiproof_merge` restores the source
+    bytes exactly. When the source proof itself fits the budget, the result
+    is the one-tuple holding the source bytes unchanged.
+
+    ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple
+    whose members each follow the usual message rules
+    (``bytes``/``bytearray``/``str``); ``public_key`` must be a
+    :class:`MerklePublicKey`; ``max_bytes`` must be a non-boolean positive
+    integer. ``context`` is keyword-only and optional and follows the usual
+    context rules (``None``/empty means no context, ``str`` encoded as
+    UTF-8); it must be the context the source proof was made under.
+
+    ``contexts`` is keyword-only and optional and instead binds a separate
+    context per source-proof leaf exactly as in :func:`multiproof_select`:
+    ``None`` (the default) keeps the shared-``context`` behaviour, while a
+    tuple applies its members positionally in source leaf order, one per
+    member of ``messages`` (``None``/empty means no context for that
+    position, a ``str`` encoded as UTF-8). A non-tuple ``contexts`` or a
+    member of another type raises ``TypeError``; an empty tuple, a count
+    that differs from the message count, or combining ``contexts`` with a
+    non-empty ``context`` raises ``ValueError`` (an empty shared ``context``
+    is allowed). Packets carry no context themselves: the caller verifies
+    each one with only its fragment's messages and matching per-leaf
+    ``contexts``.
+
+    Every type is checked before any content, exactly as in
+    :func:`multiproof_select`: a wrong ``data`` or ``messages`` type, a
+    non-``MerklePublicKey`` key, a non-integer ``max_bytes``, or a wrong
+    ``context``/``contexts`` type raises ``TypeError``. A boolean or
+    non-positive budget, an empty message tuple, a message count that
+    differs from the proof's leaf count, a structurally malformed source
+    proof, a failing leaf signature or root fold, a public-key or context
+    mismatch, and the absence of any feasible fragmentation (for example a
+    single leaf's own proof already exceeds the budget) all raise
+    ``ValueError`` and no partial result is returned; the source proof is
+    fully authenticated even when it fits in one packet. No input is
+    modified, the returned bytes never reference a caller's mutable
+    buffer, the result is deterministic for equal inputs, no randomness is
+    drawn and no signing state or signature quota is touched; no wire
+    format or version is added.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("multiproof data must be bytes or bytearray")
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    for message in messages:
+        _as_bytes(message)
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    if not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an integer")
+    context_bytes = _validate_context(context)
+    contexts_tuple = _validate_contexts(contexts)
+    if isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive, non-boolean integer")
+    if not messages:
+        raise ValueError("messages must not be empty")
+    if contexts_tuple is not None:
+        if not contexts_tuple:
+            raise ValueError("contexts must not be empty")
+        if context_bytes:
+            raise ValueError(
+                "contexts cannot be combined with a non-empty context"
+            )
+        if len(contexts_tuple) != len(messages):
+            raise ValueError("contexts and messages must have the same length")
+    parsed = _multiproof_parse(data)
+    if parsed is None:
+        raise ValueError("the source multiproof is malformed")
+    proof_key, leaves, proof_nodes = parsed
+    if len(messages) != len(leaves):
+        raise ValueError("messages and proof leaves must have the same length")
+    if (
+        public_key.w != proof_key.w
+        or public_key.height != proof_key.height
+        or public_key.root != proof_key.root
+    ):
+        raise ValueError("public_key does not match the proof's embedded public key")
+    w = proof_key.w
+    height = proof_key.height
+    b, l1, l2 = _params(w)
+    leaf_hashes: dict[int, bytes] = {}
+    for position, (index, wots_signature) in enumerate(leaves):
+        leaf_context = (
+            contexts_tuple[position] if contexts_tuple is not None else context_bytes
+        )
+        digits = _merkle_signing_digits(messages[position], w, leaf_context)
+        recovered = tuple(
+            _chain_walk(element, b - 1 - digit)
+            for element, digit in zip(wots_signature, digits)
+        )
+        leaf_hashes[index] = _leaf_hash(w, recovered)
+    if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
+        raise ValueError("the source multiproof does not verify")
+    source_bytes = bytes(data)
+    if len(source_bytes) <= max_bytes:
+        return (source_bytes,)
+
+    # Recover every tree node the proof determines, exactly as in
+    # multiproof_select: verified leaf hashes, carried proof nodes and every
+    # internal node derivable from two known children. Each fragment's
+    # authentication paths are rebuilt from these nodes, so its encoding is
+    # identical to selecting the fragment straight from the source proof.
+    known: dict[tuple[int, int], bytes] = dict(proof_nodes)
+    for index, leaf_hash in leaf_hashes.items():
+        known[(0, index)] = leaf_hash
+    for level in range(height):
+        for (node_level, index), node in list(known.items()):
+            if node_level != level:
+                continue
+            sibling = known.get((level, index ^ 1))
+            if sibling is None:
+                continue
+            if index & 1:
+                known[(level + 1, index >> 1)] = _node_hash(sibling, node)
+            else:
+                known[(level + 1, index >> 1)] = _node_hash(node, sibling)
+
+    elements_by_index = {index: elements for index, elements in leaves}
+    source_indices = tuple(index for index, _ in leaves)
+    key_length = len(public_key.to_bytes())
+    chains = l1 + l2
+    leaf_block_bytes = 4 + ELEMENT_BYTES * chains
+
+    def fragment_bytes(start: int, end: int) -> bytes:
+        """Encode the source leaves at positions ``[start, end)``.
+
+        Built exactly as in :func:`multiproof_select`, so the packet equals
+        selecting the same fragment straight from the source proof.
+        """
+        selected = tuple(
+            MerkleSignature(
+                index=leaves[position][0],
+                wots_signature=elements_by_index[leaves[position][0]],
+                auth_path=tuple(
+                    known[(level, (leaves[position][0] >> level) ^ 1)]
+                    for level in range(height)
+                ),
+            )
+            for position in range(start, end)
+        )
+        return multiproof_encode(public_key, selected)
+
+    def fragment_size(start: int, end: int) -> int:
+        """Length of a fragment's v1 encoding without serialising it.
+
+        The frozen layout is the 17-byte header, one length-prefixed public
+        key, a fixed ``4 + 32*chains``-byte block per leaf and 35 bytes per
+        canonical sibling node — see :func:`multiproof_encode`.
+        """
+        coordinates = _canonical_multiproof_nodes(
+            source_indices[start:end], height
+        )
+        return (
+            _MULTIPROOF_HEADER_BYTES
+            + key_length
+            + (end - start) * leaf_block_bytes
+            + len(coordinates) * _MULTIPROOF_NODE_BYTES
+        )
+
+    # Every feasible fragmentation is a segmentation of the ordered leaves
+    # into in-budget fragments. The encoded fragment size is strictly
+    # increasing in its leaf count: appending one leaf adds a fixed
+    # 4 + 32*chains-byte leaf block, while the canonical node set can lose at
+    # most one sibling per level (height <= 8, each node 35 bytes), and
+    # 4 + 32*chains - 35*height is positive for both supported w values. The
+    # feasible ends for each start therefore form a prefix, found by the
+    # linear scan below.
+    #
+    # Dynamic programming over end positions keeps, keyed lexicographically
+    # by (packet count, total encoded bytes, successive end indices), the
+    # best partition of each prefix: the fewest packets wins regardless of
+    # bytes, then the smallest total, then the lexicographically smallest
+    # tuple of fragment end indices. Predecessors are stored for recovery and
+    # only the winning packets are serialised at the end.
+    best: list[tuple[int, int, tuple[int, ...]] | None] = [None] * (
+        len(leaves) + 1
+    )
+    predecessor: list[int | None] = [None] * (len(leaves) + 1)
+    best[0] = (0, 0, ())
+    for start in range(len(leaves)):
+        if best[start] is None:
+            continue
+        prefix_count, prefix_bytes, prefix_ends = best[start]
+        end = start + 1
+        while end <= len(leaves):
+            packet_size = fragment_size(start, end)
+            if packet_size > max_bytes:
+                break
+            candidate = (
+                prefix_count + 1,
+                prefix_bytes + packet_size,
+                prefix_ends + (leaves[end - 1][0],),
+            )
+            current = best[end]
+            if (
+                current is None
+                or candidate[:2] < current[:2]
+                or (candidate[:2] == current[:2] and candidate[2] < current[2])
+            ):
+                best[end] = candidate
+                predecessor[end] = start
+            end += 1
+    if best[len(leaves)] is None:
+        raise ValueError("no fragmentation of the multiproof fits max_bytes")
+
+    cuts: list[tuple[int, int]] = []
+    end = len(leaves)
+    while end > 0:
+        start = predecessor[end]
+        cuts.append((start, end))
+        end = start
+    cuts.reverse()
+    return tuple(fragment_bytes(start, end) for start, end in cuts)
+
 

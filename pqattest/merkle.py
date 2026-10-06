@@ -4262,6 +4262,7 @@ def multiproof_partition(
     contexts: Any = None,
     max_verify_hashes: Any = None,
     max_total_verify_hashes: Any = None,
+    max_total_bytes: Any = None,
     prefer: Any = "compact",
 ) -> tuple[bytes, ...]:
     """Split a verified multiproof into budgeted standalone multiproofs.
@@ -4314,6 +4315,21 @@ def multiproof_partition(
     source proof that satisfies every active budget as a single packet is
     returned unchanged as a one-tuple.
 
+    ``max_total_bytes`` is keyword-only and optional: when ``None`` (the
+    default) no whole-partition byte budget applies and the result, the
+    exceptions and the output bytes are exactly those produced without the
+    argument. When given a positive, non-boolean integer, the complete
+    encoded lengths of the returned packets — each including its own copy
+    of the public key, its header and its authentication nodes, and never
+    replaced by the undivided source proof's length — must additionally
+    sum to at most ``max_total_bytes`` across the whole returned tuple.
+    Only the packet encodings themselves are billed; any framing or
+    transport overhead outside them is not. Equality with the limit is
+    allowed, and the total byte budget applies on top of — never instead
+    of — the per-packet budgets and ``max_total_verify_hashes``. A source
+    proof that satisfies every active budget as a single packet is
+    returned unchanged as a one-tuple.
+
     ``prefer`` is keyword-only and selects the optimisation target. It must
     be exactly the string ``"compact"`` (the default) or ``"verify"`` — no
     case-folding, whitespace stripping or other aliasing is applied. A
@@ -4355,8 +4371,8 @@ def multiproof_partition(
     whose members each follow the usual message rules
     (``bytes``/``bytearray``/``str``); ``public_key`` must be a
     :class:`MerklePublicKey`; ``max_bytes`` must be a non-boolean positive
-    integer, as must ``max_verify_hashes`` and ``max_total_verify_hashes``
-    when they are not ``None``.
+    integer, as must ``max_verify_hashes``, ``max_total_verify_hashes``
+    and ``max_total_bytes`` when they are not ``None``.
     ``context`` is keyword-only and optional and follows the usual context
     rules (``None``/empty means no context, ``str`` encoded as UTF-8); it
     must be the context the source proof was made under.
@@ -4377,7 +4393,8 @@ def multiproof_partition(
     Every type is checked before any content, exactly as in
     :func:`multiproof_select`: a wrong ``data`` or ``messages`` type, a
     non-``MerklePublicKey`` key, a non-integer ``max_bytes``,
-    ``max_verify_hashes`` or ``max_total_verify_hashes``, a non-string
+    ``max_verify_hashes``, ``max_total_verify_hashes`` or
+    ``max_total_bytes``, a non-string
     ``prefer``, or a wrong
     ``context``/``contexts`` type raises
     ``TypeError``. A boolean or non-positive budget, a ``prefer`` string
@@ -4412,6 +4429,8 @@ def multiproof_partition(
         max_total_verify_hashes, int
     ):
         raise TypeError("max_total_verify_hashes must be an integer or None")
+    if max_total_bytes is not None and not isinstance(max_total_bytes, int):
+        raise TypeError("max_total_bytes must be an integer or None")
     if not isinstance(prefer, str):
         raise TypeError('prefer must be the string "compact" or "verify"')
     context_bytes = _validate_context(context)
@@ -4430,6 +4449,12 @@ def multiproof_partition(
     ):
         raise ValueError(
             "max_total_verify_hashes must be a positive, non-boolean integer"
+        )
+    if max_total_bytes is not None and (
+        isinstance(max_total_bytes, bool) or max_total_bytes <= 0
+    ):
+        raise ValueError(
+            "max_total_bytes must be a positive, non-boolean integer"
         )
     if prefer not in ("compact", "verify"):
         raise ValueError('prefer must be the string "compact" or "verify"')
@@ -4496,6 +4521,9 @@ def multiproof_partition(
     ) and (
         max_total_verify_hashes is None
         or verify_hashes(source_indices) <= max_total_verify_hashes
+    ) and (
+        max_total_bytes is None
+        or len(source_bytes) <= max_total_bytes
     ):
         return (source_bytes,)
 
@@ -4583,10 +4611,12 @@ def multiproof_partition(
         budget_names.append("max_verify_hashes")
     if max_total_verify_hashes is not None:
         budget_names.append("max_total_verify_hashes")
+    if max_total_bytes is not None:
+        budget_names.append("max_total_bytes")
     infeasible = (
         "no fragmentation of the multiproof fits " + " and ".join(budget_names)
     )
-    if prefer == "verify":
+    if prefer == "verify" and max_total_bytes is None:
         # ``prefer="verify"`` minimises (total verification hashes, packet
         # count, total encoded bytes, successive end indices) over every
         # feasible consecutive fragmentation. Because the total hash bill
@@ -4652,7 +4682,7 @@ def multiproof_partition(
             fragment_bytes(start, end) for start, end in verify_cuts
         )
 
-    if max_total_verify_hashes is None:
+    if max_total_verify_hashes is None and max_total_bytes is None:
         best: list[tuple[int, int, tuple[int, ...]] | None] = [None] * (
             len(leaves) + 1
         )
@@ -4698,32 +4728,103 @@ def multiproof_partition(
         cuts.reverse()
         return tuple(fragment_bytes(start, end) for start, end in cuts)
 
-    # With a total verification-hash budget the dynamic program must also
-    # track the hash bill accumulated along each prefix partition:
-    # best[end][hashes] keeps the lexicographically smallest
-    # (packet count, total encoded bytes, successive end indices) — plus the
-    # cut positions for recovery — among the partitions of that prefix
-    # billing exactly ``hashes`` verification hashes. Before a prefix is
-    # expanded its states are pruned to the Pareto frontier: a state with
-    # both a higher bill and a no-better key than another state of the same
-    # prefix can never catch up, because every continuation appends the same
-    # fragments — and therefore the same size and hash increments — to both.
-    best: list[dict[int, tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]] | None] = [  # noqa: E501
+    if max_total_bytes is None:
+        # With a total verification-hash budget the dynamic program must also
+        # track the hash bill accumulated along each prefix partition:
+        # best[end][hashes] keeps the lexicographically smallest
+        # (packet count, total encoded bytes, successive end indices) — plus
+        # the cut positions for recovery — among the partitions of that
+        # prefix billing exactly ``hashes`` verification hashes. Before a
+        # prefix is expanded its states are pruned to the Pareto frontier: a
+        # state with both a higher bill and a no-better key than another
+        # state of the same prefix can never catch up, because every
+        # continuation appends the same fragments — and therefore the same
+        # size and hash increments — to both.
+        best: list[  # noqa: E501
+            dict[int, tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]] | None  # noqa: E501
+        ] = [None] * (len(leaves) + 1)
+        best[0] = {0: (0, 0, (), ())}
+        for start in range(len(leaves)):
+            states = best[start]
+            if not states:
+                continue
+            frontier: list[
+                tuple[int, tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]]  # noqa: E501
+            ] = []
+            for hashes in sorted(states):
+                state = states[hashes]
+                if frontier and state[:3] >= frontier[-1][1][:3]:
+                    continue
+                frontier.append((hashes, state))
+            end = start + 1
+            while end <= len(leaves):
+                packet_indices = source_indices[start:end]
+                packet_size = fragment_size(start, end)
+                if packet_size > max_bytes:
+                    break
+                packet_hashes = verify_hashes(packet_indices)
+                if max_verify_hashes is not None and (
+                    packet_hashes > max_verify_hashes
+                ):
+                    break
+                targets = best[end]
+                if targets is None:
+                    targets = best[end] = {}
+                for hashes, state in frontier:
+                    new_hashes = hashes + packet_hashes
+                    if new_hashes > max_total_verify_hashes:
+                        continue
+                    candidate = (
+                        state[0] + 1,
+                        state[1] + packet_size,
+                        state[2] + (leaves[end - 1][0],),
+                        state[3] + ((start, end),),
+                    )
+                    current = targets.get(new_hashes)
+                    if current is None or candidate[:3] < current[:3]:
+                        targets[new_hashes] = candidate
+                end += 1
+        final_states = best[len(leaves)]
+        if not final_states:
+            raise ValueError(infeasible)
+        winner = min(final_states.values(), key=lambda state: state[:3])
+        return tuple(fragment_bytes(start, end) for start, end in winner[3])
+
+    # With a whole-partition byte budget the dynamic program must track the
+    # encoded bytes accumulated along each prefix partition alongside the
+    # verification-hash bill: best[end][(hashes, bytes)] keeps the
+    # lexicographically smallest optimisation key — (packet count, total
+    # encoded bytes, successive end indices) for "compact" and (total
+    # verification hashes, packet count, total encoded bytes, successive end
+    # indices) for "verify" — plus the cut positions for recovery, among the
+    # partitions of that prefix with exactly that accumulated bill. The hash
+    # component of the bill key is only tracked when
+    # ``max_total_verify_hashes`` is active; otherwise it stays 0 and the
+    # hash bill enters only through the "verify" optimisation key. Before a
+    # prefix is expanded its states are pruned to the Pareto frontier: a
+    # state whose hash bill and byte total are both no smaller than another
+    # state's and whose optimisation key is no better can never catch up,
+    # because every continuation appends the same fragments — and therefore
+    # the same size and hash increments — to both.
+    best_bytes: list[dict[tuple[int, int], tuple[tuple, tuple]] | None] = [
         None
     ] * (len(leaves) + 1)
-    best[0] = {0: (0, 0, (), ())}
+    best_bytes[0] = {(0, 0): ((0, 0, ()) if prefer == "compact" else (0, 0, 0, ()), ())}  # noqa: E501
     for start in range(len(leaves)):
-        states = best[start]
+        states = best_bytes[start]
         if not states:
             continue
-        frontier: list[
-            tuple[int, tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]]  # noqa: E501
-        ] = []
-        for hashes in sorted(states):
-            state = states[hashes]
-            if frontier and state[:3] >= frontier[-1][1][:3]:
+        frontier = []
+        for bill in sorted(states):
+            state = states[bill]
+            if any(
+                other_bill[0] <= bill[0]
+                and other_bill[1] <= bill[1]
+                and other_state[0] <= state[0]
+                for other_bill, other_state in frontier
+            ):
                 continue
-            frontier.append((hashes, state))
+            frontier.append((bill, state))
         end = start + 1
         while end <= len(leaves):
             packet_indices = source_indices[start:end]
@@ -4735,27 +4836,49 @@ def multiproof_partition(
                 packet_hashes > max_verify_hashes
             ):
                 break
-            targets = best[end]
+            targets = best_bytes[end]
             if targets is None:
-                targets = best[end] = {}
-            for hashes, state in frontier:
-                new_hashes = hashes + packet_hashes
-                if new_hashes > max_total_verify_hashes:
+                targets = best_bytes[end] = {}
+            for (billed_hashes, billed_bytes), (opt_key, cuts) in frontier:
+                if prefer == "verify":
+                    total_hashes = opt_key[0] + packet_hashes
+                else:
+                    total_hashes = billed_hashes + packet_hashes
+                if max_total_verify_hashes is not None and (
+                    total_hashes > max_total_verify_hashes
+                ):
                     continue
-                candidate = (
-                    state[0] + 1,
-                    state[1] + packet_size,
-                    state[2] + (leaves[end - 1][0],),
-                    state[3] + ((start, end),),
+                new_bytes = billed_bytes + packet_size
+                if new_bytes > max_total_bytes:
+                    continue
+                if prefer == "compact":
+                    new_key = (
+                        opt_key[0] + 1,
+                        new_bytes,
+                        opt_key[2] + (leaves[end - 1][0],),
+                    )
+                else:
+                    new_key = (
+                        total_hashes,
+                        opt_key[1] + 1,
+                        new_bytes,
+                        opt_key[3] + (leaves[end - 1][0],),
+                    )
+                bill = (
+                    total_hashes if max_total_verify_hashes is not None else 0,
+                    new_bytes,
                 )
-                current = targets.get(new_hashes)
-                if current is None or candidate[:3] < current[:3]:
-                    targets[new_hashes] = candidate
+                candidate = (new_key, cuts + ((start, end),))
+                current = targets.get(bill)
+                if current is None or candidate < current:
+                    targets[bill] = candidate
             end += 1
-    final_states = best[len(leaves)]
+    final_states = best_bytes[len(leaves)]
     if not final_states:
         raise ValueError(infeasible)
-    winner = min(final_states.values(), key=lambda state: state[:3])
-    return tuple(fragment_bytes(start, end) for start, end in winner[3])
+    winner_key, winner_cuts = min(
+        final_states.values(), key=lambda state: state[0]
+    )
+    return tuple(fragment_bytes(start, end) for start, end in winner_cuts)
 
 

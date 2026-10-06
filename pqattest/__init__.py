@@ -30,7 +30,11 @@ from the source proofs, their per-proof message tuples and the expected
 public key alone, and multiproof_expand to restore a verified
 multiproof to an ordinary MerkleBatchProof of standalone signatures
 with complete authentication paths from the source proof, its messages
-and the expected public key alone, static
+and the expected public key alone, and multiproof_partition to split a
+verified multiproof into a tuple of standalone v1 multiproofs — each
+carrying one contiguous segment of the source leaf order and each within
+a caller-given byte budget — from the source proof, its messages and the
+expected public key alone, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
 recommend_scheme_weighted to rank that cross-scheme frontier by a
@@ -329,6 +333,7 @@ from .merkle import (
     multiproof_encode,
     multiproof_expand,
     multiproof_merge,
+    multiproof_partition,
     multiproof_select,
     multiproof_verify,
     multiproof_verify_bound,
@@ -522,6 +527,7 @@ __all__ = [
     "multiproof_encode",
     "multiproof_expand",
     "multiproof_merge",
+    "multiproof_partition",
     "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",

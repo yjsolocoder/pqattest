@@ -35,7 +35,10 @@ their source order, into the minimum number of consecutive fragments
 whose fresh standalone v1 multiproofs each fit a per-packet byte budget
 and, optionally, a per-packet verification-hash budget taken from
 :func:`merkle_verify_profile`, again from the source proof, its messages
-and the expected public key alone. Signer
+and the expected public key alone. :func:`multiproof_partition_frontier`
+is its comparison counterpart: under the same budgets it returns every
+non-dominated consecutive fragmentation, ordered by packet count, total
+encoded bytes and total verification hashes. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -4882,3 +4885,401 @@ def multiproof_partition(
     return tuple(fragment_bytes(start, end) for start, end in winner_cuts)
 
 
+
+def multiproof_partition_frontier(
+    messages: Any,
+    data: Any,
+    *,
+    public_key: Any,
+    max_bytes: Any,
+    context: Any = None,
+    contexts: Any = None,
+    max_verify_hashes: Any = None,
+    max_total_verify_hashes: Any = None,
+    max_total_bytes: Any = None,
+) -> tuple[tuple[bytes, ...], ...]:
+    """List every non-dominated budgeted fragmentation of a multiproof.
+
+    Given the same inputs as :func:`multiproof_partition` — only a source
+    :func:`multiproof_encode` proof (``data``), every message it proves
+    (``messages``, in the source proof's leaf order) and the expected
+    ``public_key`` — consider every partition of the source leaves into
+    one or more non-empty consecutive fragments (consecutive in message
+    position, so the actual tree leaf indices may be sparse) that
+    satisfies every active budget, and return the Pareto frontier of
+    their costs instead of one optimised answer. The result is a
+    non-empty tuple of plans; each plan is itself a non-empty tuple of
+    ``bytes`` packets — fresh independently verifiable v1 multiproofs —
+    ordered by source leaf order and covering the source leaves exactly
+    once: no leaf is missing, repeated or merged, even when several
+    leaves carry the same message. No proof format or signature state is
+    added.
+
+    A plan's cost is the three-tuple ``(packet count, total encoded
+    bytes, total verification hashes)``: the number of packets; the sum
+    of the packets' complete encoded lengths, each including its own
+    copy of the public key, its header and its authentication nodes; and
+    the sum of the packets' verification-hash bills, each exactly the
+    ``wots + leaf + multi`` total :func:`merkle_verify_profile` reports
+    for this public key's parameters and the packet's actual leaf-index
+    set. Hash work shared between fragments is billed to every packet
+    that spends it, and message-digest, context-processing and splitting
+    overhead are never counted. A plan is dropped when another feasible
+    plan is no larger in all three costs and strictly smaller in at
+    least one. Should two feasible plans tie on all three costs, only
+    the one whose tuple of the packets' last-leaf actual indices
+    compares lexicographically smallest is kept. The returned plans are
+    ordered ascending by the cost three-tuple — packet count first, then
+    total encoded bytes, then total verification hashes — and therefore
+    never merely echo the two ``prefer`` winners of
+    :func:`multiproof_partition`: every non-dominated cost combination
+    appears, whether or not either preference would select it.
+
+    ``max_bytes`` and the keyword-only optional ``max_verify_hashes``,
+    ``max_total_verify_hashes`` and ``max_total_bytes`` carry exactly
+    the semantics and defaults they have in
+    :func:`multiproof_partition`: every packet's complete encoding is at
+    most ``max_bytes`` bytes; when ``max_verify_hashes`` is given, every
+    packet's hash bill is at most that value; when
+    ``max_total_verify_hashes`` is given, the packets' hash bills sum to
+    at most that value across the whole plan; and when
+    ``max_total_bytes`` is given, the packets' complete encoded lengths
+    sum to at most that value across the whole plan. Every active
+    budget constrains every returned plan simultaneously — the total
+    budgets apply on top of, never instead of, the per-packet budgets —
+    and equality with any limit is allowed. When the source proof
+    satisfies every active budget as a single packet, the one-packet
+    plan appears on the frontier like any other feasible plan (its
+    packet count of one is never dominated).
+
+    Each packet is byte-for-byte identical to the result of
+    :func:`multiproof_select` on the source proof for that same fragment
+    (the original public key, leaf indices and W-OTS elements are kept,
+    and authentication nodes follow the existing canonical ordering and
+    deduplication rule), so the caller verifies packet ``k`` of a plan
+    with that fragment's messages and contexts through
+    :func:`multiproof_verify` / :func:`multiproof_verify_bound`, and
+    merging a plan's packets again with :func:`multiproof_merge`
+    restores the source bytes exactly.
+
+    ``data`` must be ``bytes`` or ``bytearray`` and ``messages`` a tuple
+    whose members each follow the usual message rules
+    (``bytes``/``bytearray``/``str``); ``public_key`` must be a
+    :class:`MerklePublicKey`; ``max_bytes`` must be a non-boolean
+    positive integer, as must ``max_verify_hashes``,
+    ``max_total_verify_hashes`` and ``max_total_bytes`` when they are
+    not ``None``. ``context`` is keyword-only and optional and follows
+    the usual context rules (``None``/empty means no context, ``str``
+    encoded as UTF-8); it must be the context the source proof was made
+    under.
+
+    ``contexts`` is keyword-only and optional and instead binds a
+    separate context per source-proof leaf exactly as in
+    :func:`multiproof_partition` and :func:`multiproof_select`: ``None``
+    (the default) keeps the shared-``context`` behaviour, while a tuple
+    applies its members positionally in source leaf order, one per
+    member of ``messages`` (``None``/empty means no context for that
+    position, a ``str`` encoded as UTF-8). A non-tuple ``contexts`` or a
+    member of another type raises ``TypeError``; an empty tuple, a count
+    that differs from the message count, or combining ``contexts`` with
+    a non-empty ``context`` raises ``ValueError`` (an empty shared
+    ``context`` is allowed). Packets carry no context themselves: the
+    caller verifies each one with only its fragment's messages and
+    matching per-leaf ``contexts``.
+
+    Every type is checked before any content, exactly as in
+    :func:`multiproof_partition`: a wrong ``data`` or ``messages`` type,
+    a non-``MerklePublicKey`` key, a non-integer ``max_bytes``,
+    ``max_verify_hashes``, ``max_total_verify_hashes`` or
+    ``max_total_bytes``, or a wrong ``context``/``contexts`` type raises
+    ``TypeError``. A boolean or non-positive budget, an empty message
+    tuple, a message count that differs from the proof's leaf count, a
+    structurally malformed source proof, a failing leaf signature or
+    root fold, a public-key or context mismatch, and the absence of any
+    feasible fragmentation (for example a single leaf's own proof
+    already exceeds a budget, or its hash count exceeds
+    ``max_verify_hashes``) all raise ``ValueError`` and no partial
+    result is returned. The source proof is fully authenticated before
+    anything is returned — every leaf is checked even when exactly one
+    fragmentation is feasible and even when every budget is generous.
+    No input is modified, the returned bytes never reference a caller's
+    mutable buffer, the result is deterministic for equal inputs, no
+    randomness is drawn and no signing state or signature quota is
+    touched; no wire format or version is added.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("multiproof data must be bytes or bytearray")
+    if not isinstance(messages, tuple):
+        raise TypeError("messages must be a tuple of messages")
+    for message in messages:
+        _as_bytes(message)
+    if not isinstance(public_key, MerklePublicKey):
+        raise TypeError("public_key must be a MerklePublicKey")
+    if not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an integer")
+    if max_verify_hashes is not None and not isinstance(
+        max_verify_hashes, int
+    ):
+        raise TypeError("max_verify_hashes must be an integer or None")
+    if max_total_verify_hashes is not None and not isinstance(
+        max_total_verify_hashes, int
+    ):
+        raise TypeError("max_total_verify_hashes must be an integer or None")
+    if max_total_bytes is not None and not isinstance(max_total_bytes, int):
+        raise TypeError("max_total_bytes must be an integer or None")
+    context_bytes = _validate_context(context)
+    contexts_tuple = _validate_contexts(contexts)
+    if isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive, non-boolean integer")
+    if max_verify_hashes is not None and (
+        isinstance(max_verify_hashes, bool) or max_verify_hashes <= 0
+    ):
+        raise ValueError(
+            "max_verify_hashes must be a positive, non-boolean integer"
+        )
+    if max_total_verify_hashes is not None and (
+        isinstance(max_total_verify_hashes, bool)
+        or max_total_verify_hashes <= 0
+    ):
+        raise ValueError(
+            "max_total_verify_hashes must be a positive, non-boolean integer"
+        )
+    if max_total_bytes is not None and (
+        isinstance(max_total_bytes, bool) or max_total_bytes <= 0
+    ):
+        raise ValueError(
+            "max_total_bytes must be a positive, non-boolean integer"
+        )
+    if not messages:
+        raise ValueError("messages must not be empty")
+    if contexts_tuple is not None:
+        if not contexts_tuple:
+            raise ValueError("contexts must not be empty")
+        if context_bytes:
+            raise ValueError(
+                "contexts cannot be combined with a non-empty context"
+            )
+        if len(contexts_tuple) != len(messages):
+            raise ValueError("contexts and messages must have the same length")
+    parsed = _multiproof_parse(data)
+    if parsed is None:
+        raise ValueError("the source multiproof is malformed")
+    proof_key, leaves, proof_nodes = parsed
+    if len(messages) != len(leaves):
+        raise ValueError("messages and proof leaves must have the same length")
+    if (
+        public_key.w != proof_key.w
+        or public_key.height != proof_key.height
+        or public_key.root != proof_key.root
+    ):
+        raise ValueError("public_key does not match the proof's embedded public key")
+    w = proof_key.w
+    height = proof_key.height
+    b, l1, l2 = _params(w)
+    leaf_hashes: dict[int, bytes] = {}
+    for position, (index, wots_signature) in enumerate(leaves):
+        leaf_context = (
+            contexts_tuple[position] if contexts_tuple is not None else context_bytes
+        )
+        digits = _merkle_signing_digits(messages[position], w, leaf_context)
+        recovered = tuple(
+            _chain_walk(element, b - 1 - digit)
+            for element, digit in zip(wots_signature, digits)
+        )
+        leaf_hashes[index] = _leaf_hash(w, recovered)
+    if not _multiproof_fold(leaf_hashes, proof_nodes, height, proof_key.root):
+        raise ValueError("the source multiproof does not verify")
+    source_indices = tuple(index for index, _ in leaves)
+
+    def verify_hashes(indices: tuple[int, ...]) -> int:
+        """Verification-hash bill for a packet over ``indices``.
+
+        Exactly the ``wots + leaf + multi`` total that the existing
+        :func:`merkle_verify_profile` assigns to this public key's
+        parameters and the packet's actual leaf set: message-independent
+        W-OTS chain-step upper bound, one leaf hash per leaf and the
+        deduplicated internal-node count. Imported lazily because
+        :mod:`pqattest.params` itself imports from this module.
+        """
+        from .params import merkle_verify_profile
+
+        profile = merkle_verify_profile(w, height, indices)
+        return profile.wots + profile.leaf + profile.multi
+
+    # Recover every tree node the proof determines, exactly as in
+    # multiproof_select: verified leaf hashes, carried proof nodes and every
+    # internal node derivable from two known children. Each fragment's
+    # authentication paths are rebuilt from these nodes, so its encoding is
+    # identical to selecting the fragment straight from the source proof.
+    known: dict[tuple[int, int], bytes] = dict(proof_nodes)
+    for index, leaf_hash in leaf_hashes.items():
+        known[(0, index)] = leaf_hash
+    for level in range(height):
+        for (node_level, index), node in list(known.items()):
+            if node_level != level:
+                continue
+            sibling = known.get((level, index ^ 1))
+            if sibling is None:
+                continue
+            if index & 1:
+                known[(level + 1, index >> 1)] = _node_hash(sibling, node)
+            else:
+                known[(level + 1, index >> 1)] = _node_hash(node, sibling)
+
+    elements_by_index = {index: elements for index, elements in leaves}
+    key_length = len(public_key.to_bytes())
+    chains = l1 + l2
+    leaf_block_bytes = 4 + ELEMENT_BYTES * chains
+
+    def fragment_bytes(start: int, end: int) -> bytes:
+        """Encode the source leaves at positions ``[start, end)``.
+
+        Built exactly as in :func:`multiproof_select`, so the packet equals
+        selecting the same fragment straight from the source proof.
+        """
+        selected = tuple(
+            MerkleSignature(
+                index=leaves[position][0],
+                wots_signature=elements_by_index[leaves[position][0]],
+                auth_path=tuple(
+                    known[(level, (leaves[position][0] >> level) ^ 1)]
+                    for level in range(height)
+                ),
+            )
+            for position in range(start, end)
+        )
+        return multiproof_encode(public_key, selected)
+
+    def fragment_size(start: int, end: int) -> int:
+        """Length of a fragment's v1 encoding without serialising it.
+
+        The frozen layout is the 17-byte header, one length-prefixed public
+        key, a fixed ``4 + 32*chains``-byte block per leaf and 35 bytes per
+        canonical sibling node — see :func:`multiproof_encode`.
+        """
+        coordinates = _canonical_multiproof_nodes(
+            source_indices[start:end], height
+        )
+        return (
+            _MULTIPROOF_HEADER_BYTES
+            + key_length
+            + (end - start) * leaf_block_bytes
+            + len(coordinates) * _MULTIPROOF_NODE_BYTES
+        )
+
+    budget_names = ["max_bytes"]
+    if max_verify_hashes is not None:
+        budget_names.append("max_verify_hashes")
+    if max_total_verify_hashes is not None:
+        budget_names.append("max_total_verify_hashes")
+    if max_total_bytes is not None:
+        budget_names.append("max_total_bytes")
+    infeasible = (
+        "no fragmentation of the multiproof fits " + " and ".join(budget_names)
+    )
+
+    def cost_frontier(
+        states: dict[tuple[int, int, int], tuple[int, ...]],
+    ) -> list[tuple[tuple[int, int, int], tuple[int, ...]]]:
+        """Non-dominated cost states of one prefix, sorted ascending.
+
+        ``states`` maps each reached cost three-tuple — (packet count,
+        total encoded bytes, total verification hashes) — to the
+        lexicographically smallest tuple of the packets' last-leaf
+        actual indices among the prefix partitions reaching it. A state
+        is dropped when another state is no larger in all three costs
+        and strictly smaller in at least one: every continuation
+        appends identical fragment cost increments to both, and a
+        continuation feasible for the dominated state is feasible for
+        the dominating one (its accumulated byte and hash bills are no
+        larger), so the dominated state can never reach the final
+        frontier. Equal-cost states were already merged by the caller,
+        which is safe because equal triples share their packet count,
+        so appending a common fragment-end suffix preserves the
+        lexicographic order of the end-index tuples.
+        """
+        kept: list[tuple[tuple[int, int, int], tuple[int, ...]]] = []
+        for triple, ends in sorted(states.items()):
+            if any(
+                other[0] <= triple[0]
+                and other[1] <= triple[1]
+                and other[2] <= triple[2]
+                for other, _ in kept
+            ):
+                continue
+            kept = [
+                (other, other_ends)
+                for other, other_ends in kept
+                if not (
+                    triple[0] <= other[0]
+                    and triple[1] <= other[1]
+                    and triple[2] <= other[2]
+                )
+            ]
+            kept.append((triple, ends))
+        return kept
+
+    # Dynamic programming over end positions. Both fragment costs are
+    # strictly increasing in the fragment's leaf count (see the detailed
+    # argument in multiproof_partition), so the feasible ends for each
+    # start form a prefix under either per-packet budget and the scan
+    # stops at the first over-budget fragment. states[end] maps each
+    # reached cost three-tuple of a partition of the first ``end``
+    # leaves to the lexicographically smallest end-index tuple reaching
+    # it; before a prefix is expanded its states are pruned to the
+    # Pareto frontier, which the final answer's frontier is a subset of.
+    states: list[dict[tuple[int, int, int], tuple[int, ...]] | None] = [
+        None
+    ] * (len(leaves) + 1)
+    states[0] = {(0, 0, 0): ()}
+    for start in range(len(leaves)):
+        current = states[start]
+        if not current:
+            continue
+        frontier = cost_frontier(current)
+        end = start + 1
+        while end <= len(leaves):
+            packet_indices = source_indices[start:end]
+            packet_size = fragment_size(start, end)
+            if packet_size > max_bytes:
+                break
+            packet_hashes = verify_hashes(packet_indices)
+            if max_verify_hashes is not None and (
+                packet_hashes > max_verify_hashes
+            ):
+                break
+            targets = states[end]
+            if targets is None:
+                targets = states[end] = {}
+            for (count, byte_total, hash_total), ends in frontier:
+                new_bytes = byte_total + packet_size
+                if max_total_bytes is not None and new_bytes > max_total_bytes:
+                    continue
+                new_hashes = hash_total + packet_hashes
+                if max_total_verify_hashes is not None and (
+                    new_hashes > max_total_verify_hashes
+                ):
+                    continue
+                triple = (count + 1, new_bytes, new_hashes)
+                new_ends = ends + (leaves[end - 1][0],)
+                existing = targets.get(triple)
+                if existing is None or new_ends < existing:
+                    targets[triple] = new_ends
+            end += 1
+    final_states = states[len(leaves)]
+    if not final_states:
+        raise ValueError(infeasible)
+
+    position_by_index = {
+        index: position for position, (index, _) in enumerate(leaves)
+    }
+    plans = []
+    for _, ends in cost_frontier(final_states):
+        packets = []
+        start = 0
+        for index in ends:
+            stop = position_by_index[index] + 1
+            packets.append(fragment_bytes(start, stop))
+            start = stop
+        plans.append(tuple(packets))
+    return tuple(plans)

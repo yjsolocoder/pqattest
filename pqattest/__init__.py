@@ -39,7 +39,11 @@ its messages and the expected public key alone, and
 multiproof_partition_frontier to list every non-dominated such
 fragmentation — graded by packet count, total encoded bytes and total
 verification hashes — under the same source proof, messages, expected
-public key and budgets, static
+public key and budgets, and MerkleReceiver, the receiving-end
+leaf-consumption tracker: bound to one expected MerklePublicKey, it
+verifies a MerkleBatchProof or a v1 multiproof in full, binds it to the
+expected key by value, and records the proof's leaf indices, accepting
+each leaf at most once per instance, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
 recommend_scheme_weighted to rank that cross-scheme frontier by a
@@ -332,6 +336,7 @@ from .merkle import (
     MerkleBatchProof,
     MerkleProof,
     MerklePublicKey,
+    MerkleReceiver,
     MerkleSignature,
     MerkleSigner,
     merkle_verify,
@@ -453,6 +458,7 @@ __all__ = [
     "MerkleDeploymentScenarioScore",
     "MerkleProof",
     "MerklePublicKey",
+    "MerkleReceiver",
     "MerkleSignature",
     "MerkleSigner",
     "MerkleStorageProfile",

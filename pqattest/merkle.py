@@ -39,7 +39,12 @@ and the expected public key alone. :class:`MerkleReceiver` is the
 receiving-end counterpart of the signer's leaf bookkeeping: bound to one
 expected :class:`MerklePublicKey`, it verifies a :class:`MerkleBatchProof`
 or a v1 multiproof in full and records its leaf indices, accepting each
-leaf at most once per instance. Signer
+leaf at most once per instance. The receiver's accepted-leaf record can be
+exported explicitly with :meth:`MerkleReceiver.checkpoint` and carried
+into a fresh instance with :meth:`MerkleReceiver.from_checkpoint` — a
+separate versioned format holding the expected public key and the full
+accepted set, protected only by a SHA-256 checksum against accidental
+corruption. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -159,6 +164,11 @@ _SEED_CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 1 + 2 + ELEMENT_BYTES + ELEMENT_BYTE
 _SEED_CHECKPOINT_BYTES = _SEED_CHECKPOINT_HEADER_BYTES + _CHECKPOINT_CHECKSUM_BYTES
 
 _SEED_ELEMENT_DOMAIN = b"pqattest/merkle/seed/v1"
+
+_RECEIVER_CHECKPOINT_MAGIC = b"PQAMRCP\0"
+_RECEIVER_CHECKPOINT_VERSION = 1
+_RECEIVER_CHECKPOINT_HEADER_BYTES = 8 + 1 + 1 + 1 + ELEMENT_BYTES + 2
+_RECEIVER_CHECKPOINT_INDEX_BYTES = 2
 
 _PUBLIC_KEY_MAGIC = b"PQAMPK\0\0"
 _PUBLIC_KEY_VERSION = 1
@@ -3700,7 +3710,11 @@ class MerkleReceiver:
     the expected key value by value before anything is recorded. The
     record of accepted leaf indices lives only in this instance: a fresh
     receiver starts empty, and no state is persisted or shared across
-    instances.
+    instances. The record can be exported explicitly with
+    :meth:`checkpoint` and carried into a new instance with
+    :meth:`from_checkpoint`; the blob is protected only by a SHA-256
+    checksum against accidental corruption and is stored — if at all —
+    by the caller alone.
     """
 
     def __init__(self, public_key: Any) -> None:
@@ -3732,6 +3746,45 @@ class MerkleReceiver:
         """
         with self._lock:
             return tuple(sorted(self._accepted))
+
+    def checkpoint(self) -> bytes:
+        """Serialise the expected public key and the accepted-leaf record.
+
+        The v1 layout is: the 8-byte magic ``b"PQAMRCP\\0"``; one byte each
+        for the version (1), ``w`` and ``height``; the 32-byte Merkle root;
+        the accepted-leaf count as 2 big-endian bytes; every accepted leaf
+        index as 2 big-endian bytes in ascending order; and finally the
+        SHA-256 of all preceding content. Encoding is deterministic: the
+        same public key and the same accepted set always produce the same
+        bytes, however the leaves were accepted (order, batching or proof
+        format), and a checkpoint exported from a restored receiver is
+        byte-identical to the one it was restored from.
+
+        The snapshot shares the recording lock, so a concurrent export
+        reflects the record either immediately before or immediately after
+        an in-flight :meth:`accept`, never part-way through one. Exporting
+        does not change the record. The trailing hash only detects
+        accidental corruption — the blob authenticates nothing and rolls
+        nothing back; store and transport are the caller's responsibility.
+        """
+        with self._lock:
+            body = (
+                _RECEIVER_CHECKPOINT_MAGIC
+                + bytes(
+                    (
+                        _RECEIVER_CHECKPOINT_VERSION,
+                        self._public_key.w,
+                        self._public_key.height,
+                    )
+                )
+                + self._public_key.root
+                + len(self._accepted).to_bytes(2, "big")
+                + b"".join(
+                    index.to_bytes(_RECEIVER_CHECKPOINT_INDEX_BYTES, "big")
+                    for index in sorted(self._accepted)
+                )
+            )
+            return body + hashlib.sha256(body).digest()
 
     def accept(
         self, messages: Any, proof: Any, *, context: Any = None, contexts: Any = None
@@ -3825,6 +3878,86 @@ class MerkleReceiver:
                 return False
             self._accepted.update(indices)
             return True
+
+    @classmethod
+    def from_checkpoint(cls, data: Any, *, public_key: Any) -> "MerkleReceiver":
+        """Restore a receiver from ``checkpoint()`` output, bound to a key.
+
+        ``data`` must be ``bytes`` or ``bytearray`` and ``public_key`` a
+        :class:`MerklePublicKey`; anything else raises ``TypeError``, and
+        both argument types are checked before any content is parsed. A
+        bad magic, an unknown version, a truncated or over-long encoding,
+        a checksum mismatch, invalid encoded ``w``/``height`` fields, an
+        accepted set that is out of range for the tree, duplicated or not
+        strictly ascending, or an encoded public key whose ``w``,
+        ``height`` and ``root`` do not all equal the expected key's raises
+        ``ValueError`` and no instance is returned. The expected key is
+        compared by value, so a distinct :class:`MerklePublicKey` instance
+        with the same field values is accepted.
+
+        The restored receiver is bound to ``public_key`` and resumes with
+        exactly the recorded accepted set: re-submitting any of those
+        leaves — in either proof format — returns ``False``, fresh leaves
+        remain acceptable, and :meth:`accept` keeps its usual verification
+        and exception semantics. The new instance is independent of the
+        receiver the checkpoint came from, and it is not affected by later
+        mutation of a ``bytearray`` it was restored from.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("checkpoint data must be bytes or bytearray")
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        data = bytes(data)
+        header = _RECEIVER_CHECKPOINT_HEADER_BYTES
+        if len(data) < header + _CHECKPOINT_CHECKSUM_BYTES:
+            raise ValueError("receiver checkpoint is truncated")
+        body, checksum = (
+            data[:-_CHECKPOINT_CHECKSUM_BYTES],
+            data[-_CHECKPOINT_CHECKSUM_BYTES:],
+        )
+        if body[:8] != _RECEIVER_CHECKPOINT_MAGIC:
+            raise ValueError("bad receiver checkpoint magic")
+        if body[8] != _RECEIVER_CHECKPOINT_VERSION:
+            raise ValueError(f"unsupported receiver checkpoint version: {body[8]}")
+        w = _validate_w(body[9])
+        height = _validate_height(body[10])
+        root = body[11 : 11 + ELEMENT_BYTES]
+        count = int.from_bytes(body[11 + ELEMENT_BYTES : header], "big")
+        if count > (1 << height):
+            raise ValueError("accepted count exceeds the leaf count")
+        expected = header + count * _RECEIVER_CHECKPOINT_INDEX_BYTES
+        if len(body) < expected:
+            raise ValueError("receiver checkpoint is truncated")
+        if len(body) > expected:
+            raise ValueError("trailing data after the receiver checkpoint encoding")
+        if hashlib.sha256(body).digest() != checksum:
+            raise ValueError("receiver checkpoint checksum mismatch")
+        indices = tuple(
+            int.from_bytes(
+                body[
+                    header + i * _RECEIVER_CHECKPOINT_INDEX_BYTES : header
+                    + (i + 1) * _RECEIVER_CHECKPOINT_INDEX_BYTES
+                ],
+                "big",
+            )
+            for i in range(count)
+        )
+        if any(index >= (1 << height) for index in indices):
+            raise ValueError("accepted index is out of range for the tree height")
+        if any(former >= latter for former, latter in zip(indices, indices[1:])):
+            raise ValueError("accepted indices are not strictly ascending")
+        if (
+            w != public_key.w
+            or height != public_key.height
+            or root != public_key.root
+        ):
+            raise ValueError(
+                "checkpoint public key does not match the expected public key"
+            )
+        receiver = cls(public_key)
+        receiver._accepted = set(indices)
+        return receiver
+
 
 
 def multiproof_select(

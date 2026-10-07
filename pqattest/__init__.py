@@ -35,7 +35,11 @@ verified multiproof's leaves, in their source order, into the minimum
 number of consecutive standalone v1 multiproofs that each fit a
 per-packet byte budget and, optionally, a per-packet verification-hash
 budget taken from merkle_verify_profile, again from the source proof,
-its messages and the expected public key alone, static
+its messages and the expected public key alone, and
+multiproof_partition_frontier to list every non-dominated such
+fragmentation — graded by packet count, total encoded bytes and total
+verification hashes — under the same source proof, messages, expected
+public key and budgets, static
 parameter analysis: Params / profile / recommend / recommend_scheme /
 scheme_frontier /
 recommend_scheme_weighted to rank that cross-scheme frontier by a
@@ -335,6 +339,7 @@ from .merkle import (
     multiproof_expand,
     multiproof_merge,
     multiproof_partition,
+    multiproof_partition_frontier,
     multiproof_select,
     multiproof_verify,
     multiproof_verify_bound,
@@ -529,6 +534,7 @@ __all__ = [
     "multiproof_expand",
     "multiproof_merge",
     "multiproof_partition",
+    "multiproof_partition_frontier",
     "multiproof_select",
     "multiproof_verify",
     "multiproof_verify_bound",

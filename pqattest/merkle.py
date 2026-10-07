@@ -35,7 +35,13 @@ their source order, into the minimum number of consecutive fragments
 whose fresh standalone v1 multiproofs each fit a per-packet byte budget
 and, optionally, a per-packet verification-hash budget taken from
 :func:`merkle_verify_profile`, again from the source proof, its messages
-and the expected public key alone. Signer
+and the expected public key alone. A :class:`MerkleReceiver` is the
+stateful receiving counterpart: built from the expected public key, it
+accepts a :class:`MerkleBatchProof` or a serialised v1 multiproof together
+with its messages, verifies and key-binds the proof exactly like the
+``verify_bound`` entries, and records the proven leaf indices so that any
+later submission touching an already-accepted leaf — in either proof
+format — is refused. Signer
 state can be persisted explicitly with
 :meth:`MerkleSigner.checkpoint` /
 :meth:`MerkleSigner.from_checkpoint`; the checkpoint contains every private
@@ -64,7 +70,8 @@ entries :meth:`MerkleSigner.sign_selected`,
 :meth:`MerkleSigner.sign_multiproof_with_auth_state`,
 :meth:`MerkleBatchProof.verify`, :meth:`MerkleBatchProof.verify_bound`,
 :func:`multiproof_verify`, :func:`multiproof_verify_bound`,
-:func:`multiproof_select` and :func:`multiproof_expand` —
+:func:`multiproof_select`, :func:`multiproof_expand` and
+:meth:`MerkleReceiver.accept` —
 additionally accept a keyword-only ``contexts`` tuple that binds a
 separate context to each message positionally (for the selection entries,
 to each chosen leaf at its tuple position; for :func:`multiproof_select`,
@@ -107,6 +114,7 @@ __all__ = [
     "MerkleBatchProof",
     "MerkleProof",
     "MerklePublicKey",
+    "MerkleReceiver",
     "MerkleSignature",
     "MerkleSigner",
     "merkle_verify",
@@ -1034,6 +1042,137 @@ class MerkleBatchProof:
             # reports every such malformed structure as ``False``. External
             # argument type errors were raised before this block.
             return False
+
+
+class MerkleReceiver:
+    """Thread-safe, in-process receiver that accepts each Merkle leaf once.
+
+    A ``MerkleReceiver`` is constructed from the expected
+    :class:`MerklePublicKey` and keeps a per-instance record of the leaf
+    indices it has already accepted. :meth:`accept` takes one message per
+    proof leaf plus either a :class:`MerkleBatchProof` or a serialised v1
+    multiproof (``bytes``/``bytearray``), fully verifies the proof with the
+    exact rules of :meth:`MerkleBatchProof.verify_bound` or
+    :func:`multiproof_verify_bound` — including binding the embedded public
+    key to the expected key value by value — and only then, when every
+    proven leaf is still unrecorded, returns ``True`` and records the whole
+    leaf set at once. Any already-recorded leaf makes the call return
+    ``False`` without changing the record, even when the messages and
+    signatures are identical to an earlier accepted submission; both proof
+    formats share the one record, so re-submitting the same leaves in the
+    other format is likewise refused. A submission mixing old and new
+    leaves fails as a whole and records nothing, leaving the new leaves
+    acceptable by a later standalone proof. The record lives only in the
+    instance: a fresh ``MerkleReceiver`` starts empty, and nothing is
+    persisted or coordinated across instances.
+    """
+
+    def __init__(self, public_key: Any) -> None:
+        if not isinstance(public_key, MerklePublicKey):
+            raise TypeError("public_key must be a MerklePublicKey")
+        _validate_w(public_key.w)
+        _validate_height(public_key.height)
+        if not isinstance(public_key.root, bytes) or len(public_key.root) != ELEMENT_BYTES:
+            raise ValueError(f"root must be exactly {ELEMENT_BYTES} bytes")
+        self._public_key = public_key
+        self._accepted: set[int] = set()
+        self._lock = threading.Lock()
+
+    @property
+    def public_key(self) -> MerklePublicKey:
+        """The expected Merkle public key this receiver binds to (read-only)."""
+        return self._public_key
+
+    @property
+    def accepted_indices(self) -> tuple[int, ...]:
+        """Leaf indices accepted so far, as an ascending tuple (read-only).
+
+        The snapshot is taken under the same lock as :meth:`accept`, so it
+        always reflects a whole number of accepted submissions — never half
+        of a batch — and the returned tuple is a fresh immutable value that
+        later :meth:`accept` calls do not change.
+        """
+        with self._lock:
+            return tuple(sorted(self._accepted))
+
+    def accept(
+        self, messages: Any, proof: Any, *, context: Any = None, contexts: Any = None
+    ) -> bool:
+        """Verify ``proof`` and record its leaves, or refuse them, atomically.
+
+        ``proof`` must be a :class:`MerkleBatchProof` or a serialised v1
+        multiproof as ``bytes``/``bytearray``; any other type raises
+        ``TypeError``. ``messages`` must be a tuple holding one message per
+        proof leaf, in proof leaf order, each member following the usual
+        message rules (``bytes``/``bytearray``/``str``, a ``str`` encoded as
+        UTF-8). ``context`` and ``contexts`` are keyword-only and follow the
+        exact rules of :meth:`MerkleBatchProof.verify_bound` and
+        :func:`multiproof_verify_bound`: a context of an illegal type
+        raises ``TypeError``, and combining a non-empty shared ``context``
+        with ``contexts`` raises ``ValueError``. The proof type and the
+        context arguments are checked first, before any verification.
+
+        The proof is then verified in full and bound to this receiver's
+        expected public key value by value (``w``, ``height`` and ``root``).
+        Only when verification succeeds and none of the proven leaf indices
+        has been recorded does the call return ``True`` and record the
+        whole leaf set at once; both proof formats share the one record.
+        Every failure — a non-tuple or ill-sized ``messages``, an empty
+        batch, an illegal message member, a ``contexts`` count mismatch, a
+        corrupted proof field or encoding, duplicated or out-of-order
+        leaves, a public-key or context mismatch, a cryptographic failure,
+        or any leaf recorded by an earlier call — returns ``False`` and
+        leaves the record unchanged. The check-and-record step runs under
+        the receiver's lock, so concurrent calls behave as some serial
+        order: overlapping batches succeed at most once, disjoint valid
+        batches all succeed, and no :attr:`accepted_indices` snapshot ever
+        shows half of a batch. Neither the inputs nor any signer state is
+        modified, and the stateless verification entries remain able to
+        verify the same proof repeatedly.
+        """
+        if isinstance(proof, MerkleBatchProof):
+            batch = proof
+            data = None
+        elif isinstance(proof, (bytes, bytearray)):
+            batch = None
+            data = proof
+        else:
+            raise TypeError(
+                "proof must be a MerkleBatchProof or a bytes/bytearray multiproof"
+            )
+        context_bytes = _validate_context(context)
+        contexts_tuple = _validate_contexts(contexts)
+        if contexts_tuple is not None and context_bytes:
+            raise ValueError(
+                "contexts cannot be combined with a non-empty context"
+            )
+        if batch is not None:
+            if not batch.verify_bound(
+                messages,
+                public_key=self._public_key,
+                context=context_bytes,
+                contexts=contexts_tuple,
+            ):
+                return False
+            indices = tuple(signature.index for signature in batch.signatures)
+        else:
+            result = _multiproof_verify(
+                messages, data, context=context_bytes, contexts=contexts_tuple
+            )
+            if result is None:
+                return False
+            proof_key, indices = result
+            if (
+                proof_key.w != self._public_key.w
+                or proof_key.height != self._public_key.height
+                or proof_key.root != self._public_key.root
+            ):
+                return False
+        with self._lock:
+            if any(index in self._accepted for index in indices):
+                return False
+            self._accepted.update(indices)
+            return True
 
 
 class MerkleSigner:
